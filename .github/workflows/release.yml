@@ -383,8 +383,10 @@ jobs:
         if: ${{ contains(matrix.runs-on, 'self-hosted') }}
         run: |
           if ! command -v flatpak &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y flatpak flatpak-builder
+            echo "Error: flatpak not found. Please install flatpak on your self-hosted runner:"
+            echo "  sudo snap install flatpak"
+            echo "  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo --user"
+            exit 1
           fi
       
       - name: Add Flathub repository
