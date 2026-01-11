@@ -37,7 +37,6 @@ jobs:
   build-windows:
     name: Build Windows
     needs: generate-version
-    if: false
     runs-on: windows-latest
     strategy:
       matrix:
@@ -94,7 +93,6 @@ jobs:
   build-macos:
     name: Build macOS
     needs: generate-version
-    if: false
     runs-on: macos-latest
     strategy:
       matrix:
@@ -194,7 +192,6 @@ jobs:
   build-linux-appimage:
     name: Build Linux AppImage
     needs: generate-version
-    if: false
     runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
@@ -315,7 +312,6 @@ jobs:
   build-linux-snap-amd64:
     name: Build Linux Snap (amd64)
     needs: generate-version
-    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -351,7 +347,7 @@ jobs:
       - name: Build snap with LXD
         run: |
           # Build using LXD (user must be in lxd group)
-          snapcraft --use-lxd
+          snapcraft pack --use-lxd
       
       - name: Rename snap
         run: |
@@ -366,7 +362,6 @@ jobs:
   build-linux-flatpak:
     name: Build Linux Flatpak
     needs: generate-version
-    if: false
     runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
@@ -429,8 +424,7 @@ jobs:
 
   release:
     name: Create Release
-    #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
-    needs: [generate-version, build-linux-flatpak]
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
 
     runs-on: ubuntu-latest
     steps:
