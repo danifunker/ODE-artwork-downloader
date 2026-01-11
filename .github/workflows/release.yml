@@ -250,22 +250,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Snapcraft (GitHub-hosted only)
-        if: runner.environment == 'github-hosted'
-        run: |
-          sudo snap install snapcraft --classic
-      
       - name: Update snapcraft.yaml with version
         run: |
           sed -i "s/^version: .*/version: '${{ needs.generate-version.outputs.version }}'/" snap/snapcraft.yaml
       
-      - name: Build snap
-        run: |
-          snapcraft pack
+      - uses: snapcore/action-build@v1
+        id: build
       
       - name: Rename snap
         run: |
-          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64.snap
+          mv ${{ steps.build.outputs.snap }} ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4

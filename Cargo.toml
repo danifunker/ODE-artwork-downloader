@@ -11,7 +11,7 @@ repository = "https://github.com/dani/ODE-artwork-downloader"
 eframe = "0.30"
 egui = "0.30"
 egui_extras = { version = "0.30", features = ["image"] }
-rfd = "0.15"
+rfd = "0.14"
 
 # Image processing
 image = "0.25"
