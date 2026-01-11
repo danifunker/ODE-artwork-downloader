@@ -214,7 +214,11 @@ jobs:
         run: |
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/iconsions/ode-artwork-downloader.desktop << EOF
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          
+          cp target/${{ matrix.target }}/release/ode-artwork-downloader AppDir/usr/bin/
+          
+          cat > AppDir/usr/share/applications/ode-artwork-downloader.desktop << EOF
           [Desktop Entry]
           Name=ODE Artwork Downloader
           Exec=ode-artwork-downloader

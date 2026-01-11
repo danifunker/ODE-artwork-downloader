@@ -27,6 +27,8 @@ parts:
   ode-artwork-downloader:
     plugin: nil
     source: .
+    build-snaps:
+      - rustup/latest/stable
     build-packages:
       - libgtk-3-dev
       - libssl-dev
@@ -39,8 +41,13 @@ parts:
       - libgtk-3-0
       - libssl3
     override-build: |
-      # Ensure cargo is in PATH
-      export PATH="$HOME/.cargo/bin:$PATH"
+      # Ensure cargo is in PATH (for self-hosted) or use rustup from snap
+      if [ -d "$HOME/.cargo/bin" ]; then
+        export PATH="$HOME/.cargo/bin:$PATH"
+      else
+        export PATH="/snap/bin:$PATH"
+        rustup default stable
+      fi
       cargo build --release
       mkdir -p $CRAFT_PART_INSTALL/bin
       cp target/release/ode-artwork-downloader $CRAFT_PART_INSTALL/bin/
