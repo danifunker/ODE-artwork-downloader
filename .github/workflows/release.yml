@@ -199,15 +199,22 @@ jobs:
           if [ "${{ matrix.arch }}" = "x64" ]; then
             wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
             chmod +x appimagetool-x86_64.AppImage
-            mv appimagetool-x86_64.AppImage appimagetool
+            # Extract appimagetool to avoid FUSE requirement
+            ./appimagetool-x86_64.AppImage --appimage-extract
+            mv squashfs-root/AppRun squashfs-root/appimagetool
+            chmod +x squashfs-root/appimagetool
           elif [ "${{ matrix.arch }}" = "x86" ]; then
             wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-i686.AppImage
             chmod +x appimagetool-i686.AppImage
-            mv appimagetool-i686.AppImage appimagetool
+            ./appimagetool-i686.AppImage --appimage-extract
+            mv squashfs-root/AppRun squashfs-root/appimagetool
+            chmod +x squashfs-root/appimagetool
           elif [ "${{ matrix.arch }}" = "arm64" ]; then
             wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage
             chmod +x appimagetool-aarch64.AppImage
-            mv appimagetool-aarch64.AppImage appimagetool
+            ./appimagetool-aarch64.AppImage --appimage-extract
+            mv squashfs-root/AppRun squashfs-root/appimagetool
+            chmod +x squashfs-root/appimagetool
           fi
       
       - name: Create AppImage
@@ -239,7 +246,8 @@ jobs:
           ln -s usr/share/applications/ode-artwork-downloader.desktop AppDir/
           ln -s usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/
           
-          ARCH=${{ matrix.arch }} ./appimagetool AppDir ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
+          # Use extracted appimagetool with --no-appstream to avoid FUSE requirement
+          ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
