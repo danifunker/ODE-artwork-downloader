@@ -140,16 +140,16 @@ jobs:
   build-linux-appimage:
     name: Build Linux AppImage
     needs: generate-version
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
         include:
-          - target: i686-unknown-linux-gnu
-            arch: x86
           - target: x86_64-unknown-linux-gnu
             arch: x64
+            runs-on: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+            runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
       
@@ -162,14 +162,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config
-          
-          if [ "${{ matrix.target }}" = "i686-unknown-linux-gnu" ]; then
-            sudo dpkg --add-architecture i386
-            sudo apt-get update
-            sudo apt-get install -y gcc-multilib g++-multilib libgtk-3-dev:i386 libssl-dev:i386
-          elif [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          fi
       
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -190,13 +182,7 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Build
-        run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-          fi
-          cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
       
       - name: Download AppImage tools
         run: |
@@ -218,11 +204,7 @@ jobs:
         run: |
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          
-          cp target/${{ matrix.target }}/release/ode-artwork-downloader AppDir/usr/bin/
-          
-          cat > AppDir/usr/share/applications/ode-artwork-downloader.desktop << EOF
+          mkdir -p AppDir/usr/share/iconsions/ode-artwork-downloader.desktop << EOF
           [Desktop Entry]
           Name=ODE Artwork Downloader
           Exec=ode-artwork-downloader
@@ -258,12 +240,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - arch: i386
-            target: i686-unknown-linux-gnu
+          - a${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        include:
           - arch: amd64
-            target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
           - arch: arm64
-            target: aarch64-unknown-linux-gnu
+            runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
       
@@ -271,57 +255,13 @@ jobs:
         run: |
           sudo snap install snapcraft --classic
       
-      - name: Create snapcraft.yaml
+      - name: Update snapcraft.yaml with version
         run: |
-          mkdir -p snap
-          cat > snap/snapcraft.yaml << 'EOF'
-          name: ode-artwork-downloader
-          version: ${{ needs.generate-version.outputs.version }}
-          summary: ODE Artwork Downloader
-          description: |
-            Download artwork for ODE (Optical Disc Emulator) devices.
-          
-          base: core22
-          confinement: strict
-          grade: stable
-          icon: assets/icons/icon.png
-          
-          architectures:
-            - build-on: ${{ matrix.arch }}
-          
-          apps:
-            ode-artwork-downloader:
-              command: bin/ode-artwork-downloader
-              plugs:
-                - home
-                - network
-                - desktop
-                - desktop-legacy
-                - wayland
-                - x11
-          
-          parts:
-            ode-artwork-downloader:
-              plugin: rust
-              source: .
-              build-packages:
-                - libgtk-3-dev
-                - libssl-dev
-                - pkg-config
-              stage-packages:
-                - libgtk-3-0
-                - libssl3
-          EOF
+          sed -i "s/^version: .*/version: '${{ needs.generate-version.outputs.version }}'/" snap/snapcraft.yaml
       
       - name: Build snap
         run: |
-          snapcraft --use-lxd
-        env:
-          SNAPCRAFT_BUILD_ENVIRONMENT: lxd
-      
-      - name: Rename snap
-        run: |
-          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
+          snapcraft pack-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
