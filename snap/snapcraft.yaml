@@ -31,10 +31,16 @@ parts:
       - libgtk-3-dev
       - libssl-dev
       - pkg-config
+      - curl
+      - gcc
+      - git
+      - libc6-dev
     stage-packages:
       - libgtk-3-0
       - libssl3
     override-build: |
+      # Ensure cargo is in PATH
+      export PATH="$HOME/.cargo/bin:$PATH"
       cargo build --release
       mkdir -p $CRAFT_PART_INSTALL/bin
       cp target/release/ode-artwork-downloader $CRAFT_PART_INSTALL/bin/

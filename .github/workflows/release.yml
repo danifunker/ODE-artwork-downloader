@@ -34,6 +34,7 @@ jobs:
   build-windows:
     name: Build Windows
     needs: generate-version
+    if: false  # Disable Windows builds for now as I'm fixing Linux
     runs-on: windows-latest
     strategy:
       matrix:
@@ -91,6 +92,7 @@ jobs:
     name: Build macOS
     needs: generate-version
     runs-on: macos-latest
+    if: false  # Disable macOS build for now as I'm fixing Linux
     strategy:
       matrix:
         include:
@@ -284,7 +286,8 @@ jobs:
       
       - name: Build snap
         run: |
-          snapcraft pack --destructive-mode
+          export PATH="$HOME/.cargo/bin:$PATH"
+          snapcraft pack --build-for=arm64 --destructive-mode
       
       - name: Rename snap
         run: |
@@ -298,7 +301,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64]
+    #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64]
+    needs: [generate-version, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
