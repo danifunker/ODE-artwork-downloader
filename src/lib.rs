@@ -7,3 +7,4 @@ pub mod disc;
 pub mod export;
 pub mod gui;
 pub mod search;
+pub mod update;

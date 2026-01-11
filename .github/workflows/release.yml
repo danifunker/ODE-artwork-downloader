@@ -144,6 +144,7 @@ jobs:
           
           # Copy binary
           cp "target/${{ matrix.target }}/release/ode-artwork-downloader" "${BUNDLE_NAME}/Contents/MacOS/"
+          chmod +x "${BUNDLE_NAME}/Contents/MacOS/ode-artwork-downloader"
           
           # Copy icon if available
           if [ -f "assets/icons/icon.icns" ]; then
@@ -179,6 +180,9 @@ jobs:
           </dict>
           </plist>
           EOF
+          
+          # Ad-hoc code sign to prevent "damaged" error
+          codesign --force --deep --sign - "${BUNDLE_NAME}"
           
           # Create DMG
           hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.dmg"

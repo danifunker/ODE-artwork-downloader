@@ -9,6 +9,7 @@ use crate::api::{open_in_browser, ArtworkSearchQuery};
 use crate::disc::{supported_extensions, parse_filename, ConfidenceLevel, DiscInfo, DiscReader, DiscFormat, FilesystemType};
 use crate::export::{export_artwork, export_artwork_from_url, generate_output_path, ExportResult, ExportSettings};
 use crate::search::ImageResult;
+use crate::update::{UpdateConfig, UpdateInfo};
 
 /// Main application state
 pub struct App {
@@ -48,6 +49,16 @@ pub struct App {
     show_log_window: bool,
     /// Last preview error message
     preview_error: Option<String>,
+    /// Update configuration
+    update_config: UpdateConfig,
+    /// Update information receiver
+    update_receiver: Option<Receiver<Result<UpdateInfo, String>>>,
+    /// Latest update info
+    update_info: Option<UpdateInfo>,
+    /// Whether to show update notification
+    show_update_notification: bool,
+    /// Whether update check has been performed
+    update_check_done: bool,
 }
 
 /// A log message with severity level
@@ -86,6 +97,11 @@ impl Default for App {
             manual_url: String::new(),
             show_log_window: false,
             preview_error: None,
+            update_config: UpdateConfig::load(),
+            update_receiver: None,
+            update_info: None,
+            show_update_notification: false,
+            update_check_done: false,
         }
     }
 }
@@ -93,7 +109,14 @@ impl Default for App {
 impl App {
     /// Create a new App instance
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::default()
+        let mut app = Self::default();
+        
+        // Start update check in background if enabled
+        if app.update_config.update_check.enabled {
+            app.start_update_check();
+        }
+        
+        app
     }
 
     /// Add a log message
@@ -246,6 +269,7 @@ impl App {
     }
 
     /// Get the currently selected image URL
+    #[allow(dead_code)]
     fn selected_image_url(&self) -> Option<&str> {
         self.selected_image_index
             .and_then(|i| self.search_results.get(i))
@@ -402,6 +426,58 @@ impl App {
             }
         }
     }
+
+    /// Start checking for updates
+    fn start_update_check(&mut self) {
+        if self.update_check_done {
+            return;
+        }
+
+        let config = self.update_config.update_check.clone();
+        let current_version = env!("APP_VERSION").to_string();
+        let (tx, rx) = mpsc::channel();
+
+        self.update_receiver = Some(rx);
+
+        thread::spawn(move || {
+            let result = crate::update::check_for_updates(&config, &current_version)
+                .map_err(|e: Box<dyn std::error::Error>| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll for update check results
+    fn poll_update_check(&mut self) {
+        if let Some(ref receiver) = self.update_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(info)) => {
+                    self.update_check_done = true;
+                    self.update_receiver = None;
+                    
+                    if info.is_outdated {
+                        self.update_info = Some(info.clone());
+                        self.show_update_notification = true;
+                        self.log(
+                            LogLevel::Info,
+                            format!("Update available: v{} → v{}", info.current_version, info.latest_version)
+                        );
+                    }
+                }
+                Ok(Err(_e)) => {
+                    self.update_check_done = true;
+                    self.update_receiver = None;
+                    // Silently fail update checks - don't spam users with errors
+                }
+                Err(TryRecvError::Empty) => {
+                    // Still checking
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.update_check_done = true;
+                    self.update_receiver = None;
+                }
+            }
+        }
+    }
 }
 
 /// Fetch image bytes from a URL
@@ -449,6 +525,9 @@ impl eframe::App for App {
 
         // Poll for export results
         self.poll_export();
+
+        // Poll for update check
+        self.poll_update_check();
 
         // Request repaint while loading
         if self.search_in_progress || self.preview_loading || self.export_in_progress {
@@ -939,6 +1018,36 @@ impl eframe::App for App {
 
         // Show drag-and-drop preview
         preview_files_being_dropped(ctx);
+
+        // Show update notification dialog
+        if self.show_update_notification {
+            if let Some(update_info) = self.update_info.clone() {
+                egui::Window::new("Update Available")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "A new version is available: v{}",
+                            update_info.latest_version
+                        ));
+                        ui.label(format!("Current version: v{}", update_info.current_version));
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Take me to the download").clicked() {
+                                if let Err(e) = open_in_browser(&update_info.releases_url) {
+                                    self.log(LogLevel::Error, format!("Failed to open browser: {}", e));
+                                }
+                                self.show_update_notification = false;
+                            }
+                            if ui.button("Skip").clicked() {
+                                self.show_update_notification = false;
+                            }
+                        });
+                    });
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@ mod disc;
 mod export;
 mod gui;
 mod search;
+mod update;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
