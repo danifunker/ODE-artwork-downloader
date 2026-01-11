@@ -25,7 +25,7 @@ apps:
 
 parts:
   ode-artwork-downloader:
-    plugin: rust
+    plugin: nil
     source: .
     build-packages:
       - libgtk-3-dev
@@ -34,3 +34,7 @@ parts:
     stage-packages:
       - libgtk-3-0
       - libssl3
+    override-build: |
+      cargo build --release
+      mkdir -p $CRAFT_PART_INSTALL/bin
+      cp target/release/ode-artwork-downloader $CRAFT_PART_INSTALL/bin/
