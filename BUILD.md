@@ -37,3 +37,11 @@ flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flat
 # Install the Freedesktop runtime and SDK (arm64 versions)
 flatpak install -y --user flathub org.freedesktop.Platform//23.08 org.freedesktop.Sdk//23.08 org.freedesktop.Sdk.Extension.rust-stable//23.08
 
+# Create isolation using lxd for snap builds
+sudo snap install lxd
+sudo lxd init --auto
+
+# additional requirements for snap builds
+sudo snap install gnome-42-2204 
+sudo snap install gtk-common-themes
+sudo snap install gnome-42-2204-sdk

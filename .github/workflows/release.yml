@@ -344,14 +344,12 @@ jobs:
         run: |
           sed -i "s/^version: .*/version: '${{ needs.generate-version.outputs.version }}'/" snap/snapcraft.yaml
       
-      - name: Build snap
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          snapcraft pack --build-for=arm64 --destructive-mode
+      - uses: snapcore/action-build@v1
+        id: build
       
       - name: Rename snap
         run: |
-          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
+          mv ${{ steps.build.outputs.snap }} ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4

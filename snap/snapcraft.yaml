@@ -15,7 +15,6 @@ icon: assets/icons/icon.png
 apps:
   ode-artwork-downloader:
     command: bin/ode-artwork-downloader
-    extensions: [gnome]
     plugs:
       - home
       - network
@@ -23,6 +22,8 @@ apps:
       - desktop-legacy
       - wayland
       - x11
+      - unity7
+      - opengl
 
 parts:
   ode-artwork-downloader:
