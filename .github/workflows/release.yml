@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - master
   workflow_dispatch:
 
 env:
@@ -11,7 +12,6 @@ env:
 
 jobs:
   generate-version:
-    needs: generate-version
     name: Generate Version
     runs-on: ubuntu-latest
     outputs:
@@ -23,8 +23,10 @@ jobs:
           VERSION=$(date -u +"%Y%m%d%H%M")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Generated version: $VERSION"
+
   build-windows:
     name: Build Windows
+    needs: generate-version
     runs-on: windows-latest
     strategy:
       matrix:
@@ -52,7 +54,7 @@ jobs:
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-      ${{ needs.generate-version.outputs.version }}-
+      
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
@@ -66,17 +68,21 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../ode-artwork-downloader-windows-${{ matrix.arch }}.zip ode-artwork-downloader.exe
+          if [ -f "../../../assets/icons/icon.ico" ]; then
+            7z a ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip ode-artwork-downloader.exe ../../../assets/icons/icon.ico
+          else
+            7z a ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip ode-artwork-downloader.exe
+          fi
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip
 
   build-macos:
     name: Build macOS
     needs: generate-version
-    name: Build macOS
     runs-on: macos-latest
     strategy:
       matrix:
@@ -115,19 +121,25 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       
       - name: Package
-        run: |${{ needs.generate-version.outputs.version }}-
+        run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../ode-artwork-downloader-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader
+          if [ -f "../../../assets/icons/icon.icns" ]; then
+            tar czf ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader ../../../assets/icons/icon.icns
+          elif [ -f "../../../assets/icons/icon.png" ]; then
+            tar czf ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader ../../../assets/icons/icon.png
+          else
+            tar czf ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader
+          fi
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz
 
   build-linux-appimage:
     name: Build Linux AppImage
     needs: generate-version
-    name: Build Linux AppImage
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -219,23 +231,29 @@ jobs:
           Categories=Utility;
           EOF
           
-          # Create a simple icon (you should replace this with your actual icon)
-          echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" | base64 -d > AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png
+          # Use generated icon if available, otherwise create a placeholder
+          if [ -f "assets/icons/hicolor/256x256/apps/ode-artwork-downloader.png" ]; then
+            cp assets/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/usr/share/icons/hicolor/256x256/apps/
+          elif [ -f "assets/icons/icon-256.png" ]; then
+            cp assets/icons/icon-256.png AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png
+          else
+            echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" | base64 -d > AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png
+          fi
           
           ln -s usr/share/applications/ode-artwork-downloader.desktop AppDir/
-          ln -s usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png${{ needs.generate-version.outputs.version }}- AppDir/
+          ln -s usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/
           
-          ARCH=${{ matrix.arch }} ./appimagetool AppDir ode-artwork-downloader-linux-${{ matrix.arch }}.AppImage
+          ARCH=${{ matrix.arch }} ./appimagetool AppDir ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
-        with:${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
+        with:
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-appimage
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
 
   build-linux-snap:
     name: Build Linux Snap
     needs: generate-version
-  build-linux-snap:
-    name: Build Linux Snap
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -255,10 +273,10 @@ jobs:
       
       - name: Create snapcraft.yaml
         run: |
-          mkdir -p ${{ needs.generate-version.outputs.version }}p
+          mkdir -p snap
           cat > snap/snapcraft.yaml << 'EOF'
           name: ode-artwork-downloader
-          version: git
+          version: ${{ needs.generate-version.outputs.version }}
           summary: ODE Artwork Downloader
           description: |
             Download artwork for ODE (Optical Disc Emulator) devices.
@@ -266,6 +284,7 @@ jobs:
           base: core22
           confinement: strict
           grade: stable
+          icon: assets/icons/icon.png
           
           architectures:
             - build-on: ${{ matrix.arch }}
@@ -299,21 +318,21 @@ jobs:
           snapcraft --use-lxd
         env:
           SNAPCRAFT_BUILD_ENVIRONMENT: lxd
-      ${{ needs.generate-version.outputs.version }}-
+      
       - name: Rename snap
         run: |
-          mv *.snap ode-artwork-downloader-linux-${{ matrix.arch }}.snap
+          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
-        with:${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
+        with:
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-snap
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
 
   release:
     name: Create Release
     needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap]
-    runs-on: ubuntu-latestd-linux-appimage, build-linux-snap]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -325,12 +344,12 @@ jobs:
       
       - name: Create Release
         uses: softprops/action-gh-release@v1
-        witag_name: v${{ needs.generate-version.outputs.version }}
+        with:
+          tag_name: v${{ needs.generate-version.outputs.version }}
           name: Release ${{ needs.generate-version.outputs.version }}
           files: artifacts/**/*
           draft: false
           prerelease: false
-          generate_release_notes: tru
-          prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
