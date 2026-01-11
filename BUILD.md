@@ -29,10 +29,11 @@ sudo apt-get install -y wget curl git libfuse-dev
 
 # Install flatpak and flatpak-builder
 sudo apt-get update
-sudo apt-get install -y flatpak flatpak-builder python3
+sudo apt-get install -y flatpak flatpak-builder python3 python3-tomlkit python3-aiohttp
 
 # Add Flathub repository
 flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo --user
 
 # Install the Freedesktop runtime and SDK (arm64 versions)
 flatpak install -y --user flathub org.freedesktop.Platform//23.08 org.freedesktop.Sdk//23.08 org.freedesktop.Sdk.Extension.rust-stable//23.08
+

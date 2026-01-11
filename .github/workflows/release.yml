@@ -334,7 +334,7 @@ jobs:
         if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder
+          sudo apt-get install -y flatpak flatpak-builder python3 python3-tomlkit python3-aiohttp
       
       - name: Check and install flatpak tools (self-hosted)
         if: ${{ contains(matrix.runs-on, 'self-hosted') }}
