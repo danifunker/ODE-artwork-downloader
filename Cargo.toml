@@ -31,6 +31,13 @@ env_logger = "0.11"
 chd = "0.2"
 cue_sheet = "0.1"
 
+# DAT file parsing
+quick-xml = { version = "0.37", features = ["serde", "serialize"] }
+zip = "2.2"
+
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = "z"
 lto = true

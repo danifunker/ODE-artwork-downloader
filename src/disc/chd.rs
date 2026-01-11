@@ -76,6 +76,7 @@ pub struct ChdInfo {
 
 /// Track information parsed from CHD metadata
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TrackInfo {
     track_num: u32,
     track_type: String,
@@ -96,12 +97,19 @@ pub fn read_chd(path: &Path) -> ChdResult<ChdInfo> {
     let hunk_size = header.hunk_size();
     let logical_size = header.logical_bytes();
 
-    // Count tracks for informational purposes
-    let track_count = count_tracks(&chd);
-    log::debug!("Found {} tracks in CHD", track_count);
+    // Parse track metadata to find data tracks
+    let tracks = parse_track_metadata(&mut chd)?;
+    log::debug!("Found {} tracks in CHD", tracks.len());
+
+    for track in &tracks {
+        log::debug!(
+            "Track {}: type={}, frames={}, offset={}",
+            track.track_num, track.track_type, track.frames, track.frame_offset
+        );
+    }
 
     // Try to read the ISO9660 PVD from the disc data
-    let (volume_label, pvd) = match read_pvd_from_chd(&mut chd) {
+    let (volume_label, pvd) = match read_pvd_from_chd(&mut chd, &tracks) {
         Ok(pvd) => {
             let label = if pvd.volume_id.is_empty() {
                 None
@@ -126,11 +134,46 @@ pub fn read_chd(path: &Path) -> ChdResult<ChdInfo> {
 }
 
 /// Parse CHT2 track metadata from CHD
-/// Returns track count for informational purposes
-fn count_tracks<F: Read + Seek>(chd: &Chd<F>) -> usize {
-    chd.metadata_refs()
+/// Collects refs first, then reads content to work around borrow checker
+fn parse_track_metadata<F: Read + Seek>(chd: &mut Chd<F>) -> ChdResult<Vec<TrackInfo>> {
+    // First pass: collect metadata refs (they're Clone)
+    let meta_refs: Vec<_> = chd
+        .metadata_refs()
         .filter(|meta_ref| meta_ref.metatag() == CHT2_TAG)
-        .count()
+        .collect();
+
+    // Second pass: read each metadata entry
+    let mut tracks = Vec::new();
+    let mut frame_offset = 0u32;
+
+    for meta_ref in meta_refs {
+        match meta_ref.read(chd.inner()) {
+            Ok(metadata) => {
+                if let Ok(content) = String::from_utf8(metadata.value.clone()) {
+                    log::debug!("CHT2 metadata: {}", content);
+                    if let Some(track) = parse_cht2_entry(&content, frame_offset) {
+                        frame_offset += track.frames;
+                        tracks.push(track);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to read CHT2 metadata: {:?}", e);
+            }
+        }
+    }
+
+    // Sort by track number
+    tracks.sort_by_key(|t| t.track_num);
+
+    // Recalculate frame offsets after sorting
+    let mut offset = 0u32;
+    for track in &mut tracks {
+        track.frame_offset = offset;
+        offset += track.frames;
+    }
+
+    Ok(tracks)
 }
 
 /// Parse a single CHT2 metadata entry
@@ -167,6 +210,22 @@ fn is_data_track(track_type: &str) -> bool {
     track_type.starts_with("MODE1") || track_type.starts_with("MODE2")
 }
 
+/// Get sector size for track type
+fn get_track_sector_size(track_type: &str) -> (u32, usize) {
+    // CHD CD-ROM data uses raw frames (2352 bytes + 96 bytes subcode = 2448)
+    // The actual sector size and data offset depend on the track type
+    if track_type.contains("RAW") {
+        // Raw mode: 2352 bytes per sector, data at offset 16 (after sync+header)
+        (CD_SECTOR_SIZE_RAW, CD_MODE1_DATA_OFFSET)
+    } else {
+        // Cooked mode: 2048 bytes of user data
+        (CD_SECTOR_SIZE_COOKED, 0)
+    }
+}
+
+/// CD frame size in CHD (raw sector + subcode)
+const CD_FRAME_SIZE: u32 = 2352 + 96; // 2448 bytes
+
 /// Read the Primary Volume Descriptor from CHD disc data
 fn read_pvd_from_chd<F: Read + Seek>(
     chd: &mut Chd<F>,
@@ -175,7 +234,7 @@ fn read_pvd_from_chd<F: Read + Seek>(
     let header = chd.header();
     let hunk_size = header.hunk_size();
 
-    // Find data tracks and try to read PVD from each
+    // Find data tracks
     let data_tracks: Vec<_> = tracks
         .iter()
         .filter(|t| is_data_track(&t.track_type))
@@ -190,18 +249,24 @@ fn read_pvd_from_chd<F: Read + Seek>(
             track.track_num, track.track_type, track.frame_offset, track.frames
         );
 
-        // Determine sector size based on track type
-        let (sector_size, data_offset) = if track.track_type.contains("RAW") {
-            (CD_SECTOR_SIZE_RAW, CD_MODE1_DATA_OFFSET)
-        } else {
-            (CD_SECTOR_SIZE_COOKED, 0)
-        };
+        let (sector_size, data_offset) = get_track_sector_size(&track.track_type);
 
-        // Calculate byte offset to PVD (sector 16 within this track)
-        let track_byte_offset = track.frame_offset as u64 * sector_size as u64;
-        let pvd_byte_offset = track_byte_offset + (PVD_SECTOR * sector_size as u64);
+        // In CHD, each frame is CD_FRAME_SIZE bytes (2448)
+        // PVD is at sector 16 within the data track
+        // Track data starts at frame_offset * CD_FRAME_SIZE
+        let track_byte_offset = track.frame_offset as u64 * CD_FRAME_SIZE as u64;
 
-        match try_read_pvd_at_offset(chd, hunk_size, pvd_byte_offset, sector_size, data_offset) {
+        // For raw sectors, we need to account for the sync/header (16 bytes)
+        // The PVD is at sector 16, so the byte offset is:
+        // track_start + (16 * frame_size) + data_offset_in_frame
+        let pvd_byte_offset = track_byte_offset + (PVD_SECTOR * CD_FRAME_SIZE as u64);
+
+        log::debug!(
+            "Track byte offset: {}, PVD byte offset: {}, sector_size: {}, data_offset: {}",
+            track_byte_offset, pvd_byte_offset, sector_size, data_offset
+        );
+
+        match try_read_pvd_at_offset(chd, hunk_size, pvd_byte_offset, CD_FRAME_SIZE, data_offset) {
             Ok(pvd) => return Ok(pvd),
             Err(e) => {
                 log::debug!("Failed to read PVD from track {}: {}", track.track_num, e);
@@ -209,7 +274,7 @@ fn read_pvd_from_chd<F: Read + Seek>(
         }
     }
 
-    // If no tracks found or all failed, try legacy approach (assume data starts at offset 0)
+    // If no tracks found, try legacy approach
     if tracks.is_empty() {
         log::debug!("No track metadata found, trying legacy offsets");
         return try_legacy_pvd_read(chd, hunk_size);

@@ -37,7 +37,7 @@ Create a cross-platform GUI application in Rust that automatically identifies CD
 | File picker and drag-drop | Done | |
 | Disc info display | Done | |
 | CHD support | Done | Using `chd` crate (pure Rust) |
-| BIN/CUE support | Pending | Stub implemented |
+| BIN/CUE support | Done | Using `cue_sheet` crate |
 | MDS/MDF support | Pending | Stub implemented |
 
 ### Phase 2: API Integration & Cover Art
@@ -155,6 +155,8 @@ thiserror = "2.0"
 rfd = "0.15"
 log = "0.4"
 env_logger = "0.11"
+chd = "0.2"
+cue_sheet = "0.1"
 ```
 
 ---
@@ -174,6 +176,7 @@ ode-artwork-downloader/
 │   │   ├── reader.rs        # Unified disc reader interface
 │   │   ├── iso9660.rs       # ISO9660 PVD parsing
 │   │   ├── chd.rs           # CHD file reading (pure Rust)
+│   │   ├── bincue.rs        # BIN/CUE file reading
 │   │   └── identifier.rs    # Filename parsing, title extraction
 │   ├── gui/
 │   │   ├── mod.rs           # GUI module exports
@@ -291,7 +294,9 @@ strip = true           # Strip debug symbols
 
 ### TODO
 - [ ] Add GitHub Actions for cross-platform builds
-- [ ] Implement CHD reading (investigate pure Rust options)
+- [x] Implement CHD reading (using `chd` crate)
+- [x] Implement BIN/CUE reading (using `cue_sheet` crate)
+- [ ] Implement MDS/MDF reading
 - [ ] Implement API integrations (Redump, MAME, IGDB, MobyGames)
 - [ ] Add batch processing mode
 - [ ] Add CSV export functionality

@@ -25,6 +25,7 @@ pub type BinCueResult<T> = Result<T, BinCueError>;
 
 /// Errors specific to BIN/CUE reading
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum BinCueError {
     /// IO error
     Io(std::io::Error),
@@ -74,12 +75,49 @@ pub struct BinCueInfo {
 
 /// Track info extracted from CUE commands
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ParsedTrack {
     track_no: u32,
     track_type: TrackType,
     sector_size: u64,
     data_offset: u64,
     is_data: bool,
+    bin_filename: String,  // The BIN file this track belongs to
+}
+
+/// Normalize CUE file for parser compatibility
+/// - Fixes case-sensitivity issues (BINARY -> Binary)
+/// - Removes/fixes problematic lines (CATALOG with leading zeros)
+fn normalize_cue_keywords(content: &str) -> String {
+    let mut result = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip CATALOG lines (parser has issues with number parsing)
+        // CATALOG is optional and not needed for reading disc data
+        if trimmed.starts_with("CATALOG") {
+            continue;
+        }
+
+        // Skip REM (comment) lines that might cause issues
+        if trimmed.starts_with("REM ") {
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    // Fix case-sensitive file format keywords
+    result
+        .replace("BINARY", "Binary")
+        .replace("MOTOROLA", "Motorola")
+        .replace(" WAVE", " Wave")  // Be careful not to replace in filenames
+        .replace(" MP3", " Mp3")
+        .replace(" AIFF", " Aiff")
 }
 
 /// Read BIN/CUE disc image and extract information
@@ -89,56 +127,75 @@ struct ParsedTrack {
 pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
     // Read and parse the CUE file
     let cue_content = std::fs::read_to_string(cue_path)?;
+
+    // Normalize file format keywords (cue_sheet crate is case-sensitive)
+    // CUE files often have "BINARY" but crate expects "Binary"
+    let cue_content = normalize_cue_keywords(&cue_content);
+
     let commands = parse_cue(&cue_content)
         .map_err(|e| BinCueError::CueParse(format!("{:?}", e)))?;
 
-    // Find the FILE command to get the BIN filename
-    let mut bin_filename: Option<String> = None;
+    // Parse commands, tracking current BIN file for each track
+    let mut current_bin_filename: Option<String> = None;
     let mut tracks: Vec<ParsedTrack> = Vec::new();
 
     for cmd in &commands {
         match cmd {
             Command::File(filename, _format) => {
-                if bin_filename.is_none() {
-                    bin_filename = Some(filename.clone());
-                }
+                current_bin_filename = Some(filename.clone());
             }
             Command::Track(track_no, track_type) => {
                 let (sector_size, data_offset, is_data) = get_track_params(track_type);
+                let bin_filename = current_bin_filename.clone()
+                    .unwrap_or_else(|| "unknown.bin".to_string());
                 tracks.push(ParsedTrack {
                     track_no: *track_no,
                     track_type: track_type.clone(),
                     sector_size,
                     data_offset,
                     is_data,
+                    bin_filename: bin_filename.clone(),
                 });
-                log::debug!("Track {}: {:?}, sector_size={}, is_data={}",
-                    track_no, track_type, sector_size, is_data);
+                log::debug!("Track {}: {:?}, sector_size={}, is_data={}, file={}",
+                    track_no, track_type, sector_size, is_data, bin_filename);
             }
             _ => {}
         }
     }
 
-    let bin_filename = bin_filename
-        .ok_or_else(|| BinCueError::CueParse("No FILE entry in CUE sheet".to_string()))?;
+    if tracks.is_empty() {
+        return Err(BinCueError::CueParse("No TRACK entries in CUE sheet".to_string()));
+    }
 
-    log::debug!("Found {} tracks, BIN file: {}", tracks.len(), bin_filename);
-
-    // Resolve BIN path relative to CUE file location
-    let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
-    let bin_path = resolve_bin_path(cue_dir, &bin_filename)?;
-
-    // Open the BIN file and try to read PVD
-    let file = File::open(&bin_path)?;
-    let mut reader = BufReader::new(file);
+    log::debug!("Found {} tracks", tracks.len());
 
     // Find first data track
     let data_track = tracks.iter().find(|t| t.is_data);
 
+    // Resolve CUE directory for finding BIN files
+    let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
+
+    // For return value, use the first data track's BIN file, or first track's
+    let primary_bin_filename = data_track
+        .map(|t| &t.bin_filename)
+        .or_else(|| tracks.first().map(|t| &t.bin_filename))
+        .ok_or_else(|| BinCueError::CueParse("No tracks found".to_string()))?;
+
+    let bin_path = resolve_bin_path_with_cue_fallback(cue_dir, primary_bin_filename, Some(cue_path))?;
+
+    // Try to read PVD from the data track's BIN file
     let (volume_label, pvd) = if let Some(track) = data_track {
+        // Open the specific BIN file for this track
+        let track_bin_path = resolve_bin_path_with_cue_fallback(cue_dir, &track.bin_filename, Some(cue_path))?;
+        log::debug!("Opening data track BIN file: {}", track_bin_path.display());
+        let file = File::open(&track_bin_path)?;
+        let mut reader = BufReader::new(file);
+
         match read_pvd_from_bin(&mut reader, track.sector_size, track.data_offset) {
             Ok(pvd) => {
+                log::debug!("PVD parsed successfully, volume_id: '{}'", pvd.volume_id);
                 let label = if pvd.volume_id.is_empty() {
+                    log::debug!("Volume ID is empty");
                     None
                 } else {
                     Some(pvd.volume_id.clone())
@@ -152,7 +209,9 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
             }
         }
     } else {
-        log::warn!("No data track found, trying fallback");
+        log::warn!("No data track found, trying fallback on first BIN file");
+        let file = File::open(&bin_path)?;
+        let mut reader = BufReader::new(file);
         try_read_pvd_fallback(&mut reader)
     };
 
@@ -183,7 +242,12 @@ fn get_track_params(track_type: &TrackType) -> (u64, u64, bool) {
 }
 
 /// Resolve BIN file path, trying different locations
-fn resolve_bin_path(cue_dir: &Path, bin_filename: &str) -> BinCueResult<std::path::PathBuf> {
+/// Falls back to CUE basename if the referenced BIN file doesn't exist
+fn resolve_bin_path_with_cue_fallback(
+    cue_dir: &Path,
+    bin_filename: &str,
+    cue_path: Option<&Path>,
+) -> BinCueResult<std::path::PathBuf> {
     // Try the path as-is (relative to CUE dir)
     let bin_path = cue_dir.join(bin_filename);
     if bin_path.exists() {
@@ -198,12 +262,27 @@ fn resolve_bin_path(cue_dir: &Path, bin_filename: &str) -> BinCueResult<std::pat
         }
     }
 
-    // Try common variations
+    // Try common variations of the referenced filename
     let base = Path::new(bin_filename).file_stem().unwrap_or_default();
     for ext in &["bin", "BIN", "img", "IMG"] {
         let try_path = cue_dir.join(format!("{}.{}", base.to_string_lossy(), ext));
         if try_path.exists() {
             return Ok(try_path);
+        }
+    }
+
+    // If CUE path provided, try using the CUE's basename with BIN extensions
+    // This handles cases where the BIN was renamed to match the CUE
+    if let Some(cue) = cue_path {
+        if let Some(cue_stem) = cue.file_stem() {
+            log::debug!("BIN not found, trying CUE basename: {}", cue_stem.to_string_lossy());
+            for ext in &["bin", "BIN", "img", "IMG"] {
+                let try_path = cue_dir.join(format!("{}.{}", cue_stem.to_string_lossy(), ext));
+                if try_path.exists() {
+                    log::debug!("Found BIN using CUE basename: {}", try_path.display());
+                    return Ok(try_path);
+                }
+            }
         }
     }
 
@@ -217,6 +296,7 @@ fn read_pvd_from_bin<R: Read + Seek>(
     data_offset: u64,
 ) -> BinCueResult<PrimaryVolumeDescriptor> {
     // Calculate byte offset to PVD (sector 16)
+    // For raw sectors (2352), data_offset is where user data starts within the sector
     let pvd_byte_offset = (PVD_SECTOR * sector_size) + data_offset;
 
     log::debug!(
@@ -228,6 +308,13 @@ fn read_pvd_from_bin<R: Read + Seek>(
 
     let mut buffer = [0u8; SECTOR_SIZE as usize];
     reader.read_exact(&mut buffer)?;
+
+    // Debug: show first few bytes to verify we're reading the right data
+    log::debug!(
+        "PVD first 8 bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+        buffer[0], buffer[1], buffer[2], buffer[3],
+        buffer[4], buffer[5], buffer[6], buffer[7]
+    );
 
     PrimaryVolumeDescriptor::parse(&buffer).map_err(BinCueError::Iso9660)
 }
@@ -279,5 +366,37 @@ mod tests {
         assert_eq!(size, 2352);
         assert_eq!(offset, 16);
         assert!(is_data);
+    }
+
+    #[test]
+    fn test_normalize_cue_keywords() {
+        let input = r#"FILE "game.bin" BINARY
+TRACK 01 MODE1/2352
+  INDEX 01 00:00:00"#;
+        let output = normalize_cue_keywords(input);
+        assert!(output.contains("Binary"));
+        assert!(!output.contains("BINARY"));
+    }
+
+    #[test]
+    fn test_parse_multifile_cue() {
+        let cue_content = r#"CATALOG 0000000000000
+FILE "Batman Forever (Europe) (Track 01).bin" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:00
+FILE "Batman Forever (Europe) (Track 02).bin" BINARY
+  TRACK 02 AUDIO
+    INDEX 00 00:00:00
+    INDEX 01 00:02:00"#;
+
+        let normalized = normalize_cue_keywords(cue_content);
+        println!("Normalized:\n{}", normalized);
+
+        let result = parse_cue(&normalized);
+        println!("Parse result: {:?}", result);
+        assert!(result.is_ok(), "Failed to parse CUE: {:?}", result.err());
+
+        let commands = result.unwrap();
+        assert!(commands.len() >= 4, "Expected at least 4 commands, got {}", commands.len());
     }
 }
