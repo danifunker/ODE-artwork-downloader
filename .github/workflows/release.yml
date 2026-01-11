@@ -1,0 +1,336 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  generate-version:
+    needs: generate-version
+    name: Generate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Generate version from date
+        id: version
+        run: |
+          VERSION=$(date -u +"%Y%m%d%H%M")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: i686-pc-windows-msvc
+            arch: x86
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      ${{ needs.generate-version.outputs.version }}-
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../ode-artwork-downloader-windows-${{ matrix.arch }}.zip ode-artwork-downloader.exe
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip
+
+  build-macos:
+    name: Build macOS
+    needs: generate-version
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      
+      - name: Package
+        run: |${{ needs.generate-version.outputs.version }}-
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../ode-artwork-downloader-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz
+
+  build-linux-appimage:
+    name: Build Linux AppImage
+    needs: generate-version
+    name: Build Linux AppImage
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            arch: x86
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config
+          
+          if [ "${{ matrix.target }}" = "i686-unknown-linux-gnu" ]; then
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install -y gcc-multilib g++-multilib libgtk-3-dev:i386 libssl-dev:i386
+          elif [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          fi
+          cargo build --release --target ${{ matrix.target }}
+      
+      - name: Download AppImage tools
+        run: |
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+            chmod +x appimagetool-x86_64.AppImage
+            mv appimagetool-x86_64.AppImage appimagetool
+          elif [ "${{ matrix.arch }}" = "x86" ]; then
+            wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-i686.AppImage
+            chmod +x appimagetool-i686.AppImage
+            mv appimagetool-i686.AppImage appimagetool
+          elif [ "${{ matrix.arch }}" = "arm64" ]; then
+            wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage
+            chmod +x appimagetool-aarch64.AppImage
+            mv appimagetool-aarch64.AppImage appimagetool
+          fi
+      
+      - name: Create AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          
+          cp target/${{ matrix.target }}/release/ode-artwork-downloader AppDir/usr/bin/
+          
+          cat > AppDir/usr/share/applications/ode-artwork-downloader.desktop << EOF
+          [Desktop Entry]
+          Name=ODE Artwork Downloader
+          Exec=ode-artwork-downloader
+          Icon=ode-artwork-downloader
+          Type=Application
+          Categories=Utility;
+          EOF
+          
+          # Create a simple icon (you should replace this with your actual icon)
+          echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" | base64 -d > AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png
+          
+          ln -s usr/share/applications/ode-artwork-downloader.desktop AppDir/
+          ln -s usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png${{ needs.generate-version.outputs.version }}- AppDir/
+          
+          ARCH=${{ matrix.arch }} ./appimagetool AppDir ode-artwork-downloader-linux-${{ matrix.arch }}.AppImage
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
+
+  build-linux-snap:
+    name: Build Linux Snap
+    needs: generate-version
+  build-linux-snap:
+    name: Build Linux Snap
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: i386
+            target: i686-unknown-linux-gnu
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Snapcraft
+        run: |
+          sudo snap install snapcraft --classic
+      
+      - name: Create snapcraft.yaml
+        run: |
+          mkdir -p ${{ needs.generate-version.outputs.version }}p
+          cat > snap/snapcraft.yaml << 'EOF'
+          name: ode-artwork-downloader
+          version: git
+          summary: ODE Artwork Downloader
+          description: |
+            Download artwork for ODE (Optical Disc Emulator) devices.
+          
+          base: core22
+          confinement: strict
+          grade: stable
+          
+          architectures:
+            - build-on: ${{ matrix.arch }}
+          
+          apps:
+            ode-artwork-downloader:
+              command: bin/ode-artwork-downloader
+              plugs:
+                - home
+                - network
+                - desktop
+                - desktop-legacy
+                - wayland
+                - x11
+          
+          parts:
+            ode-artwork-downloader:
+              plugin: rust
+              source: .
+              build-packages:
+                - libgtk-3-dev
+                - libssl-dev
+                - pkg-config
+              stage-packages:
+                - libgtk-3-0
+                - libssl3
+          EOF
+      
+      - name: Build snap
+        run: |
+          snapcraft --use-lxd
+        env:
+          SNAPCRAFT_BUILD_ENVIRONMENT: lxd
+      ${{ needs.generate-version.outputs.version }}-
+      - name: Rename snap
+        run: |
+          mv *.snap ode-artwork-downloader-linux-${{ matrix.arch }}.snap
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
+
+  release:
+    name: Create Release
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap]
+    runs-on: ubuntu-latestd-linux-appimage, build-linux-snap]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        witag_name: v${{ needs.generate-version.outputs.version }}
+          name: Release ${{ needs.generate-version.outputs.version }}
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: tru
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,35 @@
+name: ode-artwork-downloader
+version: git
+summary: ODE Artwork Downloader
+description: |
+  Download artwork for ODE (Optical Disc Emulator) devices.
+  
+  This application helps you find and download artwork for your optical disc
+  emulator, supporting various disc formats and artwork sources.
+
+base: core22
+confinement: strict
+grade: stable
+
+apps:
+  ode-artwork-downloader:
+    command: bin/ode-artwork-downloader
+    plugs:
+      - home
+      - network
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+
+parts:
+  ode-artwork-downloader:
+    plugin: rust
+    source: .
+    build-packages:
+      - libgtk-3-dev
+      - libssl-dev
+      - pkg-config
+    stage-packages:
+      - libgtk-3-0
+      - libssl3
