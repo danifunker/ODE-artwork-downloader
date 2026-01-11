@@ -1,0 +1,34 @@
+[package]
+name = "ode-artwork-downloader"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform GUI application to download cover art for USBODE disc images"
+license = "MIT"
+repository = "https://github.com/dani/ODE-artwork-downloader"
+
+[dependencies]
+# GUI
+eframe = "0.30"
+egui = "0.30"
+egui_extras = { version = "0.30", features = ["image"] }
+rfd = "0.15"
+
+# Image processing
+image = "0.25"
+
+# HTTP and serialization
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+regex = "1.10"
+thiserror = "2.0"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
