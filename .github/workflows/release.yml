@@ -257,7 +257,7 @@ jobs:
       
       - name: Build snap
         run: |
-          snapcraft pack
+          snapcraft pack --destructive-mode
       
       - name: Rename snap
         run: |
@@ -286,7 +286,7 @@ jobs:
       
       - name: Build snap
         run: |
-          snapcraft pack
+          snapcraft pack --destructive-mode
       
       - name: Rename snap
         run: |
