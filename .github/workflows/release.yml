@@ -5,6 +5,13 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - "*.md"
+      - "version.txt"
+      - "os-sublist.json"
+      - "docs/**"
+      - "/update-os-sublist.sh"
+      # - ".github/**"
   workflow_dispatch:
 
 env:
@@ -237,17 +244,10 @@ jobs:
     name: Build Linux Snap
     needs: generate-version
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - a${{ matrix.runs-on }}
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            runs-on: ubuntu-latest
-          - arch: arm64
-            runs-on: [self-hosted, linux, ARM64]
+  build-linux-snap-amd64:
+    name: Build Linux Snap (amd64)
+    needs: generate-version
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
@@ -261,17 +261,50 @@ jobs:
       
       - name: Build snap
         run: |
-          snapcraft pack-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
+          snapcraft pack
+      
+      - name: Rename snap
+        run: |
+          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-snap
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.snap
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64-snap
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64.snap
+
+  build-linux-snap-arm64:
+    name: Build Linux Snap (arm64)
+    needs: generate-version
+    runs-on: [self-hosted, linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Snapcraft
+        run: |
+          sudo snap install snapcraft --classic
+      
+      - name: Update snapcraft.yaml with version
+        run: |
+          sed -i "s/^version: .*/version: '${{ needs.generate-version.outputs.version }}'/" snap/snapcraft.yaml
+      
+      - name: Build snap
+        run: |
+          snapcraft pack
+      
+      - name: Rename snap
+        run: |
+          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64-snap
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
 
   release:
     name: Create Release
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap]
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
