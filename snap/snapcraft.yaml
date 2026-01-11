@@ -15,6 +15,7 @@ icon: assets/icons/icon.png
 apps:
   ode-artwork-downloader:
     command: bin/ode-artwork-downloader
+    extensions: [gnome]
     plugs:
       - home
       - network

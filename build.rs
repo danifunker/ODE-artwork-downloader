@@ -16,11 +16,24 @@ fn main() {
     
     println!("cargo:rustc-env=APP_VERSION={}", full_version);
     
-    // Windows-specific icon embedding
+    // Windows-specific icon and resource embedding
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();
         res.set_icon("assets/icons/icon.ico");
-        res.compile().unwrap();
+        
+        // Set application info
+        res.set("ProductName", "ODE Artwork Downloader");
+        res.set("FileDescription", "Download artwork for ODE disc images");
+        res.set("CompanyName", "dani");
+        
+        // Use the APP_VERSION we just set
+        res.set("FileVersion", &full_version);
+        res.set("ProductVersion", &full_version);
+        
+        if let Err(e) = res.compile() {
+            eprintln!("Warning: Failed to compile Windows resources: {}", e);
+            eprintln!("The .exe will still work but won't have an embedded icon.");
+        }
     }
 }

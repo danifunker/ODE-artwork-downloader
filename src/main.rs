@@ -3,6 +3,9 @@
 //! A cross-platform GUI application that automatically identifies CD/DVD disc images
 //! and downloads appropriate cover art for the USBODE project.
 
+// Hide console window on Windows release builds
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui;
 
 mod api;

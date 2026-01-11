@@ -132,22 +132,62 @@ jobs:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
       
-      - name: Package
+      - name: Create macOS app bundle
         run: |
-          cd target/${{ matrix.target }}/release
-          if [ -f "../../../assets/icons/icon.icns" ]; then
-            tar czf ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader ../../../assets/icons/icon.icns
-          elif [ -f "../../../assets/icons/icon.png" ]; then
-            tar czf ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader ../../../assets/icons/icon.png
-          else
-            tar czf ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz ode-artwork-downloader
+          APP_NAME="ODE Artwork Downloader"
+          BUNDLE_NAME="ODE-Artwork-Downloader.app"
+          VERSION="${{ needs.generate-version.outputs.version }}"
+          
+          # Create app bundle structure
+          mkdir -p "${BUNDLE_NAME}/Contents/MacOS"
+          mkdir -p "${BUNDLE_NAME}/Contents/Resources"
+          
+          # Copy binary
+          cp "target/${{ matrix.target }}/release/ode-artwork-downloader" "${BUNDLE_NAME}/Contents/MacOS/"
+          
+          # Copy icon if available
+          if [ -f "assets/icons/icon.icns" ]; then
+            cp "assets/icons/icon.icns" "${BUNDLE_NAME}/Contents/Resources/AppIcon.icns"
           fi
+          
+          # Create Info.plist
+          cat > "${BUNDLE_NAME}/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleDisplayName</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleIdentifier</key>
+              <string>io.github.dani.ode-artwork-downloader</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleExecutable</key>
+              <string>ode-artwork-downloader</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon.icns</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.13</string>
+          </dict>
+          </plist>
+          EOF
+          
+          # Create DMG
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.dmg"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.tar.gz
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.dmg
 
   build-linux-appimage:
     name: Build Linux AppImage
@@ -230,26 +270,32 @@ jobs:
           
           cp target/${{ matrix.target }}/release/ode-artwork-downloader AppDir/usr/bin/
           
+          # Create proper .desktop file with all required fields
           cat > AppDir/usr/share/applications/ode-artwork-downloader.desktop << EOF
           [Desktop Entry]
+          Type=Application
           Name=ODE Artwork Downloader
+          Comment=Download artwork for ODE disc images
           Exec=ode-artwork-downloader
           Icon=ode-artwork-downloader
-          Type=Application
-          Categories=Utility;
+          Categories=Utility;Graphics;
+          Terminal=false
+          StartupNotify=true
           EOF
           
-          # Use generated icon if available, otherwise create a placeholder
-          if [ -f "assets/icons/hicolor/256x256/apps/ode-artwork-downloader.png" ]; then
-            cp assets/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/usr/share/icons/hicolor/256x256/apps/
-          elif [ -f "assets/icons/icon-256.png" ]; then
+          # Copy icon with proper naming
+          if [ -f "assets/icons/icon-256.png" ]; then
             cp assets/icons/icon-256.png AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png
+            # Also copy to root for AppImage (some systems need this)
+            cp assets/icons/icon-256.png AppDir/ode-artwork-downloader.png
           else
+            # Fallback tiny placeholder
             echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" | base64 -d > AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png
+            cp AppDir/usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/ode-artwork-downloader.png
           fi
           
-          ln -s usr/share/applications/ode-artwork-downloader.desktop AppDir/
-          ln -s usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/
+          # Copy .desktop file to root (required for AppImage)
+          cp AppDir/usr/share/applications/ode-artwork-downloader.desktop AppDir/
           
           # Create AppRun as symlink to the binary
           ln -s usr/bin/ode-artwork-downloader AppDir/AppRun
