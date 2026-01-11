@@ -14,6 +14,9 @@ on:
       # - ".github/**"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -246,6 +249,9 @@ jobs:
           ln -s usr/share/applications/ode-artwork-downloader.desktop AppDir/
           ln -s usr/share/icons/hicolor/256x256/apps/ode-artwork-downloader.png AppDir/
           
+          # Create AppRun as symlink to the binary
+          ln -s usr/bin/ode-artwork-downloader AppDir/AppRun
+          
           # Use extracted appimagetool with --no-appstream to avoid FUSE requirement
           ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
       
@@ -305,10 +311,71 @@ jobs:
           name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64-snap
           path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
 
+  build-linux-flatpak:
+    name: Build Linux Flatpak
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runs-on: [self-hosted, linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install flatpak tools (GitHub-hosted only)
+        if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+      
+      - name: Check and install flatpak tools (self-hosted)
+        if: ${{ contains(matrix.runs-on, 'self-hosted') }}
+        run: |
+          if ! command -v flatpak &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y flatpak flatpak-builder
+          fi
+      
+      - name: Add Flathub repository
+        run: |
+          flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo --user
+      
+      - name: Install Freedesktop runtime and SDK
+        run: |
+          flatpak install -y --user flathub org.freedesktop.Platform//23.08 org.freedesktop.Sdk//23.08 org.freedesktop.Sdk.Extension.rust-stable//23.08
+      
+      - name: Generate cargo sources
+        run: |
+          # Install flatpak-cargo-generator if not present
+          if [ ! -f flatpak-cargo-generator.py ]; then
+            wget https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+            chmod +x flatpak-cargo-generator.py
+          fi
+          python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
+      
+      - name: Build Flatpak
+        run: |
+          flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo build-dir flatpak/io.github.dani.ODEArtworkDownloader.yml
+      
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle repo ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.flatpak io.github.dani.ODEArtworkDownloader
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-flatpak
+          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.flatpak
+
   release:
     name: Create Release
-    #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64]
-    needs: [generate-version, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64]
+    #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
+    needs: [generate-version, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

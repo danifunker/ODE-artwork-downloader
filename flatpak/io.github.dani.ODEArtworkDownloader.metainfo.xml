@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.dani.ODEArtworkDownloader</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>ODE Artwork Downloader</name>
+  <summary>Download artwork for ODE (Optical Disc Emulator) devices</summary>
+  
+  <description>
+    <p>
+      ODE Artwork Downloader helps you find and download artwork for your optical disc
+      emulator, supporting various disc formats and artwork sources.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Support for multiple disc formats (ISO, CHD, BIN/CUE)</li>
+      <li>Search and download artwork from multiple sources</li>
+      <li>Easy-to-use graphical interface</li>
+      <li>Fast and efficient artwork management</li>
+    </ul>
+  </description>
+  
+  <launchable type="desktop-id">io.github.dani.ODEArtworkDownloader.desktop</launchable>
+  
+  <url type="homepage">https://github.com/dani/ODE-artwork-downloader</url>
+  <url type="bugtracker">https://github.com/dani/ODE-artwork-downloader/issues</url>
+  
+  <categories>
+    <category>Utility</category>
+  </categories>
+  
+  <content_rating type="oars-1.1" />
+  
+  <releases>
+    <release version="0.1.0" date="2026-01-11">
+      <description>
+        <p>Initial release</p>
+      </description>
+    </release>
+  </releases>
+</component>

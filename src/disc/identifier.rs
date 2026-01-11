@@ -46,6 +46,8 @@ pub struct ParsedFilename {
     pub serial: Option<String>,
     /// Detected version info (if any)
     pub version: Option<String>,
+    /// Detected year (if any)
+    pub year: Option<u32>,
 }
 
 // Regex patterns for filename parsing
@@ -63,6 +65,11 @@ static SERIAL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 static VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\s*\((v\d+\.?\d*|Rev\s*[A-Z0-9]+)\)").unwrap()
+});
+
+static YEAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    // Match years in parentheses like (1997) or standalone 4-digit years 1990-2030
+    Regex::new(r"\s*\((19[89]\d|20[0-3]\d)\)|\b(19[89]\d|20[0-3]\d)\b").unwrap()
 });
 
 static EXTRA_TAGS_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -88,6 +95,7 @@ pub fn parse_filename(path: &Path) -> ParsedFilename {
     let mut disc_number = None;
     let mut serial = None;
     let mut version = None;
+    let mut year = None;
 
     // Extract region
     if let Some(caps) = REGION_PATTERN.captures(&title) {
@@ -113,6 +121,17 @@ pub fn parse_filename(path: &Path) -> ParsedFilename {
         title = VERSION_PATTERN.replace(&title, "").to_string();
     }
 
+    // Extract year (before removing extra tags)
+    if let Some(caps) = YEAR_PATTERN.captures(&title) {
+        // Try group 1 (year in parens) or group 2 (standalone year)
+        let year_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+        year = year_str.and_then(|s| s.parse().ok());
+        // Only remove year if it was in parentheses
+        if caps.get(1).is_some() {
+            title = YEAR_PATTERN.replace(&title, "").to_string();
+        }
+    }
+
     // Remove any remaining tags in parentheses or brackets
     title = EXTRA_TAGS_PATTERN.replace_all(&title, "").to_string();
 
@@ -132,6 +151,7 @@ pub fn parse_filename(path: &Path) -> ParsedFilename {
         disc_number,
         serial,
         version,
+        year,
     }
 }
 
@@ -225,5 +245,24 @@ mod tests {
     fn test_normalize_volume_label() {
         assert_eq!(normalize_volume_label("GAME_TITLE"), "GAME TITLE");
         assert_eq!(normalize_volume_label("  GAME   TITLE  "), "GAME TITLE");
+    }
+
+    #[test]
+    fn test_parse_filename_with_year_in_parens() {
+        let path = Path::new("Doom (1993).iso");
+        let parsed = parse_filename(path);
+
+        assert_eq!(parsed.title, "Doom");
+        assert_eq!(parsed.year, Some(1993));
+    }
+
+    #[test]
+    fn test_parse_filename_with_year_and_region() {
+        let path = Path::new("Command & Conquer (1995) (USA).iso");
+        let parsed = parse_filename(path);
+
+        assert_eq!(parsed.title, "Command & Conquer");
+        assert_eq!(parsed.year, Some(1995));
+        assert_eq!(parsed.region, Some("USA".to_string()));
     }
 }

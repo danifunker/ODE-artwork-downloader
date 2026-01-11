@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=ODE Artwork Downloader
+Comment=Download artwork for ODE (Optical Disc Emulator) devices
+Exec=ode-artwork-downloader
+Icon=io.github.dani.ODEArtworkDownloader
+Type=Application
+Categories=Utility;
+StartupNotify=true
