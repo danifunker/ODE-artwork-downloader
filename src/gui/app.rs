@@ -3,7 +3,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 
-use crate::disc::{formats::supported_extensions, ConfidenceLevel, DiscInfo, DiscReader};
+use crate::disc::{supported_extensions, ConfidenceLevel, DiscInfo, DiscReader};
 
 /// Main application state
 pub struct App {
@@ -186,8 +186,12 @@ impl eframe::App for App {
                             .spacing([40.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
-                                ui.label("Title:");
-                                ui.strong(&info.title);
+                                ui.label("Volume Label:");
+                                if let Some(ref label) = info.volume_label {
+                                    ui.strong(label);
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "Not found");
+                                }
                                 ui.end_row();
 
                                 ui.label("Format:");
@@ -197,12 +201,6 @@ impl eframe::App for App {
                                 ui.label("Filesystem:");
                                 ui.label(info.filesystem.display_name());
                                 ui.end_row();
-
-                                if let Some(ref label) = info.volume_label {
-                                    ui.label("Volume Label:");
-                                    ui.label(label);
-                                    ui.end_row();
-                                }
 
                                 ui.label("Confidence:");
                                 let (color, text) = match info.confidence {

@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 
 /// Confidence level for game identification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
 pub enum ConfidenceLevel {
     /// Low confidence - derived from filename only
     Low,
@@ -31,6 +32,7 @@ impl ConfidenceLevel {
 
 /// Result of parsing a filename for game information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ParsedFilename {
     /// Cleaned game title
     pub title: String,

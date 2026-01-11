@@ -13,6 +13,7 @@ use super::iso9660::PrimaryVolumeDescriptor;
 
 /// Errors that can occur when reading disc images
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum DiscError {
     #[error("File not found: {0}")]
     FileNotFound(PathBuf),
@@ -32,6 +33,7 @@ pub enum DiscError {
 
 /// Information extracted from a disc image
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DiscInfo {
     /// Path to the disc image file
     pub path: PathBuf,
@@ -137,43 +139,135 @@ impl DiscReader {
     }
 
     /// Read a CHD file
-    ///
-    /// CHD support will be implemented in a future update.
-    /// For now, falls back to filename parsing.
     fn read_chd(path: &Path, parsed_filename: ParsedFilename) -> Result<DiscInfo, DiscError> {
-        // TODO: Implement CHD reading using chdman or pure Rust
-        // For now, fall back to filename parsing
-        log::warn!("CHD reading not yet implemented, using filename parsing");
+        match super::chd::read_chd(path) {
+            Ok(chd_info) => {
+                // Determine filesystem type based on whether we found ISO9660 data
+                let filesystem = if chd_info.pvd.is_some() {
+                    FilesystemType::Iso9660
+                } else {
+                    FilesystemType::Unknown
+                };
 
-        Ok(DiscInfo {
-            path: path.to_path_buf(),
-            format: DiscFormat::Chd,
-            filesystem: FilesystemType::Unknown,
-            volume_label: None,
-            title: parsed_filename.title.clone(),
-            parsed_filename,
-            confidence: ConfidenceLevel::Low,
-            pvd: None,
-        })
+                // Determine title and confidence
+                let (title, confidence) = if let Some(ref label) = chd_info.volume_label {
+                    if label.len() > 2 && !label.chars().all(|c| c.is_ascii_digit()) {
+                        (super::identifier::normalize_volume_label(label), ConfidenceLevel::High)
+                    } else {
+                        (parsed_filename.title.clone(), ConfidenceLevel::Low)
+                    }
+                } else if let Some(ref meta) = chd_info.metadata {
+                    // CHD metadata available but no volume label
+                    (meta.clone(), ConfidenceLevel::Medium)
+                } else {
+                    (parsed_filename.title.clone(), ConfidenceLevel::Low)
+                };
+
+                Ok(DiscInfo {
+                    path: path.to_path_buf(),
+                    format: DiscFormat::Chd,
+                    filesystem,
+                    volume_label: chd_info.volume_label,
+                    parsed_filename,
+                    title,
+                    confidence,
+                    pvd: chd_info.pvd,
+                })
+            }
+            Err(e) => {
+                // Log the error but fall back to filename parsing
+                log::warn!("Failed to read CHD file, falling back to filename: {}", e);
+
+                Ok(DiscInfo {
+                    path: path.to_path_buf(),
+                    format: DiscFormat::Chd,
+                    filesystem: FilesystemType::Unknown,
+                    volume_label: None,
+                    title: parsed_filename.title.clone(),
+                    parsed_filename,
+                    confidence: ConfidenceLevel::Low,
+                    pvd: None,
+                })
+            }
+        }
     }
 
     /// Read a BIN/CUE file
-    ///
-    /// BIN/CUE support will be implemented in Phase 3.
     fn read_bin_cue(path: &Path, parsed_filename: ParsedFilename) -> Result<DiscInfo, DiscError> {
-        // TODO: Implement BIN/CUE reading
-        log::warn!("BIN/CUE reading not yet implemented, using filename parsing");
+        // For CUE files, read the CUE sheet
+        // For BIN files, try to find the corresponding CUE file
+        let cue_path = if path.extension().map(|e| e.to_ascii_lowercase()) == Some("cue".into()) {
+            path.to_path_buf()
+        } else {
+            // It's a BIN file, look for matching CUE
+            let cue_path = path.with_extension("cue");
+            if cue_path.exists() {
+                cue_path
+            } else {
+                // Try uppercase
+                let cue_path_upper = path.with_extension("CUE");
+                if cue_path_upper.exists() {
+                    cue_path_upper
+                } else {
+                    // No CUE file found, fall back to filename parsing
+                    log::warn!("No CUE file found for BIN, using filename parsing");
+                    return Ok(DiscInfo {
+                        path: path.to_path_buf(),
+                        format: DiscFormat::BinCue,
+                        filesystem: FilesystemType::Unknown,
+                        volume_label: None,
+                        title: parsed_filename.title.clone(),
+                        parsed_filename,
+                        confidence: ConfidenceLevel::Low,
+                        pvd: None,
+                    });
+                }
+            }
+        };
 
-        Ok(DiscInfo {
-            path: path.to_path_buf(),
-            format: DiscFormat::BinCue,
-            filesystem: FilesystemType::Unknown,
-            volume_label: None,
-            title: parsed_filename.title.clone(),
-            parsed_filename,
-            confidence: ConfidenceLevel::Low,
-            pvd: None,
-        })
+        match super::bincue::read_bincue(&cue_path) {
+            Ok(bincue_info) => {
+                let filesystem = if bincue_info.pvd.is_some() {
+                    FilesystemType::Iso9660
+                } else {
+                    FilesystemType::Unknown
+                };
+
+                let (title, confidence) = if let Some(ref label) = bincue_info.volume_label {
+                    if label.len() > 2 && !label.chars().all(|c| c.is_ascii_digit()) {
+                        (super::identifier::normalize_volume_label(label), ConfidenceLevel::High)
+                    } else {
+                        (parsed_filename.title.clone(), ConfidenceLevel::Low)
+                    }
+                } else {
+                    (parsed_filename.title.clone(), ConfidenceLevel::Low)
+                };
+
+                Ok(DiscInfo {
+                    path: path.to_path_buf(),
+                    format: DiscFormat::BinCue,
+                    filesystem,
+                    volume_label: bincue_info.volume_label,
+                    parsed_filename,
+                    title,
+                    confidence,
+                    pvd: bincue_info.pvd,
+                })
+            }
+            Err(e) => {
+                log::warn!("Failed to read BIN/CUE, falling back to filename: {}", e);
+                Ok(DiscInfo {
+                    path: path.to_path_buf(),
+                    format: DiscFormat::BinCue,
+                    filesystem: FilesystemType::Unknown,
+                    volume_label: None,
+                    title: parsed_filename.title.clone(),
+                    parsed_filename,
+                    confidence: ConfidenceLevel::Low,
+                    pvd: None,
+                })
+            }
+        }
     }
 
     /// Read an MDS/MDF file

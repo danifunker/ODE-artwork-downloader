@@ -24,6 +24,7 @@ const ISO9660_IDENTIFIER: &[u8; 5] = b"CD001";
 ///
 /// Contains identifying information extracted from an ISO 9660 disc image.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PrimaryVolumeDescriptor {
     /// Volume identifier (32 bytes, space-padded)
     pub volume_id: String,

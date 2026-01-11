@@ -4,6 +4,7 @@ use std::path::Path;
 
 /// Supported disc image formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DiscFormat {
     /// ISO 9660 disc image (.iso)
     Iso,
@@ -39,6 +40,7 @@ impl DiscFormat {
     }
 
     /// Get supported file extensions for this format
+    #[allow(dead_code)]
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
             Self::Iso => &["iso"],
@@ -51,6 +53,7 @@ impl DiscFormat {
 
 /// Supported filesystem types found on disc images
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum FilesystemType {
     /// ISO 9660 standard filesystem
     Iso9660,

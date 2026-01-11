@@ -36,7 +36,7 @@ Create a cross-platform GUI application in Rust that automatically identifies CD
 | Basic GUI with egui | Done | `src/gui/app.rs` |
 | File picker and drag-drop | Done | |
 | Disc info display | Done | |
-| CHD support | Pending | Stub implemented, needs CHD library |
+| CHD support | Done | Using `chd` crate (pure Rust) |
 | BIN/CUE support | Pending | Stub implemented |
 | MDS/MDF support | Pending | Stub implemented |
 
@@ -81,9 +81,10 @@ Create a cross-platform GUI application in Rust that automatically identifies CD
 - Download and resize to 240x240 JPEG for USBODE
 
 ### CHD Handling Decision
-Include in Phase 1. Approach TBD:
-1. **chdman subprocess** - Shell out to chdman tool (simple, requires chdman installed)
-2. **Pure Rust** - Use or create pure Rust CHD reader (preferred for portability)
+**Resolved:** Using the `chd` crate (pure Rust implementation)
+- No native dependencies required
+- Works on all platforms without extra setup
+- Reads CHD files and extracts ISO9660 PVD from disc data
 
 ### File Naming Convention
 Output: `{original_filename}.jpg` (e.g., `game.chd` -> `game.jpg`)
@@ -172,6 +173,7 @@ ode-artwork-downloader/
 │   │   ├── formats.rs       # Format and filesystem enums
 │   │   ├── reader.rs        # Unified disc reader interface
 │   │   ├── iso9660.rs       # ISO9660 PVD parsing
+│   │   ├── chd.rs           # CHD file reading (pure Rust)
 │   │   └── identifier.rs    # Filename parsing, title extraction
 │   ├── gui/
 │   │   ├── mod.rs           # GUI module exports
