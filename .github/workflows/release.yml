@@ -240,10 +240,6 @@ jobs:
           name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-appimage
           path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
 
-  build-linux-snap:
-    name: Build Linux Snap
-    needs: generate-version
-    runs-on: ubuntu-latest
   build-linux-snap-amd64:
     name: Build Linux Snap (amd64)
     needs: generate-version
