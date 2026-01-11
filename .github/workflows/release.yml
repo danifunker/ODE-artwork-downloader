@@ -153,6 +153,7 @@ jobs:
     name: Build Linux AppImage
     needs: generate-version
     runs-on: ${{ matrix.runs-on }}
+    if: false # Disable Linux AppImage build for now as I'm fixing Linux flatpak
     strategy:
       matrix:
         include:
@@ -265,6 +266,7 @@ jobs:
     name: Build Linux Snap (amd64)
     needs: generate-version
     runs-on: ubuntu-latest
+    if: false # Disable Linux Snap build for now as I'm fixing Linux flatpak
     steps:
       - uses: actions/checkout@v4
       
@@ -288,6 +290,7 @@ jobs:
   build-linux-snap-arm64:
     name: Build Linux Snap (arm64)
     needs: generate-version
+    if: false # Disable Linux Snap build for now as I'm fixing Linux flatpak
     runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -375,7 +378,9 @@ jobs:
   release:
     name: Create Release
     #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
-    needs: [generate-version, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
+    #needs: [generate-version, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
+    needs: [generate-version, build-linux-flatpak]
+
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
