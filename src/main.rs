@@ -5,8 +5,11 @@
 
 use eframe::egui;
 
+mod api;
 mod disc;
+mod export;
 mod gui;
+mod search;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();

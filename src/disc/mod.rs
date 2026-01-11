@@ -14,7 +14,7 @@ mod reader;
 #[allow(unused_imports)]
 pub use formats::{DiscFormat, FilesystemType, supported_extensions};
 #[allow(unused_imports)]
-pub use identifier::{parse_filename, ConfidenceLevel};
+pub use identifier::{parse_filename, normalize_volume_label, ConfidenceLevel, ParsedFilename};
 #[allow(unused_imports)]
 pub use iso9660::PrimaryVolumeDescriptor;
 #[allow(unused_imports)]
