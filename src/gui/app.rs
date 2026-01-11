@@ -6,8 +6,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use crate::api::{open_in_browser, ArtworkSearchQuery};
-use crate::disc::{supported_extensions, ConfidenceLevel, DiscInfo, DiscReader};
-use crate::export::{export_artwork_from_url, generate_output_path, ExportResult, ExportSettings};
+use crate::disc::{supported_extensions, parse_filename, ConfidenceLevel, DiscInfo, DiscReader, DiscFormat, FilesystemType};
+use crate::export::{export_artwork, export_artwork_from_url, generate_output_path, ExportResult, ExportSettings};
 use crate::search::ImageResult;
 
 /// Main application state
@@ -44,6 +44,10 @@ pub struct App {
     search_query_text: String,
     /// Manual URL override for downloading
     manual_url: String,
+    /// Whether to show the log window
+    show_log_window: bool,
+    /// Last preview error message
+    preview_error: Option<String>,
 }
 
 /// A log message with severity level
@@ -80,6 +84,8 @@ impl Default for App {
             export_in_progress: false,
             search_query_text: String::new(),
             manual_url: String::new(),
+            show_log_window: false,
+            preview_error: None,
         }
     }
 }
@@ -124,8 +130,39 @@ impl App {
                 self.disc_info = Some(Ok(info));
             }
             Err(e) => {
-                self.log(LogLevel::Error, format!("Error reading disc: {}", e));
-                self.disc_info = Some(Err(e.to_string()));
+                let error_str = e.to_string();
+                // Check if this is likely an HFS/HFS+ disc or other non-ISO9660 format
+                let is_filesystem_error = error_str.contains("Primary Volume Descriptor")
+                    || error_str.contains("HFS")
+                    || error_str.contains("Parse error");
+
+                if is_filesystem_error {
+                    // Fall back to filename-only parsing for HFS and other unsupported filesystems
+                    self.log(
+                        LogLevel::Warning,
+                        format!("Could not read disc structure (may be HFS/Mac format), using filename only"),
+                    );
+
+                    // Create a minimal DiscInfo from filename
+                    let parsed = parse_filename(&path);
+                    let format = DiscFormat::from_path(&path).unwrap_or(DiscFormat::Iso);
+
+                    let fallback_info = DiscInfo {
+                        path: path.clone(),
+                        format,
+                        filesystem: FilesystemType::Unknown,
+                        volume_label: None,
+                        title: parsed.title.clone(),
+                        parsed_filename: parsed,
+                        confidence: ConfidenceLevel::Low,
+                        pvd: None,
+                    };
+
+                    self.disc_info = Some(Ok(fallback_info));
+                } else {
+                    self.log(LogLevel::Error, format!("Error reading disc: {}", e));
+                    self.disc_info = Some(Err(error_str));
+                }
             }
         }
     }
@@ -136,7 +173,7 @@ impl App {
 
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Disc Images", &extensions)
-            .add_filter("ISO Files", &["iso"])
+            .add_filter("ISO/Toast Files", &["iso", "toast"])
             .add_filter("CHD Files", &["chd"])
             .add_filter("BIN/CUE Files", &["bin", "cue"])
             .add_filter("All Files", &["*"])
@@ -228,6 +265,7 @@ impl App {
         self.preview_loading = true;
         self.preview_url = Some(url.clone());
         self.preview_texture = None;
+        self.preview_error = None;
         self.preview_receiver = Some(rx);
 
         thread::spawn(move || {
@@ -253,17 +291,22 @@ impl App {
                                 egui::TextureOptions::LINEAR,
                             );
                             self.preview_texture = Some(texture);
+                            self.preview_error = None;
                             self.log(LogLevel::Success, "Preview loaded");
                         }
                         Err(e) => {
-                            self.log(LogLevel::Error, format!("Failed to decode image: {}", e));
+                            let msg = format!("Failed to decode image: {}", e);
+                            self.preview_error = Some(msg.clone());
+                            self.log(LogLevel::Error, msg);
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     self.preview_loading = false;
                     self.preview_receiver = None;
-                    self.log(LogLevel::Error, format!("Failed to load preview: {}", e));
+                    let msg = format!("Failed to load: {}", e);
+                    self.preview_error = Some(msg.clone());
+                    self.log(LogLevel::Error, msg);
                 }
                 Err(TryRecvError::Empty) => {
                     // Still loading
@@ -290,6 +333,29 @@ impl App {
         thread::spawn(move || {
             let settings = ExportSettings::default();
             let result = export_artwork_from_url(&url, &path, &settings);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Convert a local image file (for drag-and-drop artwork)
+    fn convert_local_image(&mut self, image_path: &std::path::Path, output_path: &str) {
+        let image_path = image_path.to_path_buf();
+        let output = output_path.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        self.export_in_progress = true;
+        self.export_receiver = Some(rx);
+
+        self.log(LogLevel::Info, format!("Converting to {}", output));
+
+        thread::spawn(move || {
+            // Read the local file
+            let result = std::fs::read(&image_path)
+                .map_err(|e| format!("Failed to read file: {}", e))
+                .and_then(|bytes| {
+                    let settings = ExportSettings::default();
+                    export_artwork(&bytes, &output, &settings)
+                });
             let _ = tx.send(result);
         });
     }
@@ -399,7 +465,27 @@ impl eframe::App for App {
         // Process dropped files
         if let Some(file) = self.dropped_files.pop() {
             if let Some(path) = file.path {
-                self.process_file(path);
+                // Check if it's an image file (for manual artwork drop)
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_default();
+
+                let is_image = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp");
+
+                if is_image {
+                    // It's an image - convert and save if we have a disc selected
+                    if let Some(ref disc_path) = self.selected_path {
+                        let output_path = generate_output_path(disc_path);
+                        self.log(LogLevel::Info, format!("Converting dropped image: {}", path.display()));
+                        self.convert_local_image(&path, &output_path);
+                    } else {
+                        self.log(LogLevel::Warning, "Drop a disc image first, then drop artwork to convert");
+                    }
+                } else {
+                    // It's a disc image
+                    self.process_file(path);
+                }
             }
         }
 
@@ -409,37 +495,50 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("ODE Artwork Downloader");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("v0.1.0");
+                    ui.label(format!("v{}", env!("APP_VERSION")));
+                    ui.separator();
+                    let log_count = self.log_messages.len();
+                    let log_btn_text = if log_count > 0 {
+                        format!("Log ({})", log_count)
+                    } else {
+                        "Log".to_string()
+                    };
+                    if ui.button(log_btn_text).clicked() {
+                        self.show_log_window = !self.show_log_window;
+                    }
                 });
             });
             ui.add_space(4.0);
         });
 
-        // Bottom panel with log
-        egui::TopBottomPanel::bottom("log_panel")
-            .resizable(true)
-            .min_height(100.0)
-            .default_height(150.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.label("Log");
-                ui.separator();
+        // Log window (separate window, hidden by default)
+        if self.show_log_window {
+            egui::Window::new("Log")
+                .open(&mut self.show_log_window)
+                .default_size([500.0, 300.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    if ui.button("Clear").clicked() {
+                        self.log_messages.clear();
+                    }
+                    ui.separator();
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for msg in &self.log_messages {
-                            let color = match msg.level {
-                                LogLevel::Info => egui::Color32::GRAY,
-                                LogLevel::Success => egui::Color32::GREEN,
-                                LogLevel::Warning => egui::Color32::YELLOW,
-                                LogLevel::Error => egui::Color32::RED,
-                            };
-                            ui.colored_label(color, &msg.text);
-                        }
-                    });
-            });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for msg in &self.log_messages {
+                                let color = match msg.level {
+                                    LogLevel::Info => egui::Color32::GRAY,
+                                    LogLevel::Success => egui::Color32::GREEN,
+                                    LogLevel::Warning => egui::Color32::YELLOW,
+                                    LogLevel::Error => egui::Color32::RED,
+                                };
+                                ui.colored_label(color, &msg.text);
+                            }
+                        });
+                });
+        }
 
         // Main central panel
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -626,179 +725,216 @@ impl eframe::App for App {
                         }
 
                         // Display search results
-                        if !self.search_results.is_empty() {
-                            ui.add_space(16.0);
-                            ui.separator();
-
-                            // Two-column layout: results list on left, preview on right
-                            ui.horizontal(|ui| {
-                                // Left side: results list
-                                ui.vertical(|ui| {
-                                    ui.heading("Search Results");
-                                    ui.label(format!("{} images - click to preview", self.search_results.len()));
-                                    ui.add_space(8.0);
-
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("search_results")
-                                        .max_height(250.0)
-                                        .max_width(350.0)
-                                        .show(ui, |ui| {
-                                            let mut clicked_idx = None;
-
-                                            for (idx, result) in self.search_results.iter().enumerate() {
-                                                let is_selected = self.selected_image_index == Some(idx);
-                                                let truncated_title = if result.title.chars().count() > 40 {
-                                                    format!("{}...", result.title.chars().take(40).collect::<String>())
-                                                } else {
-                                                    result.title.clone()
-                                                };
-                                                let text = format!(
-                                                    "{}. {} ({}x{})",
-                                                    idx + 1,
-                                                    truncated_title,
-                                                    result.width.unwrap_or(0),
-                                                    result.height.unwrap_or(0)
-                                                );
-
-                                                let response = ui.selectable_label(is_selected, &text);
-                                                if response.clicked() {
-                                                    clicked_idx = Some(idx);
-                                                }
-                                                response.on_hover_text(&result.image_url);
-                                            }
-
-                                            // Handle selection change
-                                            if let Some(idx) = clicked_idx {
-                                                self.selected_image_index = Some(idx);
-                                                let url = self.search_results.get(idx).map(|r| r.image_url.clone());
-                                                if let Some(url) = url {
-                                                    self.load_preview(&url);
-                                                }
-                                            }
-                                        });
-                                });
-
-                                ui.add_space(16.0);
-
-                                // Right side: preview
-                                ui.vertical(|ui| {
-                                    ui.heading("Preview");
-
-                                    if self.preview_loading {
-                                        ui.add_space(50.0);
-                                        ui.horizontal(|ui| {
-                                            ui.spinner();
-                                            ui.label("Loading...");
-                                        });
-                                    } else if let Some(ref texture) = self.preview_texture {
-                                        let size = texture.size_vec2();
-                                        // Scale to fit in preview area (max 200x200)
-                                        let max_size = 200.0;
-                                        let scale = (max_size / size.x).min(max_size / size.y).min(1.0);
-                                        let display_size = egui::vec2(size.x * scale, size.y * scale);
-
-                                        // Clone data needed for closures before borrowing self
-                                        let texture_id = texture.id();
-                                        let img_width = size.x as u32;
-                                        let img_height = size.y as u32;
-                                        let can_download = self.selected_path.is_some()
-                                            && self.preview_url.is_some()
-                                            && !self.export_in_progress;
-                                        let export_in_progress = self.export_in_progress;
-                                        let output_path = self.selected_path.as_ref()
-                                            .map(|p| generate_output_path(p));
-                                        let preview_url = self.preview_url.clone();
-
-                                        // Image and download button side by side
-                                        let mut start_export_data: Option<(String, String)> = None;
-
-                                        ui.horizontal(|ui| {
-                                            // Image on the left
-                                            ui.vertical(|ui| {
-                                                ui.image((texture_id, display_size));
-                                                // Show dimensions below image
-                                                ui.label(format!("{}x{}", img_width, img_height));
-                                            });
-
-                                            ui.add_space(16.0);
-
-                                            // Download controls on the right
-                                            ui.vertical(|ui| {
-                                                ui.add_enabled_ui(can_download, |ui| {
-                                                    let btn_text = if export_in_progress {
-                                                        "Downloading..."
-                                                    } else {
-                                                        "Download & Save"
-                                                    };
-
-                                                    if ui.button(btn_text).clicked() {
-                                                        if let (Some(url), Some(path)) = (
-                                                            preview_url.clone(),
-                                                            output_path.clone(),
-                                                        ) {
-                                                            start_export_data = Some((url, path));
-                                                        }
-                                                    }
-                                                });
-
-                                                if export_in_progress {
-                                                    ui.horizontal(|ui| {
-                                                        ui.spinner();
-                                                        ui.label("Converting...");
-                                                    });
-                                                }
-
-                                                ui.add_space(8.0);
-
-                                                // Show where it will be saved
-                                                if let Some(ref path) = output_path {
-                                                    ui.label(egui::RichText::new("Save to:")
-                                                        .small()
-                                                        .color(egui::Color32::GRAY));
-                                                    ui.label(egui::RichText::new(path)
-                                                        .small()
-                                                        .color(egui::Color32::GRAY));
-                                                }
-                                            });
-                                        });
-
-                                        // Handle export after closures
-                                        if let Some((url, path)) = start_export_data {
-                                            self.start_export(&url, &path);
-                                        }
-                                    } else {
-                                        ui.add_space(50.0);
-                                        ui.label("Select an image to preview");
-                                    }
-                                });
-                            });
+                        let has_results = !self.search_results.is_empty();
+                        if has_results {
+                            ui.add_space(8.0);
                         }
                     }
                     Some(Err(ref error)) => {
                         ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
                     }
                     None => {
-                        ui.label("Select a disc image file to view information.");
+                        // Center the drag-and-drop hint in available space
+                        let available = ui.available_size();
+                        ui.allocate_space(egui::vec2(0.0, available.y * 0.3));
 
-                        // Show drag-and-drop hint
-                        ui.add_space(20.0);
-                        let rect = ui.available_rect_before_wrap();
-                        let response = ui.allocate_rect(rect, egui::Sense::hover());
-
-                        if response.hovered() {
-                            ui.painter().rect_stroke(
-                                rect,
-                                8.0,
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 100, 200)),
+                        ui.vertical_centered(|ui| {
+                            ui.label("Select a disc image file to view information.");
+                            ui.add_space(40.0);
+                            ui.label(
+                                egui::RichText::new("Drag and drop disc image files here")
+                                    .size(18.0)
+                                    .color(egui::Color32::GRAY)
                             );
-                        }
-
-                        ui.centered_and_justified(|ui| {
-                            ui.label("Drag and drop disc image files here");
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("Supported: ISO, Toast, CHD, BIN/CUE, MDS/MDF")
+                                    .small()
+                                    .color(egui::Color32::DARK_GRAY)
+                            );
                         });
                     }
                 }
             });
+
+            // Search results section - outside the group so it can expand
+            if !self.search_results.is_empty() {
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    // Left side: results list
+                    ui.vertical(|ui| {
+                        ui.heading("Search Results");
+                        ui.label(format!("{} images - click to preview", self.search_results.len()));
+                        ui.add_space(8.0);
+
+                        // Fixed height for ~10 results with scrolling
+                        let results_height = 280.0_f32.min(ui.available_height() - 50.0).max(150.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("search_results")
+                            .auto_shrink([false, false])
+                            .min_scrolled_height(results_height)
+                            .max_height(results_height)
+                            .max_width(420.0)
+                            .show(ui, |ui| {
+                                let mut clicked_idx = None;
+
+                                for (idx, result) in self.search_results.iter().enumerate() {
+                                    let is_selected = self.selected_image_index == Some(idx);
+                                    let truncated_title = if result.title.chars().count() > 50 {
+                                        format!("{}...", result.title.chars().take(50).collect::<String>())
+                                    } else {
+                                        result.title.clone()
+                                    };
+                                    let text = format!(
+                                        "{}. {} ({}x{})",
+                                        idx + 1,
+                                        truncated_title,
+                                        result.width.unwrap_or(0),
+                                        result.height.unwrap_or(0)
+                                    );
+
+                                    let response = ui.selectable_label(is_selected, &text);
+                                    if response.clicked() {
+                                        clicked_idx = Some(idx);
+                                    }
+
+                                    // Add hover text and context menu
+                                    let response = response.on_hover_text(&result.image_url);
+                                    response.context_menu(|ui| {
+                                        if ui.button("Copy URL to clipboard").clicked() {
+                                            ui.output_mut(|o| o.copied_text = result.image_url.clone());
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Open in browser").clicked() {
+                                            let _ = open_in_browser(&result.image_url);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+
+                                // Handle selection change
+                                if let Some(idx) = clicked_idx {
+                                    self.selected_image_index = Some(idx);
+                                    let url = self.search_results.get(idx).map(|r| r.image_url.clone());
+                                    if let Some(url) = url {
+                                        self.load_preview(&url);
+                                    }
+                                }
+                            });
+                    });
+
+                    ui.add_space(16.0);
+
+                    // Right side: preview
+                    ui.vertical(|ui| {
+                        ui.heading("Preview");
+
+                        if self.preview_loading {
+                            ui.add_space(50.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Loading...");
+                            });
+                        } else if let Some(ref texture) = self.preview_texture {
+                            let size = texture.size_vec2();
+                            // Scale to fit in preview area (max 200x200)
+                            let max_size = 200.0;
+                            let scale = (max_size / size.x).min(max_size / size.y).min(1.0);
+                            let display_size = egui::vec2(size.x * scale, size.y * scale);
+
+                            // Clone data needed for closures before borrowing self
+                            let texture_id = texture.id();
+                            let img_width = size.x as u32;
+                            let img_height = size.y as u32;
+                            let can_download = self.selected_path.is_some()
+                                && self.preview_url.is_some()
+                                && !self.export_in_progress;
+                            let export_in_progress = self.export_in_progress;
+                            let output_path = self.selected_path.as_ref()
+                                .map(|p| generate_output_path(p));
+                            let preview_url = self.preview_url.clone();
+
+                            // Image and download button side by side
+                            let mut start_export_data: Option<(String, String)> = None;
+
+                            ui.horizontal(|ui| {
+                                // Image on the left
+                                ui.vertical(|ui| {
+                                    ui.image((texture_id, display_size));
+                                    // Show dimensions below image
+                                    ui.label(format!("{}x{}", img_width, img_height));
+                                });
+
+                                ui.add_space(16.0);
+
+                                // Download controls on the right
+                                ui.vertical(|ui| {
+                                    ui.add_enabled_ui(can_download, |ui| {
+                                        let btn_text = if export_in_progress {
+                                            "Downloading..."
+                                        } else {
+                                            "Download & Save"
+                                        };
+
+                                        if ui.button(btn_text).clicked() {
+                                            if let (Some(url), Some(path)) = (
+                                                preview_url.clone(),
+                                                output_path.clone(),
+                                            ) {
+                                                start_export_data = Some((url, path));
+                                            }
+                                        }
+                                    });
+
+                                    if export_in_progress {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label("Converting...");
+                                        });
+                                    }
+
+                                    ui.add_space(8.0);
+
+                                    // Show where it will be saved
+                                    if let Some(ref path) = output_path {
+                                        ui.label(egui::RichText::new("Save to:")
+                                            .small()
+                                            .color(egui::Color32::GRAY));
+                                        ui.label(egui::RichText::new(path)
+                                            .small()
+                                            .color(egui::Color32::GRAY));
+                                    }
+                                });
+                            });
+
+                            // Handle export after closures
+                            if let Some((url, path)) = start_export_data {
+                                self.start_export(&url, &path);
+                            }
+                        } else if let Some(ref error) = self.preview_error {
+                            // Show error message
+                            ui.add_space(20.0);
+                            ui.colored_label(egui::Color32::RED, error);
+                            ui.add_space(10.0);
+                            ui.label("Tip: Download the image manually and drop it here");
+
+                            // Drop zone for manual image
+                            let output_path = self.selected_path.as_ref()
+                                .map(|p| generate_output_path(p));
+                            if let Some(ref path) = output_path {
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new(format!("Will save to: {}", path))
+                                    .small()
+                                    .color(egui::Color32::GRAY));
+                            }
+                        } else {
+                            ui.add_space(50.0);
+                            ui.label("Select an image to preview");
+                        }
+                    });
+                });
+            }
         });
 
         // Show drag-and-drop preview

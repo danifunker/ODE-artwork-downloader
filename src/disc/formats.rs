@@ -21,7 +21,7 @@ impl DiscFormat {
     pub fn from_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_lowercase();
         match ext.as_str() {
-            "iso" => Some(Self::Iso),
+            "iso" | "toast" => Some(Self::Iso),
             "bin" | "cue" => Some(Self::BinCue),
             "chd" => Some(Self::Chd),
             "mds" | "mdf" => Some(Self::MdsMdf),
@@ -43,7 +43,7 @@ impl DiscFormat {
     #[allow(dead_code)]
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
-            Self::Iso => &["iso"],
+            Self::Iso => &["iso", "toast"],
             Self::BinCue => &["bin", "cue"],
             Self::Chd => &["chd"],
             Self::MdsMdf => &["mds", "mdf"],
@@ -85,7 +85,7 @@ impl FilesystemType {
 
 /// Get all supported file extensions for file dialogs
 pub fn supported_extensions() -> Vec<&'static str> {
-    vec!["iso", "bin", "cue", "chd", "mds", "mdf"]
+    vec!["iso", "toast", "bin", "cue", "chd", "mds", "mdf"]
 }
 
 #[cfg(test)]

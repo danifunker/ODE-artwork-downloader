@@ -37,7 +37,6 @@ jobs:
   build-windows:
     name: Build Windows
     needs: generate-version
-    if: false  # Disable Windows builds for now as I'm fixing Linux
     runs-on: windows-latest
     strategy:
       matrix:
@@ -95,7 +94,6 @@ jobs:
     name: Build macOS
     needs: generate-version
     runs-on: macos-latest
-    if: false  # Disable macOS build for now as I'm fixing Linux
     strategy:
       matrix:
         include:
@@ -130,6 +128,8 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Build
+        env:
+          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
       
       - name: Package
@@ -153,7 +153,6 @@ jobs:
     name: Build Linux AppImage
     needs: generate-version
     runs-on: ${{ matrix.runs-on }}
-    if: false # Disable Linux AppImage build for now as I'm fixing Linux flatpak
     strategy:
       matrix:
         include:
@@ -196,6 +195,8 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Build
+        env:
+          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
       
       - name: Download AppImage tools
@@ -266,7 +267,6 @@ jobs:
     name: Build Linux Snap (amd64)
     needs: generate-version
     runs-on: ubuntu-latest
-    if: false # Disable Linux Snap build for now as I'm fixing Linux flatpak
     steps:
       - uses: actions/checkout@v4
       
@@ -290,7 +290,6 @@ jobs:
   build-linux-snap-arm64:
     name: Build Linux Snap (arm64)
     needs: generate-version
-    if: false # Disable Linux Snap build for now as I'm fixing Linux flatpak
     runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -377,9 +376,7 @@ jobs:
 
   release:
     name: Create Release
-    #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
-    #needs: [generate-version, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
-    needs: [generate-version, build-linux-flatpak]
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
 
     runs-on: ubuntu-latest
     steps:
