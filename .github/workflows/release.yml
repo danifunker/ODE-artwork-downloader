@@ -79,16 +79,16 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           if [ -f "../../../assets/icons/icon.ico" ]; then
-            7z a ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip ode-artwork-downloader.exe ../../../assets/icons/icon.ico
+            7z a ../../../OAD-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip ode-artwork-downloader.exe ../../../assets/icons/icon.ico
           else
-            7z a ../../../ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip ode-artwork-downloader.exe
+            7z a ../../../OAD-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip ode-artwork-downloader.exe
           fi
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-windows-${{ matrix.arch }}.zip
+          name: OAD-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: OAD-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
   build-macos:
     name: Build macOS
@@ -185,13 +185,13 @@ jobs:
           codesign --force --deep --sign - "${BUNDLE_NAME}"
           
           # Create DMG
-          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-macos-${{ matrix.arch }}.dmg
+          name: OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
 
   build-linux-appimage:
     name: Build Linux AppImage
@@ -305,13 +305,13 @@ jobs:
           ln -s usr/bin/ode-artwork-downloader AppDir/AppRun
           
           # Use extracted appimagetool with --no-appstream to avoid FUSE requirement
-          ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
+          ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-appimage
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.AppImage
+          name: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
+          path: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
 
   build-linux-snap-amd64:
     name: Build Linux Snap (amd64)
@@ -329,13 +329,13 @@ jobs:
       
       - name: Rename snap
         run: |
-          mv ${{ steps.build.outputs.snap }} ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64.snap
+          mv ${{ steps.build.outputs.snap }} OAD-linux-amd64-${{ needs.generate-version.outputs.version }}.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64-snap
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-amd64.snap
+          name: OAD-linux-amd64-${{ needs.generate-version.outputs.version }}-snap
+          path: OAD-linux-amd64-${{ needs.generate-version.outputs.version }}.snap
 
   build-linux-snap-arm64:
     name: Build Linux Snap (arm64)
@@ -355,13 +355,13 @@ jobs:
       
       - name: Rename snap
         run: |
-          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
+          mv *.snap OAD-linux-arm64-${{ needs.generate-version.outputs.version }}.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64-snap
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
+          name: OAD-linux-arm64-${{ needs.generate-version.outputs.version }}-snap
+          path: OAD-linux-arm64-${{ needs.generate-version.outputs.version }}.snap
 
   build-linux-flatpak:
     name: Build Linux Flatpak
@@ -418,13 +418,13 @@ jobs:
       
       - name: Create Flatpak bundle
         run: |
-          flatpak build-bundle repo ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.flatpak io.github.dani.ODEArtworkDownloader
+          flatpak build-bundle repo OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.flatpak io.github.dani.ODEArtworkDownloader
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}-flatpak
-          path: ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-${{ matrix.arch }}.flatpak
+          name: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-flatpak
+          path: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.flatpak
 
   release:
     name: Create Release
