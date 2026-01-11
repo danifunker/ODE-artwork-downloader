@@ -37,6 +37,7 @@ jobs:
   build-windows:
     name: Build Windows
     needs: generate-version
+    if: false
     runs-on: windows-latest
     strategy:
       matrix:
@@ -93,6 +94,7 @@ jobs:
   build-macos:
     name: Build macOS
     needs: generate-version
+    if: false
     runs-on: macos-latest
     strategy:
       matrix:
@@ -192,6 +194,7 @@ jobs:
   build-linux-appimage:
     name: Build Linux AppImage
     needs: generate-version
+    if: false
     runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
@@ -312,6 +315,7 @@ jobs:
   build-linux-snap-amd64:
     name: Build Linux Snap (amd64)
     needs: generate-version
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -344,12 +348,14 @@ jobs:
         run: |
           sed -i "s/^version: .*/version: '${{ needs.generate-version.outputs.version }}'/" snap/snapcraft.yaml
       
-      - uses: snapcore/action-build@v1
-        id: build
+      - name: Build snap with LXD
+        run: |
+          # Build using LXD (user must be in lxd group)
+          snapcraft --use-lxd
       
       - name: Rename snap
         run: |
-          mv ${{ steps.build.outputs.snap }} ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
+          mv *.snap ode-artwork-downloader-${{ needs.generate-version.outputs.version }}-linux-arm64.snap
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -360,6 +366,7 @@ jobs:
   build-linux-flatpak:
     name: Build Linux Flatpak
     needs: generate-version
+    if: false
     runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
@@ -422,7 +429,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
+    #needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-snap-amd64, build-linux-snap-arm64, build-linux-flatpak]
+    needs: [generate-version, build-linux-flatpak]
 
     runs-on: ubuntu-latest
     steps:
