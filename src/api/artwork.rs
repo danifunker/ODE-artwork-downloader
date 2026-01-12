@@ -4,6 +4,82 @@
 
 use crate::disc::{DiscInfo, ParsedFilename};
 use std::path::Path;
+use regex::Regex;
+use std::sync::LazyLock;
+
+// Regex for detecting CamelCase or PascalCase
+static CAMEL_CASE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    // Match lowercase followed by uppercase, or multiple uppercase followed by lowercase
+    Regex::new(r"([a-z])([A-Z])|([A-Z]+)([A-Z][a-z])").unwrap()
+});
+
+/// Configuration for search behavior
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    /// Sites to exclude from search results
+    pub exclusion_sites: Vec<String>,
+    /// Platform keywords to exclude from search results
+    pub exclusion_platforms: Vec<String>,
+    /// Keywords to use for CD searches
+    pub cd_keywords: Vec<String>,
+    /// Keywords to use for DVD searches
+    pub dvd_keywords: Vec<String>,
+    /// Known publishers to exclude from game name search
+    pub known_publishers: Vec<String>,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            exclusion_sites: vec!["ebay.com".to_string()],
+            exclusion_platforms: vec![
+                "playstation".to_string(),
+                "xbox".to_string(),
+                "nintendo".to_string(),
+            ],
+            cd_keywords: vec!["CD".to_string(), "jewel case".to_string()],
+            dvd_keywords: vec!["DVD".to_string()],
+            known_publishers: vec![
+                "Electronic Arts".to_string(),
+                "EA".to_string(),
+                "Sierra".to_string(),
+                "LucasArts".to_string(),
+                "Activision".to_string(),
+                "Blizzard".to_string(),
+                "id Software".to_string(),
+                "Apogee".to_string(),
+                "3D Realms".to_string(),
+                "Interplay".to_string(),
+                "MicroProse".to_string(),
+                "Origin".to_string(),
+                "Broderbund".to_string(),
+                "Maxis".to_string(),
+                "Westwood".to_string(),
+                "Epic Games".to_string(),
+                "Epic MegaGames".to_string(),
+                "Acclaim".to_string(),
+                "GT Interactive".to_string(),
+                "Eidos".to_string(),
+                "THQ".to_string(),
+                "Ubisoft".to_string(),
+                "Microsoft".to_string(),
+                "Bethesda".to_string(),
+                "Virgin Interactive".to_string(),
+                "Psygnosis".to_string(),
+                "Ocean".to_string(),
+                "Infogrames".to_string(),
+                "Atari".to_string(),
+                "Konami".to_string(),
+                "Capcom".to_string(),
+                "Namco".to_string(),
+                "Sega".to_string(),
+                "Square".to_string(),
+                "SquareSoft".to_string(),
+                "Enix".to_string(),
+            ],
+        }
+    }
+}
 
 /// Search query configuration
 #[derive(Debug, Clone)]
@@ -20,26 +96,194 @@ pub struct ArtworkSearchQuery {
     pub year: Option<u32>,
     /// Search terms to append (e.g., "jewel case", "cover art")
     pub search_suffix: String,
+    /// Publisher name (kept separate from title search)
+    pub publisher: Option<String>,
+    /// Original filename for context
+    pub original_filename: Option<String>,
 }
 
 impl ArtworkSearchQuery {
-    /// Default search suffix for jewel case art searches
-    const DEFAULT_SUFFIX: &'static str = "\"jewel case\" art -site:ebay.com -\"playstation\" -\"xbox\" -\"nintendo\"";
+    /// Build default search suffix based on configuration
+    fn build_default_suffix(config: &SearchConfig, original_filename: Option<&str>) -> String {
+        let mut parts = Vec::new();
+
+        // Determine if we should use CD or DVD keywords
+        let is_dvd = original_filename
+            .map(|f| f.to_lowercase().contains("dvd"))
+            .unwrap_or(false);
+
+        if is_dvd {
+            // Use DVD keywords
+            if !config.dvd_keywords.is_empty() {
+                let dvd_terms: Vec<String> = config
+                    .dvd_keywords
+                    .iter()
+                    .map(|k| format!("\"{}\"", k))
+                    .collect();
+                parts.push(dvd_terms.join(" OR "));
+            }
+        } else {
+            // Use CD keywords
+            if !config.cd_keywords.is_empty() {
+                let cd_terms: Vec<String> = config
+                    .cd_keywords
+                    .iter()
+                    .map(|k| format!("\"{}\"", k))
+                    .collect();
+                parts.push(cd_terms.join(" OR "));
+            }
+        }
+
+        parts.push("art".to_string());
+
+        // Add site exclusions
+        for site in &config.exclusion_sites {
+            parts.push(format!("-site:{}", site));
+        }
+
+        // Add platform exclusions
+        for platform in &config.exclusion_platforms {
+            parts.push(format!("-\"{}\"", platform));
+        }
+
+        parts.join(" ")
+    }
+
+    /// Split CamelCase or PascalCase strings into separate words
+    /// Example: "FinalFantasyVII" -> "Final Fantasy VII"
+    fn split_camel_case(text: &str) -> String {
+        // First, insert spaces between lowercase and uppercase letters
+        let result = CAMEL_CASE_PATTERN.replace_all(text, |caps: &regex::Captures| {
+            if let (Some(lower), Some(upper)) = (caps.get(1), caps.get(2)) {
+                // Case: lowercase followed by uppercase (e.g., "aB")
+                format!("{} {}", lower.as_str(), upper.as_str())
+            } else if let (Some(uppers), Some(lower_part)) = (caps.get(3), caps.get(4)) {
+                // Case: multiple uppercase followed by uppercase+lowercase (e.g., "ABCDe")
+                format!("{} {}", uppers.as_str(), lower_part.as_str())
+            } else {
+                caps.get(0).unwrap().as_str().to_string()
+            }
+        });
+
+        result.to_string()
+    }
+
+    /// Remove platform keywords from title if they appear with other descriptors
+    /// Only removes if there are other meaningful words in the title
+    fn remove_platform_keywords(title: &str) -> String {
+        let words: Vec<&str> = title.split_whitespace().collect();
+        
+        // Don't modify if title is too short
+        if words.len() <= 2 {
+            return title.to_string();
+        }
+
+        let platform_keywords = [
+            "Mac", "Macintosh", "Win", "Windows", "DOS", "PC",
+        ];
+
+        let filtered: Vec<&str> = words
+            .into_iter()
+            .filter(|&word| {
+                // Keep the word if it's not a platform keyword
+                !platform_keywords.iter().any(|&pk| {
+                    word.eq_ignore_ascii_case(pk)
+                })
+            })
+            .collect();
+
+        // Only return filtered version if we still have meaningful content
+        if filtered.len() >= 2 {
+            filtered.join(" ")
+        } else {
+            title.to_string()
+        }
+    }
+
+    /// Remove known publisher names from the title
+    fn remove_publishers(title: &str, config: &SearchConfig) -> (String, Option<String>) {
+        let mut detected_publisher = None;
+        let mut cleaned_title = title.to_string();
+
+        // Check for each known publisher
+        for publisher in &config.known_publishers {
+            let publisher_lower = publisher.to_lowercase();
+            let title_lower = cleaned_title.to_lowercase();
+
+            // Check if publisher is in the title (as a whole word)
+            if let Some(pos) = title_lower.find(&publisher_lower) {
+                // Verify it's a word boundary match
+                let is_start = pos == 0 || !title_lower.chars().nth(pos - 1).unwrap().is_alphanumeric();
+                let end_pos = pos + publisher_lower.len();
+                let is_end = end_pos >= title_lower.len() || !title_lower.chars().nth(end_pos).unwrap().is_alphanumeric();
+
+                if is_start && is_end {
+                    // Found the publisher - remove it from title
+                    detected_publisher = Some(publisher.clone());
+                    
+                    // Remove the publisher from the title
+                    let before = &cleaned_title[..pos];
+                    let after = if end_pos < cleaned_title.len() {
+                        &cleaned_title[end_pos..]
+                    } else {
+                        ""
+                    };
+                    
+                    cleaned_title = format!("{}{}", before, after)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    
+                    break;
+                }
+            }
+        }
+
+        (cleaned_title, detected_publisher)
+    }
+
+    /// Process a title to handle CamelCase, platform keywords, and publishers
+    fn process_title(title: &str, config: &SearchConfig) -> (String, Option<String>) {
+        // First, try to split CamelCase
+        let split_title = Self::split_camel_case(title);
+        
+        // Remove platform keywords if present with other descriptors
+        let no_platform = Self::remove_platform_keywords(&split_title);
+        
+        // Remove known publishers and extract them
+        let (cleaned_title, publisher) = Self::remove_publishers(&no_platform, config);
+        
+        (cleaned_title, publisher)
+    }
 
     /// Create a search query from parsed filename information
     pub fn from_parsed_filename(parsed: &ParsedFilename) -> Self {
+        Self::from_parsed_filename_with_config(parsed, &SearchConfig::default())
+    }
+
+    /// Create a search query from parsed filename information with custom config
+    pub fn from_parsed_filename_with_config(parsed: &ParsedFilename, config: &SearchConfig) -> Self {
+        let (title, publisher) = Self::process_title(&parsed.title, config);
+        
         Self {
-            title: parsed.title.clone(),
+            title,
             alt_title: None,
             region: parsed.region.clone(),
             platform: None,
             year: parsed.year,
-            search_suffix: Self::DEFAULT_SUFFIX.to_string(),
+            search_suffix: Self::build_default_suffix(config, Some(&parsed.original)),
+            publisher,
+            original_filename: Some(parsed.original.clone()),
         }
     }
 
     /// Create a search query from disc info (uses best available title)
     pub fn from_disc_info(info: &DiscInfo) -> Self {
+        Self::from_disc_info_with_config(info, &SearchConfig::default())
+    }
+
+    /// Create a search query from disc info with custom config
+    pub fn from_disc_info_with_config(info: &DiscInfo, config: &SearchConfig) -> Self {
         let filename_title = info.parsed_filename.title.clone();
 
         // Get normalized volume label if available and useful
@@ -52,13 +296,22 @@ impl ArtworkSearchQuery {
             }
         });
 
+        // Process the filename title
+        let (processed_filename, publisher_from_filename) = Self::process_title(&filename_title, config);
+
+        // Process the volume title if available
+        let processed_volume = volume_title.as_ref().map(|vol| {
+            let (processed, _) = Self::process_title(vol, config);
+            processed
+        });
+
         // Use filename as primary, volume label as alt if different
-        let (title, alt_title) = match volume_title {
-            Some(ref vol) if vol.to_lowercase() != filename_title.to_lowercase() => {
-                (filename_title.clone(), Some(vol.clone()))
+        let (title, alt_title) = match processed_volume {
+            Some(ref vol) if vol.to_lowercase() != processed_filename.to_lowercase() => {
+                (processed_filename.clone(), Some(vol.clone()))
             }
             Some(vol) => (vol, None), // Same title, just use one
-            None => (filename_title, None),
+            None => (processed_filename, None),
         };
 
         // Detect platform from file path
@@ -70,13 +323,21 @@ impl ArtworkSearchQuery {
             region: info.parsed_filename.region.clone(),
             platform,
             year: info.parsed_filename.year,
-            search_suffix: Self::DEFAULT_SUFFIX.to_string(),
+            search_suffix: Self::build_default_suffix(config, Some(&info.parsed_filename.original)),
+            publisher: publisher_from_filename,
+            original_filename: Some(info.parsed_filename.original.clone()),
         }
     }
 
     /// Set the platform hint
     pub fn with_platform(mut self, platform: impl Into<String>) -> Self {
         self.platform = Some(platform.into());
+        self
+    }
+
+    /// Set the publisher
+    pub fn with_publisher(mut self, publisher: impl Into<String>) -> Self {
+        self.publisher = Some(publisher.into());
         self
     }
 
@@ -95,6 +356,11 @@ impl ArtworkSearchQuery {
             parts.push(format!("(\"{}\" OR \"{}\")", self.title, alt));
         } else {
             parts.push(format!("\"{}\"", self.title));
+        }
+
+        // Add publisher if available (kept in search but separate from title)
+        if let Some(ref publisher) = self.publisher {
+            parts.push(format!("\"{}\"", publisher));
         }
 
         // Add year if available
@@ -206,10 +472,12 @@ mod tests {
             region: None,
             platform: None,
             year: None,
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
-        assert_eq!(query.build_query(), "\"Final Fantasy VII\" jewel case art");
+        assert_eq!(query.build_query(), "\"Final Fantasy VII\" CD art");
     }
 
     #[test]
@@ -220,10 +488,12 @@ mod tests {
             region: Some("USA".to_string()),
             platform: None,
             year: None,
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
-        assert_eq!(query.build_query(), "\"Final Fantasy VII\" USA jewel case art");
+        assert_eq!(query.build_query(), "\"Final Fantasy VII\" USA CD art");
     }
 
     #[test]
@@ -234,12 +504,14 @@ mod tests {
             region: Some("USA".to_string()),
             platform: Some("PlayStation".to_string()),
             year: None,
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
         assert_eq!(
             query.build_query(),
-            "\"Final Fantasy VII\" PlayStation USA jewel case art"
+            "\"Final Fantasy VII\" PlayStation USA CD art"
         );
     }
 
@@ -251,10 +523,12 @@ mod tests {
             region: None,
             platform: None,
             year: None,
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
-        assert_eq!(query.build_query(), "(\"Final Fantasy VII\" OR \"FF7\") jewel case art");
+        assert_eq!(query.build_query(), "(\"Final Fantasy VII\" OR \"FF7\") CD art");
     }
 
     #[test]
@@ -265,10 +539,28 @@ mod tests {
             region: None,
             platform: Some("DOS".to_string()),
             year: Some(1993),
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
-        assert_eq!(query.build_query(), "\"Doom\" 1993 DOS jewel case art");
+        assert_eq!(query.build_query(), "\"Doom\" 1993 DOS CD art");
+    }
+
+    #[test]
+    fn test_build_query_with_publisher() {
+        let query = ArtworkSearchQuery {
+            title: "Command & Conquer".to_string(),
+            alt_title: None,
+            region: None,
+            platform: None,
+            year: None,
+            search_suffix: "CD art".to_string(),
+            publisher: Some("Westwood".to_string()),
+            original_filename: None,
+        };
+
+        assert_eq!(query.build_query(), "\"Command & Conquer\" \"Westwood\" CD art");
     }
 
     #[test]
@@ -278,8 +570,119 @@ mod tests {
 
         assert_eq!(query.title, "Final Fantasy VII");
         assert_eq!(query.region, Some("USA".to_string()));
-        assert!(query.search_suffix.contains("jewel case"));
-        assert!(query.search_suffix.contains("-site:ebay.com"));
+        assert!(query.search_suffix.contains("art"));
+    }
+
+    #[test]
+    fn test_split_camel_case() {
+        assert_eq!(
+            ArtworkSearchQuery::split_camel_case("FinalFantasyVII"),
+            "Final Fantasy VII"
+        );
+        assert_eq!(
+            ArtworkSearchQuery::split_camel_case("CommandAndConquer"),
+            "Command And Conquer"
+        );
+        assert_eq!(
+            ArtworkSearchQuery::split_camel_case("WarCraft"),
+            "War Craft"
+        );
+        // Already has spaces - should not be affected
+        assert_eq!(
+            ArtworkSearchQuery::split_camel_case("Final Fantasy VII"),
+            "Final Fantasy VII"
+        );
+    }
+
+    #[test]
+    fn test_remove_platform_keywords() {
+        // Should remove platform keywords when there are other descriptors
+        assert_eq!(
+            ArtworkSearchQuery::remove_platform_keywords("Doom DOS Edition"),
+            "Doom Edition"
+        );
+        assert_eq!(
+            ArtworkSearchQuery::remove_platform_keywords("SimCity Mac Version"),
+            "SimCity Version"
+        );
+        assert_eq!(
+            ArtworkSearchQuery::remove_platform_keywords("Windows Solitaire Game"),
+            "Solitaire Game"
+        );
+
+        // Should not modify short titles
+        assert_eq!(
+            ArtworkSearchQuery::remove_platform_keywords("Doom DOS"),
+            "Doom DOS"
+        );
+
+        // Should not affect titles without platform keywords
+        assert_eq!(
+            ArtworkSearchQuery::remove_platform_keywords("Final Fantasy VII"),
+            "Final Fantasy VII"
+        );
+    }
+
+    #[test]
+    fn test_remove_publishers() {
+        let config = SearchConfig::default();
+
+        let (title, publisher) = ArtworkSearchQuery::remove_publishers("Command & Conquer Westwood", &config);
+        assert_eq!(title, "Command & Conquer");
+        assert_eq!(publisher, Some("Westwood".to_string()));
+
+        let (title, publisher) = ArtworkSearchQuery::remove_publishers("Sierra King's Quest", &config);
+        assert_eq!(title, "King's Quest");
+        assert_eq!(publisher, Some("Sierra".to_string()));
+
+        let (title, publisher) = ArtworkSearchQuery::remove_publishers("Final Fantasy VII", &config);
+        assert_eq!(title, "Final Fantasy VII");
+        assert_eq!(publisher, None);
+
+        // Test EA specifically
+        let (title, publisher) = ArtworkSearchQuery::remove_publishers("Command & Conquer EA", &config);
+        assert_eq!(title, "Command & Conquer");
+        assert_eq!(publisher, Some("EA".to_string()));
+    }
+
+    #[test]
+    fn test_process_title() {
+        let config = SearchConfig::default();
+
+        // Test CamelCase splitting
+        let (title, _) = ArtworkSearchQuery::process_title("FinalFantasyVII", &config);
+        assert_eq!(title, "Final Fantasy VII");
+
+        // Test platform removal with CamelCase
+        let (title, _) = ArtworkSearchQuery::process_title("DoomDOSEdition", &config);
+        assert_eq!(title, "Doom Edition");
+
+        // Test publisher detection
+        let (title, publisher) = ArtworkSearchQuery::process_title("Command Conquer Westwood", &config);
+        assert_eq!(title, "Command Conquer");
+        assert_eq!(publisher, Some("Westwood".to_string()));
+    }
+
+    #[test]
+    fn test_build_default_suffix_cd() {
+        let config = SearchConfig::default();
+        let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("game.iso"));
+
+        assert!(suffix.contains("art"));
+        assert!(suffix.contains("-site:ebay.com"));
+        assert!(suffix.contains("-\"playstation\""));
+        // Should use CD keywords by default
+        assert!(suffix.contains("CD") || suffix.contains("jewel case"));
+    }
+
+    #[test]
+    fn test_build_default_suffix_dvd() {
+        let config = SearchConfig::default();
+        let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("game_dvd.iso"));
+
+        assert!(suffix.contains("art"));
+        // Should use DVD keywords when DVD is in filename
+        assert!(suffix.contains("DVD"));
     }
 
     #[test]
@@ -314,7 +717,9 @@ mod tests {
             region: None,
             platform: Some("Dreamcast".to_string()),
             year: None,
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
         let url = query.google_images_url();
@@ -331,7 +736,9 @@ mod tests {
             region: None,
             platform: None,
             year: None,
-            search_suffix: "jewel case art".to_string(),
+            search_suffix: "CD art".to_string(),
+            publisher: None,
+            original_filename: None,
         };
 
         let url = query.duckduckgo_images_url();

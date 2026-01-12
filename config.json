@@ -2,5 +2,60 @@
   "update_check": {
     "enabled": true,
     "repository_url": "https://github.com/danifunker/ODE-artwork-downloader"
+  },
+  "search": {
+    "exclusion_sites": [
+      "ebay.com"
+    ],
+    "exclusion_platforms": [
+      "playstation",
+      "xbox",
+      "nintendo"
+    ],
+    "cd_keywords": [
+      "CD",
+      "jewel case"
+    ],
+    "dvd_keywords": [
+      "DVD"
+    ],
+    "known_publishers": [
+      "Electronic Arts",
+      "EA",
+      "Sierra",
+      "LucasArts",
+      "Activision",
+      "Blizzard",
+      "id Software",
+      "Apogee",
+      "3D Realms",
+      "Interplay",
+      "MicroProse",
+      "Origin",
+      "Broderbund",
+      "Maxis",
+      "Westwood",
+      "Epic Games",
+      "Epic MegaGames",
+      "Acclaim",
+      "GT Interactive",
+      "Eidos",
+      "THQ",
+      "Ubisoft",
+      "Microsoft",
+      "Bethesda",
+      "Virgin Interactive",
+      "Psygnosis",
+      "Ocean",
+      "Infogrames",
+      "Atari",
+      "Konami",
+      "Capcom",
+      "Namco",
+      "Sega",
+      "Square",
+      "SquareSoft",
+      "Enix"
+    ]
   }
 }

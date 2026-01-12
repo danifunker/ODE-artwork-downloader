@@ -178,10 +178,15 @@ fn encode_baseline_jpeg(rgb_image: &RgbImage, quality: u8) -> Result<Vec<u8>, St
 /// Changes the extension to .jpg
 pub fn generate_output_path<P: AsRef<Path>>(disc_path: P) -> String {
     let path = disc_path.as_ref();
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cover");
-    let parent = path.parent().unwrap_or(Path::new("."));
-
-    parent.join(format!("{}.jpg", stem)).display().to_string()
+    
+    // Use with_extension if the path has a parent directory, otherwise construct with ./
+    if path.parent().is_some() && path.parent() != Some(Path::new("")) {
+        path.with_extension("jpg").display().to_string()
+    } else {
+        // For bare filenames, ensure we get "./filename.jpg"
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cover");
+        format!("./{}.jpg", stem)
+    }
 }
 
 #[cfg(test)]
