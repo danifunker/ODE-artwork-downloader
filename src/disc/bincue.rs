@@ -10,6 +10,7 @@ use std::path::Path;
 use cue_sheet::parser::{parse_cue, Command, TrackType};
 
 use super::iso9660::{PrimaryVolumeDescriptor, SECTOR_SIZE, PVD_SECTOR};
+use super::toc::{DiscTOC, TrackInfo, parse_msf};
 
 /// CD sector size for raw data (2352 bytes)
 const CD_SECTOR_SIZE_RAW: u64 = 2352;
@@ -71,10 +72,12 @@ pub struct BinCueInfo {
     pub bin_path: std::path::PathBuf,
     /// Number of tracks found
     pub track_count: usize,
+    /// Table of Contents (for audio CDs)
+    pub toc: Option<DiscTOC>,
 }
 
 /// Track info extracted from CUE commands
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct ParsedTrack {
     track_no: u32,
@@ -83,6 +86,7 @@ struct ParsedTrack {
     data_offset: u64,
     is_data: bool,
     bin_filename: String,  // The BIN file this track belongs to
+    index_01: Option<String>,  // INDEX 01 position (MM:SS:FF)
 }
 
 /// Normalize CUE file for parser compatibility
@@ -138,6 +142,7 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
     // Parse commands, tracking current BIN file for each track
     let mut current_bin_filename: Option<String> = None;
     let mut tracks: Vec<ParsedTrack> = Vec::new();
+    let mut current_track_index: Option<usize> = None;
 
     for cmd in &commands {
         match cmd {
@@ -155,9 +160,22 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
                     data_offset,
                     is_data,
                     bin_filename: bin_filename.clone(),
+                    index_01: None,
                 });
+                current_track_index = Some(tracks.len() - 1);
                 log::debug!("Track {}: {:?}, sector_size={}, is_data={}, file={}",
                     track_no, track_type, sector_size, is_data, bin_filename);
+            }
+            Command::Index(index_no, msf) => {
+                // Capture INDEX 01 position for TOC calculation
+                if *index_no == 1 {
+                    if let Some(idx) = current_track_index {
+                        if let Some(track) = tracks.get_mut(idx) {
+                            track.index_01 = Some(format!("{}:{}:{}", msf.mins, msf.secs, msf.frames));
+                            log::debug!("Track {} INDEX 01: {}:{}:{}", track.track_no, msf.mins, msf.secs, msf.frames);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -215,11 +233,19 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
         try_read_pvd_fallback(&mut reader)
     };
 
+    // Extract TOC if we have audio tracks
+    let toc = extract_toc(&tracks, &bin_path);
+    if let Some(ref toc) = toc {
+        log::debug!("TOC extracted: {} tracks, MusicBrainz ID: {}", 
+            toc.track_count(), toc.calculate_musicbrainz_id());
+    }
+
     Ok(BinCueInfo {
         volume_label,
         pvd,
         bin_path,
         track_count: tracks.len(),
+        toc,
     })
 }
 
@@ -341,6 +367,57 @@ fn try_read_pvd_fallback<R: Read + Seek>(reader: &mut R) -> (Option<String>, Opt
     }
 
     (None, None)
+}
+
+/// Extract TOC information from parsed tracks
+fn extract_toc(tracks: &[ParsedTrack], bin_path: &Path) -> Option<DiscTOC> {
+    // Only extract TOC if we have tracks with INDEX 01 information
+    let tracks_with_index: Vec<_> = tracks.iter()
+        .filter(|t| t.index_01.is_some())
+        .collect();
+
+    if tracks_with_index.is_empty() {
+        return None;
+    }
+
+    // Convert to TrackInfo
+    let mut track_infos = Vec::new();
+    for track in tracks_with_index {
+        if let Some(ref msf) = track.index_01 {
+            if let Some(offset) = parse_msf(msf) {
+                let track_type = match track.track_type {
+                    TrackType::Audio => "AUDIO",
+                    TrackType::Mode(1, _) => "MODE1",
+                    TrackType::Mode(2, _) => "MODE2",
+                    _ => "OTHER",
+                };
+                
+                track_infos.push(TrackInfo {
+                    number: track.track_no as u8,
+                    offset,
+                    track_type: track_type.to_string(),
+                });
+            }
+        }
+    }
+
+    if track_infos.is_empty() {
+        return None;
+    }
+
+    // Calculate total length from BIN file size
+    let total_length_frames = if let Ok(metadata) = std::fs::metadata(bin_path) {
+        let file_size = metadata.len();
+        // Assume first track's sector size for calculation
+        let sector_size = tracks.first().map(|t| t.sector_size).unwrap_or(2352);
+        let total_sectors = file_size / sector_size;
+        total_sectors as u32 // Convert sectors to frames (1:1 for CD)
+    } else {
+        // Fallback: use last track offset + estimated track length
+        track_infos.last().map(|t| t.offset + 5000).unwrap_or(0)
+    };
+
+    DiscTOC::from_tracks(track_infos, total_length_frames)
 }
 
 #[cfg(test)]

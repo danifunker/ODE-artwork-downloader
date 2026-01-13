@@ -10,6 +10,7 @@ use thiserror::Error;
 use super::formats::{DiscFormat, FilesystemType};
 use super::identifier::{parse_filename, ConfidenceLevel, ParsedFilename};
 use super::iso9660::PrimaryVolumeDescriptor;
+use super::toc::DiscTOC;
 
 /// Errors that can occur when reading disc images
 #[derive(Error, Debug)]
@@ -51,6 +52,8 @@ pub struct DiscInfo {
     pub confidence: ConfidenceLevel,
     /// Primary Volume Descriptor (if available)
     pub pvd: Option<PrimaryVolumeDescriptor>,
+    /// Table of Contents (for audio CDs)
+    pub toc: Option<DiscTOC>,
 }
 
 impl DiscInfo {
@@ -135,6 +138,7 @@ impl DiscReader {
             title,
             confidence,
             pvd: Some(pvd),
+            toc: None,
         })
     }
 
@@ -172,6 +176,7 @@ impl DiscReader {
                     title,
                     confidence,
                     pvd: chd_info.pvd,
+                    toc: chd_info.toc,
                 })
             }
             Err(e) => {
@@ -187,6 +192,7 @@ impl DiscReader {
                     parsed_filename,
                     confidence: ConfidenceLevel::Low,
                     pvd: None,
+                    toc: None,
                 })
             }
         }
@@ -220,6 +226,7 @@ impl DiscReader {
                         parsed_filename,
                         confidence: ConfidenceLevel::Low,
                         pvd: None,
+                        toc: None,
                     });
                 }
             }
@@ -252,6 +259,7 @@ impl DiscReader {
                     title,
                     confidence,
                     pvd: bincue_info.pvd,
+                    toc: bincue_info.toc,
                 })
             }
             Err(e) => {
@@ -265,6 +273,7 @@ impl DiscReader {
                     parsed_filename,
                     confidence: ConfidenceLevel::Low,
                     pvd: None,
+                    toc: None,
                 })
             }
         }
@@ -286,6 +295,7 @@ impl DiscReader {
             parsed_filename,
             confidence: ConfidenceLevel::Low,
             pvd: None,
+            toc: None,
         })
     }
 }

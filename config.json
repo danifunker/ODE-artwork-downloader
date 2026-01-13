@@ -1,23 +1,21 @@
 {
-  "update_check": {
-    "enabled": true,
-    "repository_url": "https://github.com/danifunker/ODE-artwork-downloader"
-  },
   "search": {
-    "exclusion_sites": [
-      "ebay.com"
+    "cd_keywords": [
+      "CD",
+      "jewel case"
+    ],
+    "content_type": "audio_cds",
+    "dvd_keywords": [
+      "DVD",
+      "Box art"
     ],
     "exclusion_platforms": [
       "playstation",
       "xbox",
       "nintendo"
     ],
-    "cd_keywords": [
-      "CD",
-      "jewel case"
-    ],
-    "dvd_keywords": [
-      "DVD"
+    "exclusion_sites": [
+      "ebay.com"
     ],
     "known_publishers": [
       "Electronic Arts",
@@ -56,6 +54,39 @@
       "Square",
       "SquareSoft",
       "Enix"
-    ]
+    ],
+    "known_sites": {
+      "apps_utilities": [
+        "archive.org",
+        "winworldpc.com",
+        "macintoshgarden.org",
+        "macintoshrepository.org",
+        "vetusware.com",
+        "oldversion.com"
+      ],
+      "audio_cds": [
+        "discogs.com",
+        "allmusic.com",
+        "musicbrainz.org",
+        "rateyourmusic.com",
+        "coverartarchive.org"
+      ],
+      "games": [
+        "mobygames.com",
+        "archive.org",
+        "gog.com",
+        "myabandonware.com",
+        "dosgamesarchive.com",
+        "homeoftheunderdogs.net",
+        "oldgames.sk",
+        "macintoshgarden.org",
+        "macintoshrepository.org",
+        "classicdosgames.com"
+      ]
+    }
+  },
+  "update_check": {
+    "enabled": true,
+    "repository_url": "https://github.com/danifunker/ODE-artwork-downloader"
   }
 }

@@ -26,10 +26,114 @@ pub struct SearchConfig {
     pub dvd_keywords: Vec<String>,
     /// Known publishers to exclude from game name search
     pub known_publishers: Vec<String>,
+    /// Content type for site selection
+    pub content_type: ContentType,
+    /// Known sites for games
+    pub games_sites: Vec<String>,
+    /// Known sites for apps and utilities
+    pub apps_sites: Vec<String>,
+    /// Known sites for audio CDs
+    pub audio_sites: Vec<String>,
+}
+
+/// Content type for different disc categories
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentType {
+    Any,
+    Games,
+    AppsUtilities,
+    AudioCDs,
+}
+
+impl ContentType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContentType::Any => "any",
+            ContentType::Games => "games",
+            ContentType::AppsUtilities => "apps_utilities",
+            ContentType::AudioCDs => "audio_cds",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "games" => ContentType::Games,
+            "apps_utilities" | "apps" => ContentType::AppsUtilities,
+            "audio_cds" | "audio" => ContentType::AudioCDs,
+            _ => ContentType::Any, // default
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ContentType::Any => "Any",
+            ContentType::Games => "Games",
+            ContentType::AppsUtilities => "Apps & Utilities",
+            ContentType::AudioCDs => "Audio CDs",
+        }
+    }
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
+        // Try to load from config.json
+        if let Ok(config_str) = std::fs::read_to_string("config.json") {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                if let Some(search) = json.get("search") {
+                    return Self {
+                        exclusion_sites: search.get("exclusion_sites")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_else(|| vec!["ebay.com".to_string()]),
+                        
+                        exclusion_platforms: search.get("exclusion_platforms")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_else(|| vec!["playstation".to_string(), "xbox".to_string(), "nintendo".to_string()]),
+                        
+                        cd_keywords: search.get("cd_keywords")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_else(|| vec!["CD".to_string(), "jewel case".to_string()]),
+                        
+                        dvd_keywords: search.get("dvd_keywords")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_else(|| vec!["DVD".to_string()]),
+                        
+                        content_type: search.get("content_type")
+                            .and_then(|v| v.as_str())
+                            .map(ContentType::from_str)
+                            .unwrap_or(ContentType::Any),
+                        
+                        games_sites: search.get("known_sites")
+                            .and_then(|v| v.get("games"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default(),
+                        
+                        apps_sites: search.get("known_sites")
+                            .and_then(|v| v.get("apps_utilities"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default(),
+                        
+                        audio_sites: search.get("known_sites")
+                            .and_then(|v| v.get("audio_cds"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default(),
+                        
+                        known_publishers: search.get("known_publishers")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default(),
+                    };
+                }
+            }
+        }
+
+        // Fallback if config.json doesn't exist or can't be read
         Self {
             exclusion_sites: vec!["ebay.com".to_string()],
             exclusion_platforms: vec![
@@ -39,44 +143,11 @@ impl Default for SearchConfig {
             ],
             cd_keywords: vec!["CD".to_string(), "jewel case".to_string()],
             dvd_keywords: vec!["DVD".to_string()],
-            known_publishers: vec![
-                "Electronic Arts".to_string(),
-                "EA".to_string(),
-                "Sierra".to_string(),
-                "LucasArts".to_string(),
-                "Activision".to_string(),
-                "Blizzard".to_string(),
-                "id Software".to_string(),
-                "Apogee".to_string(),
-                "3D Realms".to_string(),
-                "Interplay".to_string(),
-                "MicroProse".to_string(),
-                "Origin".to_string(),
-                "Broderbund".to_string(),
-                "Maxis".to_string(),
-                "Westwood".to_string(),
-                "Epic Games".to_string(),
-                "Epic MegaGames".to_string(),
-                "Acclaim".to_string(),
-                "GT Interactive".to_string(),
-                "Eidos".to_string(),
-                "THQ".to_string(),
-                "Ubisoft".to_string(),
-                "Microsoft".to_string(),
-                "Bethesda".to_string(),
-                "Virgin Interactive".to_string(),
-                "Psygnosis".to_string(),
-                "Ocean".to_string(),
-                "Infogrames".to_string(),
-                "Atari".to_string(),
-                "Konami".to_string(),
-                "Capcom".to_string(),
-                "Namco".to_string(),
-                "Sega".to_string(),
-                "Square".to_string(),
-                "SquareSoft".to_string(),
-                "Enix".to_string(),
-            ],
+            content_type: ContentType::Any,
+            games_sites: Vec::new(),
+            apps_sites: Vec::new(),
+            audio_sites: Vec::new(),
+            known_publishers: Vec::new(),
         }
     }
 }
@@ -136,14 +207,38 @@ impl ArtworkSearchQuery {
 
         parts.push("art".to_string());
 
-        // Add site exclusions
-        for site in &config.exclusion_sites {
-            parts.push(format!("-site:{}", site));
+        // Add site inclusions or exclusions based on content type
+        match config.content_type {
+            ContentType::Games | ContentType::AppsUtilities | ContentType::AudioCDs => {
+                // Limit to known sites for specific content types
+                let sites = match config.content_type {
+                    ContentType::Games => &config.games_sites,
+                    ContentType::AppsUtilities => &config.apps_sites,
+                    ContentType::AudioCDs => &config.audio_sites,
+                    ContentType::Any => unreachable!(),
+                };
+
+                if !sites.is_empty() {
+                    let site_terms: Vec<String> = sites
+                        .iter()
+                        .map(|s| format!("site:{}", s))
+                        .collect();
+                    parts.push(format!("({})", site_terms.join(" OR ")));
+                }
+            }
+            ContentType::Any => {
+                // Don't limit sites, just add exclusions
+                for site in &config.exclusion_sites {
+                    parts.push(format!("-site:{}", site));
+                }
+            }
         }
 
-        // Add platform exclusions
-        for platform in &config.exclusion_platforms {
-            parts.push(format!("-\"{}\"", platform));
+        // Add platform exclusions (only for games and any)
+        if config.content_type == ContentType::Games || config.content_type == ContentType::Any {
+            for platform in &config.exclusion_platforms {
+                parts.push(format!("-\"{}\"", platform));
+            }
         }
 
         parts.join(" ")
@@ -665,7 +760,8 @@ mod tests {
 
     #[test]
     fn test_build_default_suffix_cd() {
-        let config = SearchConfig::default();
+        let mut config = SearchConfig::default();
+        config.content_type = ContentType::Any; // Use Any to test without site limits
         let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("game.iso"));
 
         assert!(suffix.contains("art"));
@@ -677,7 +773,8 @@ mod tests {
 
     #[test]
     fn test_build_default_suffix_dvd() {
-        let config = SearchConfig::default();
+        let mut config = SearchConfig::default();
+        config.content_type = ContentType::Any; // Use Any to test without site limits
         let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("game_dvd.iso"));
 
         assert!(suffix.contains("art"));
@@ -743,5 +840,72 @@ mod tests {
 
         let url = query.duckduckgo_images_url();
         assert!(url.contains("size:Square"));
+    }
+
+    #[test]
+    fn test_content_type_conversions() {
+        assert_eq!(ContentType::Games.as_str(), "games");
+        assert_eq!(ContentType::AppsUtilities.as_str(), "apps_utilities");
+        assert_eq!(ContentType::AudioCDs.as_str(), "audio_cds");
+        assert_eq!(ContentType::Any.as_str(), "any");
+
+        assert_eq!(ContentType::from_str("games"), ContentType::Games);
+        assert_eq!(ContentType::from_str("apps"), ContentType::AppsUtilities);
+        assert_eq!(ContentType::from_str("audio_cds"), ContentType::AudioCDs);
+        assert_eq!(ContentType::from_str("any"), ContentType::Any);
+        assert_eq!(ContentType::from_str("invalid"), ContentType::Games); // default
+
+        assert_eq!(ContentType::Games.display_name(), "Games");
+        assert_eq!(ContentType::AppsUtilities.display_name(), "Apps & Utilities");
+        assert_eq!(ContentType::AudioCDs.display_name(), "Audio CDs");
+        assert_eq!(ContentType::Any.display_name(), "Any");
+    }
+
+    #[test]
+    fn test_build_suffix_with_site_limits_games() {
+        let mut config = SearchConfig::default();
+        config.content_type = ContentType::Games;
+        config.games_sites = vec!["mobygames.com".to_string(), "archive.org".to_string()];
+
+        let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("game.iso"));
+
+        assert!(suffix.contains("art"));
+        assert!(suffix.contains("site:mobygames.com"));
+        assert!(suffix.contains("site:archive.org"));
+        // Should NOT have exclusions when limiting to known sites
+        assert!(!suffix.contains("-site:ebay.com"));
+        // Should still have platform exclusions for games
+        assert!(suffix.contains("-\"playstation\""));
+    }
+
+    #[test]
+    fn test_build_suffix_with_site_limits_audio() {
+        let mut config = SearchConfig::default();
+        config.content_type = ContentType::AudioCDs;
+        config.audio_sites = vec!["discogs.com".to_string(), "allmusic.com".to_string()];
+
+        let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("album.iso"));
+
+        assert!(suffix.contains("art"));
+        assert!(suffix.contains("site:discogs.com"));
+        assert!(suffix.contains("site:allmusic.com"));
+        // Should NOT have platform exclusions for audio CDs
+        assert!(!suffix.contains("-\"playstation\""));
+    }
+
+    #[test]
+    fn test_build_suffix_any_type() {
+        let mut config = SearchConfig::default();
+        config.content_type = ContentType::Any;
+
+        let suffix = ArtworkSearchQuery::build_default_suffix(&config, Some("game.iso"));
+
+        assert!(suffix.contains("art"));
+        // Should have exclusions for Any type
+        assert!(suffix.contains("-site:ebay.com"));
+        // Should NOT have site inclusions
+        assert!(!suffix.contains("site:mobygames.com"));
+        // Should have platform exclusions for Any
+        assert!(suffix.contains("-\"playstation\""));
     }
 }

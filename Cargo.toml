@@ -27,10 +27,13 @@ thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
 urlencoding = "2.1"
+sha1 = "0.10"
+base64 = "0.22"
 
 # Disc image formats
 chd = "0.2"
 cue_sheet = "0.1"
+musicbrainz_rs = "0.5"
 
 # DAT file parsing
 quick-xml = { version = "0.37", features = ["serde", "serialize"] }

@@ -9,6 +9,7 @@ mod formats;
 mod identifier;
 mod iso9660;
 mod reader;
+mod toc;
 
 // Public API re-exports (some may be unused until later phases)
 #[allow(unused_imports)]
@@ -19,3 +20,5 @@ pub use identifier::{parse_filename, normalize_volume_label, ConfidenceLevel, Pa
 pub use iso9660::PrimaryVolumeDescriptor;
 #[allow(unused_imports)]
 pub use reader::{DiscInfo, DiscReader, DiscError};
+#[allow(unused_imports)]
+pub use toc::{DiscTOC, TrackInfo};

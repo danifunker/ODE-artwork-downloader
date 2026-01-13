@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use crate::api::{open_in_browser, ArtworkSearchQuery};
+use crate::api::{open_in_browser, ArtworkSearchQuery, SearchConfig, ContentType};
 use crate::disc::{supported_extensions, parse_filename, ConfidenceLevel, DiscInfo, DiscReader, DiscFormat, FilesystemType};
 use crate::export::{export_artwork, export_artwork_from_url, generate_output_path, ExportResult, ExportSettings};
 use crate::search::ImageResult;
@@ -59,6 +59,8 @@ pub struct App {
     show_update_notification: bool,
     /// Whether update check has been performed
     update_check_done: bool,
+    /// Search configuration
+    search_config: SearchConfig,
 }
 
 /// A log message with severity level
@@ -102,6 +104,7 @@ impl Default for App {
             update_info: None,
             show_update_notification: false,
             update_check_done: false,
+            search_config: SearchConfig::default(),
         }
     }
 }
@@ -179,6 +182,7 @@ impl App {
                         parsed_filename: parsed,
                         confidence: ConfidenceLevel::Low,
                         pvd: None,
+                        toc: None,
                     };
 
                     self.disc_info = Some(Ok(fallback_info));
@@ -206,6 +210,36 @@ impl App {
         }
     }
 
+    /// Update search query from disc info using current config
+    fn update_search_query_from_disc(&mut self) {
+        if let Some(Ok(info)) = &self.disc_info {
+            let search_query = ArtworkSearchQuery::from_disc_info_with_config(info, &self.search_config);
+            self.search_query_text = search_query.build_query();
+        }
+    }
+
+    /// Save search configuration to config.json
+    fn save_search_config(&self) {
+        if let Ok(config_str) = std::fs::read_to_string("config.json") {
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                // Update the content_type field
+                if let Some(search) = json.get_mut("search") {
+                    if let Some(obj) = search.as_object_mut() {
+                        obj.insert(
+                            "content_type".to_string(),
+                            serde_json::Value::String(self.search_config.content_type.as_str().to_string())
+                        );
+                        
+                        // Write back to file
+                        if let Ok(updated) = serde_json::to_string_pretty(&json) {
+                            let _ = std::fs::write("config.json", updated);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Start an async image search
     fn start_search(&mut self, query: &str) {
         let query = query.to_string();
@@ -222,14 +256,100 @@ impl App {
         });
     }
 
+    /// Start an async MusicBrainz search using disc ID
+    fn start_musicbrainz_search(&mut self, disc_id: &str, toc_string: Option<String>) {
+        let disc_id = disc_id.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        self.search_in_progress = true;
+        self.search_results.clear();
+        self.selected_image_index = None;
+        self.search_receiver = Some(rx);
+
+        thread::spawn(move || {
+            // Query MusicBrainz for releases
+            let mb_results = crate::api::search_by_discid(&disc_id, toc_string.as_deref());
+            
+            let result = mb_results.and_then(|releases| {
+                let mut all_results = Vec::new();
+                
+                // Convert MusicBrainz results to ImageResult format
+                let mb_images: Vec<_> = releases.iter()
+                    .filter_map(|release| {
+                        // Prefer cover art URL, fall back to thumbnail
+                        let image_url = release.cover_art_url.clone().or_else(|| release.thumbnail_url.clone())?;
+                        let thumbnail = release.thumbnail_url.clone().unwrap_or_else(|| image_url.clone());
+                        
+                        let title = if let Some(ref date) = release.date {
+                            format!("{} - {} ({})", release.artist, release.title, date)
+                        } else {
+                            format!("{} - {}", release.artist, release.title)
+                        };
+
+                        Some(crate::search::ImageResult {
+                            image_url,
+                            thumbnail_url: thumbnail,
+                            title,
+                            source: format!("MusicBrainz ({})", release.release_id),
+                            width: None,
+                            height: None,
+                        })
+                    })
+                    .collect();
+                
+                all_results.extend(mb_images);
+                
+                // If we got at least one MusicBrainz result, search Discogs for the album
+                if let Some(first_release) = releases.first() {
+                    let search_query = format!("site:discogs.com {} {}", first_release.artist, first_release.title);
+                    log::info!("Searching Discogs for album: {} - {}", first_release.artist, first_release.title);
+                    
+                    // Search specifically on Discogs
+                    match crate::search::search_images(&search_query, 20) {
+                        Ok(mut discogs_results) => {
+                            // Mark Discogs results with their source
+                            for result in &mut discogs_results {
+                                if result.source.contains("discogs.com") {
+                                    result.source = format!("Discogs");
+                                }
+                            }
+                            all_results.extend(discogs_results);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to search Discogs: {}", e);
+                        }
+                    }
+                }
+                
+                Ok(all_results)
+            });
+            
+            let _ = tx.send(result);
+        });
+    }
+
     /// Poll for search results
     fn poll_search(&mut self) {
         if let Some(ref receiver) = self.search_receiver {
             match receiver.try_recv() {
                 Ok(Ok(mut results)) => {
                     let count = results.len();
-                    // Sort by aspect ratio - closest to 1.0 (square) first
+                    
+                    // Count MusicBrainz vs Discogs results
+                    let mb_count = results.iter().filter(|r| r.source.starts_with("MusicBrainz")).count();
+                    let discogs_count = results.iter().filter(|r| r.source == "Discogs").count();
+                    
+                    // Sort: MusicBrainz results first, then web results by aspect ratio
                     results.sort_by(|a, b| {
+                        // MusicBrainz results always come first
+                        let a_is_mb = a.source.starts_with("MusicBrainz");
+                        let b_is_mb = b.source.starts_with("MusicBrainz");
+                        
+                        if a_is_mb != b_is_mb {
+                            return if a_is_mb { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+                        }
+                        
+                        // Within same category, sort by aspect ratio (closest to 1.0)
                         let aspect_a = match (a.width, a.height) {
                             (Some(w), Some(h)) if h > 0 => {
                                 let ratio = w as f64 / h as f64;
@@ -246,10 +366,19 @@ impl App {
                         };
                         aspect_a.partial_cmp(&aspect_b).unwrap_or(std::cmp::Ordering::Equal)
                     });
+                    
                     self.search_results = results;
                     self.search_in_progress = false;
                     self.search_receiver = None;
-                    self.log(LogLevel::Success, format!("Found {} images (sorted by aspect ratio)", count));
+                    
+                    let msg = if mb_count > 0 && discogs_count > 0 {
+                        format!("Found {} MusicBrainz releases + {} Discogs images", mb_count, discogs_count)
+                    } else if mb_count > 0 {
+                        format!("Found {} MusicBrainz releases", mb_count)
+                    } else {
+                        format!("Found {} images", count)
+                    };
+                    self.log(LogLevel::Success, msg);
                 }
                 Ok(Err(e)) => {
                     self.search_in_progress = false;
@@ -621,21 +750,63 @@ impl eframe::App for App {
 
         // Main central panel
         egui::CentralPanel::default().show(ctx, |ui| {
-            // File selection section
-            ui.group(|ui| {
-                ui.heading("File Selection");
-                ui.add_space(8.0);
+            // Top section with File Selection and Search Settings in columns
+            ui.columns(2, |columns| {
+                
+                // --- Left Column: File Selection ---
+                columns[0].group(|ui| {
+                    ui.set_min_height(120.0);
+                    ui.heading("File Selection");
+                    ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
                     if ui.button("Browse...").clicked() {
                         self.open_file_picker();
                     }
 
+                    ui.add_space(8.0);
+
                     if let Some(ref path) = self.selected_path {
-                        ui.label(path.display().to_string());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(path.display().to_string()).size(11.0)
+                            ).wrap()
+                        );
                     } else {
-                        ui.label("No file selected (drag & drop supported)");
+                        ui.colored_label(egui::Color32::GRAY, "No file selected (drag & drop supported)");
                     }
+                });
+
+                // --- Right Column: Search Settings ---
+                columns[1].group(|ui| {
+                    ui.set_min_height(120.0);
+                    ui.heading("Search Settings");
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Content Type:");
+                        let mut changed = false;
+                        egui::ComboBox::new("content_type_combo", "")
+                            .selected_text(self.search_config.content_type.display_name())
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::Any, "Any").clicked() { 
+                                    changed = true; 
+                                }
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::Games, "Games").clicked() { 
+                                    changed = true; 
+                                }
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::AppsUtilities, "Apps & Utilities").clicked() { 
+                                    changed = true; 
+                                }
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::AudioCDs, "Audio CDs").clicked() { 
+                                    changed = true; 
+                                }
+                            });
+
+                        if changed {
+                            self.save_search_config();
+                            self.update_search_query_from_disc();
+                        }
+                    });
                 });
             });
 
@@ -715,12 +886,47 @@ impl eframe::App for App {
                                     ui.colored_label(egui::Color32::LIGHT_RED, "Not found");
                                 }
                                 ui.end_row();
+
+                                // TOC information (for audio CDs)
+                                if let Some(ref toc) = info.toc {
+                                    ui.label("Audio Tracks:");
+                                    ui.label(format!("{}", toc.track_count()));
+                                    ui.end_row();
+
+                                    ui.label("Total Length:");
+                                    ui.label(toc.total_time_string());
+                                    ui.end_row();
+
+                                    ui.label("MusicBrainz ID:");
+                                    let disc_id = toc.calculate_musicbrainz_id();
+                                    ui.horizontal(|ui| {
+                                        ui.label(&disc_id);
+                                        if ui.small_button("📋").on_hover_text("Copy to clipboard").clicked() {
+                                            ui.output_mut(|o| o.copied_text = disc_id.clone());
+                                        }
+                                        if ui.small_button("🔍").on_hover_text("Search on MusicBrainz").clicked() {
+                                            let url = format!("https://musicbrainz.org/cdtoc/{}", disc_id);
+                                            let _ = crate::api::open_in_browser(&url);
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("FreeDB ID:");
+                                    let freedb_id = toc.calculate_freedb_id();
+                                    ui.horizontal(|ui| {
+                                        ui.label(&freedb_id);
+                                        if ui.small_button("📋").on_hover_text("Copy to clipboard").clicked() {
+                                            ui.output_mut(|o| o.copied_text = freedb_id.clone());
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
                             });
 
                         ui.add_space(16.0);
 
                         // Prepare search query from disc info (clone to avoid borrow issues)
-                        let search_query = ArtworkSearchQuery::from_disc_info(info);
+                        let search_query = ArtworkSearchQuery::from_disc_info_with_config(info, &self.search_config);
                         let default_query = search_query.build_query();
 
                         // Initialize search query text if empty
@@ -745,10 +951,18 @@ impl eframe::App for App {
                         let mut search_clicked = false;
                         let mut browser_clicked = false;
                         let query_for_search = self.search_query_text.clone();
+                        let use_musicbrainz = self.search_config.content_type == ContentType::AudioCDs && info.toc.is_some();
+                        let disc_id = info.toc.as_ref().map(|toc| toc.calculate_musicbrainz_id());
 
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(!self.search_in_progress, |ui| {
-                                if ui.button("Search").clicked() {
+                                let search_label = if use_musicbrainz {
+                                    "Search MusicBrainz"
+                                } else {
+                                    "Search"
+                                };
+                                
+                                if ui.button(search_label).clicked() {
                                     search_clicked = true;
                                 }
                                 if ui.button("Open in Browser").clicked() {
@@ -762,17 +976,41 @@ impl eframe::App for App {
                         });
 
                         if search_clicked {
-                            self.log(LogLevel::Info, format!("Searching: {}", query_for_search));
-                            self.start_search(&query_for_search);
+                            if use_musicbrainz {
+                                if let Some(ref id) = disc_id {
+                                    self.log(LogLevel::Info, format!("Searching MusicBrainz for disc ID: {}", id));
+                                    // Get TOC string if available
+                                    let toc = self.disc_info.as_ref()
+                                        .and_then(|result| result.as_ref().ok())
+                                        .and_then(|info| info.toc.as_ref())
+                                        .map(|toc| toc.to_toc_string());
+                                    self.start_musicbrainz_search(id, toc);
+                                } else {
+                                    self.log(LogLevel::Error, "No disc ID available");
+                                }
+                            } else {
+                                self.log(LogLevel::Info, format!("Searching: {}", query_for_search));
+                                self.start_search(&query_for_search);
+                            }
                         }
 
                         if browser_clicked {
-                            // Build browser URL from current query
-                            let encoded = urlencoding::encode(&query_for_search);
-                            let browser_url = format!("https://www.google.com/search?tbm=isch&tbs=iar:s&q={}", encoded);
-                            self.log(LogLevel::Info, format!("Opening browser: {}", query_for_search));
-                            if let Err(e) = open_in_browser(&browser_url) {
-                                self.log(LogLevel::Error, e);
+                            if use_musicbrainz {
+                                if let Some(ref id) = disc_id {
+                                    let url = format!("https://musicbrainz.org/cdtoc/{}", id);
+                                    self.log(LogLevel::Info, "Opening MusicBrainz in browser".to_string());
+                                    if let Err(e) = open_in_browser(&url) {
+                                        self.log(LogLevel::Error, e);
+                                    }
+                                }
+                            } else {
+                                // Build browser URL from current query
+                                let encoded = urlencoding::encode(&query_for_search);
+                                let browser_url = format!("https://www.google.com/search?tbm=isch&tbs=iar:s&q={}", encoded);
+                                self.log(LogLevel::Info, format!("Opening browser: {}", query_for_search));
+                                if let Err(e) = open_in_browser(&browser_url) {
+                                    self.log(LogLevel::Error, e);
+                                }
                             }
                         }
 

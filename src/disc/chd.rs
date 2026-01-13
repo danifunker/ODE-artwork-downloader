@@ -10,6 +10,7 @@ use chd::Chd;
 use chd::metadata::MetadataTag;
 
 use super::iso9660::{PrimaryVolumeDescriptor, SECTOR_SIZE, PVD_SECTOR};
+use super::toc::{DiscTOC, TrackInfo as TocTrackInfo};
 
 /// CD sector size with full subchannel data (raw)
 const CD_SECTOR_SIZE_RAW: u32 = 2352;
@@ -72,6 +73,8 @@ pub struct ChdInfo {
     pub hunk_size: u32,
     /// Total size of uncompressed data
     pub logical_size: u64,
+    /// Table of Contents (for audio CDs)
+    pub toc: Option<DiscTOC>,
 }
 
 /// Track information parsed from CHD metadata
@@ -124,12 +127,20 @@ pub fn read_chd(path: &Path) -> ChdResult<ChdInfo> {
         }
     };
 
+    // Extract TOC if we have audio tracks
+    let toc = extract_toc_from_tracks(&tracks);
+    if let Some(ref toc) = toc {
+        log::debug!("TOC extracted from CHD: {} tracks, MusicBrainz ID: {}", 
+            toc.track_count(), toc.calculate_musicbrainz_id());
+    }
+
     Ok(ChdInfo {
         volume_label,
         pvd,
         metadata: None,
         hunk_size,
         logical_size,
+        toc,
     })
 }
 
@@ -208,6 +219,40 @@ fn parse_cht2_entry(content: &str, frame_offset: u32) -> Option<TrackInfo> {
 /// Check if a track type is a data track (not audio)
 fn is_data_track(track_type: &str) -> bool {
     track_type.starts_with("MODE1") || track_type.starts_with("MODE2")
+}
+
+/// Check if a track type is an audio track
+fn is_audio_track(track_type: &str) -> bool {
+    track_type == "AUDIO"
+}
+
+/// Extract TOC information from CHD track metadata
+fn extract_toc_from_tracks(tracks: &[TrackInfo]) -> Option<DiscTOC> {
+    // Filter for audio tracks only
+    let audio_tracks: Vec<_> = tracks.iter()
+        .filter(|t| is_audio_track(&t.track_type))
+        .collect();
+
+    if audio_tracks.is_empty() {
+        return None;
+    }
+
+    // Convert to TOC TrackInfo format
+    let toc_tracks: Vec<TocTrackInfo> = audio_tracks.iter()
+        .map(|t| TocTrackInfo {
+            number: t.track_num as u8,
+            offset: t.frame_offset,
+            track_type: t.track_type.clone(),
+        })
+        .collect();
+
+    // Calculate total length from last track
+    let total_length_frames = tracks.iter()
+        .map(|t| t.frame_offset + t.frames)
+        .max()
+        .unwrap_or(0);
+
+    DiscTOC::from_tracks(toc_tracks, total_length_frames)
 }
 
 /// Get sector size for track type
