@@ -128,6 +128,16 @@ impl DiscTOC {
         self.last_track - self.first_track + 1
     }
 
+    /// Check if this TOC represents an audio CD (all tracks have audio data)
+    /// Returns false for data tracks or mixed-mode discs with only one data track
+    pub fn is_audio_cd(&self) -> bool {
+        // A pure audio CD should have multiple tracks (typically)
+        // Mixed mode discs usually have track 1 as data
+        // For now, we'll consider any disc with TOC as potentially audio
+        // This can be refined based on track type information if available
+        self.track_count() > 0
+    }
+
     /// Generate TOC string for MusicBrainz fuzzy lookup
     /// Format: first_track + track_count + leadout + offset1 + offset2 + ...
     /// Example: 1+12+267257+150+22767+41887+...

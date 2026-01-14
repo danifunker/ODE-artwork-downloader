@@ -3,14 +3,64 @@
 //! Unified interface for reading disc images in various formats.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use super::formats::{DiscFormat, FilesystemType};
 use super::identifier::{parse_filename, ConfidenceLevel, ParsedFilename};
 use super::iso9660::PrimaryVolumeDescriptor;
 use super::toc::DiscTOC;
+
+/// Callback for logging disc reading progress
+pub type LogCallback = Arc<Mutex<dyn FnMut(String) + Send>>;
+
+thread_local! {
+    static LOG_CALLBACK: std::cell::RefCell<Option<LogCallback>> = std::cell::RefCell::new(None);
+}
+
+/// Set a logging callback for disc reading operations
+pub fn set_log_callback(callback: LogCallback) {
+    LOG_CALLBACK.with(|cb| {
+        *cb.borrow_mut() = Some(callback);
+    });
+}
+
+/// Clear the logging callback
+pub fn clear_log_callback() {
+    LOG_CALLBACK.with(|cb| {
+        *cb.borrow_mut() = None;
+    });
+}
+
+/// Log a message to both console and callback
+macro_rules! disc_log {
+    ($level:ident, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        log::$level!("{}", msg);
+        LOG_CALLBACK.with(|cb| {
+            if let Some(callback) = cb.borrow().as_ref() {
+                if let Ok(mut cb) = callback.lock() {
+                    cb(msg);
+                }
+            }
+        });
+    }};
+}
+
+/// Detected disc structure type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscStructure {
+    /// ISO9660 filesystem
+    Iso9660,
+    /// Apple Partition Map with HFS/HFS+ partitions
+    ApplePartitionMap,
+    /// HFS/HFS+ directly (no partition map)
+    HfsDirectly,
+    /// Unknown or unrecognized structure
+    Unknown,
+}
 
 /// Errors that can occur when reading disc images
 #[derive(Error, Debug)]
@@ -54,6 +104,10 @@ pub struct DiscInfo {
     pub pvd: Option<PrimaryVolumeDescriptor>,
     /// Table of Contents (for audio CDs)
     pub toc: Option<DiscTOC>,
+    /// HFS Master Directory Block (if HFS filesystem detected)
+    pub hfs_mdb: Option<super::hfs::MasterDirectoryBlock>,
+    /// HFS+ Volume Header (if HFS+ filesystem detected)
+    pub hfsplus_header: Option<super::hfsplus::HfsPlusVolumeHeader>,
 }
 
 impl DiscInfo {
@@ -108,14 +162,86 @@ impl DiscReader {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        let pvd = PrimaryVolumeDescriptor::read_from(&mut reader)
-            .map_err(DiscError::ParseError)?;
+        // Pre-flight check: read first 64KB to detect disc structure
+        let disc_type = Self::detect_disc_structure(&mut reader)?;
+        
+        log::info!("Detected disc structure: {:?}", disc_type);
 
-        let volume_label = if pvd.volume_id.is_empty() {
-            None
-        } else {
-            Some(pvd.volume_id.clone())
+        // Based on detection, parse appropriately
+        let (filesystem, volume_label, pvd, hfs_mdb, hfsplus_header) = match disc_type {
+            DiscStructure::Iso9660 => {
+                disc_log!(info, "Parsing ISO9660 filesystem");
+                // Re-open for clean ISO9660 read
+                let file2 = File::open(path)?;
+                let mut reader2 = BufReader::new(file2);
+                let pvd = PrimaryVolumeDescriptor::read_from(&mut reader2)
+                    .map_err(DiscError::ParseError)?;
+                
+                let label = if pvd.volume_id.is_empty() {
+                    None
+                } else {
+                    Some(pvd.volume_id.clone())
+                };
+                
+                (FilesystemType::Iso9660, label, Some(pvd), None, None)
+            }
+            DiscStructure::ApplePartitionMap => {
+                disc_log!(info, "Parsing Apple Partition Map");
+                // Re-open for APM + HFS detection
+                let file2 = File::open(path)?;
+                let mut reader2 = BufReader::new(file2);
+                let result = Self::try_hfs_detection(&mut reader2).unwrap_or_else(|e| {
+                    disc_log!(warn, "HFS detection failed after APM: {}", e);
+                    (FilesystemType::Unknown, None, None, None, None)
+                });
+                disc_log!(info, "APM result: filesystem={:?}, label={:?}", result.0, result.1);
+                result
+            }
+            DiscStructure::HfsDirectly => {
+                disc_log!(info, "Parsing HFS directly (no partition map)");
+                // Re-open for direct HFS detection (no partition map)
+                let file2 = File::open(path)?;
+                let mut reader2 = BufReader::new(file2);
+                
+                // Seek to HFS header location
+                reader2.seek(SeekFrom::Start(0))
+                    .map_err(|e| DiscError::ParseError(format!("Seek failed: {}", e)))?;
+                
+                // Try HFS+ first
+                if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse(&mut reader2) {
+                    if header.is_valid() {
+                        disc_log!(info, "Result: HFS+, volume: {}", volume_name);
+                        (FilesystemType::HfsPlus, Some(volume_name), None, None, Some(header))
+                    } else {
+                        disc_log!(warn, "HFS+ header invalid");
+                        (FilesystemType::Unknown, None, None, None, None)
+                    }
+                } else {
+                    // Try HFS classic
+                    reader2.seek(SeekFrom::Start(0))
+                        .map_err(|e| DiscError::ParseError(format!("Seek failed: {}", e)))?;
+                    
+                    if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse(&mut reader2) {
+                        if mdb.is_valid() {
+                            disc_log!(info, "Result: HFS, volume: {}", mdb.volume_name);
+                            (FilesystemType::Hfs, Some(mdb.volume_name.clone()), None, Some(mdb), None)
+                        } else {
+                            disc_log!(warn, "HFS MDB invalid");
+                            (FilesystemType::Unknown, None, None, None, None)
+                        }
+                    } else {
+                        disc_log!(warn, "Failed to parse HFS headers");
+                        (FilesystemType::Unknown, None, None, None, None)
+                    }
+                }
+            }
+            DiscStructure::Unknown => {
+                disc_log!(warn, "Unknown disc structure, no filesystem detected");
+                (FilesystemType::Unknown, None, None, None, None)
+            }
         };
+
+        disc_log!(info, "Filesystem: {:?}, Volume label: {:?}", filesystem, volume_label);
 
         // Determine title and confidence based on available information
         let (title, confidence) = if let Some(ref label) = volume_label {
@@ -132,27 +258,157 @@ impl DiscReader {
         Ok(DiscInfo {
             path: path.to_path_buf(),
             format: DiscFormat::Iso,
-            filesystem: FilesystemType::Iso9660,
+            filesystem,
             volume_label,
             parsed_filename,
             title,
             confidence,
-            pvd: Some(pvd),
+            pvd,
             toc: None,
+            hfs_mdb,
+            hfsplus_header,
         })
+    }
+
+    /// Detect disc structure by reading first sectors
+    fn detect_disc_structure<R: Read + Seek>(reader: &mut R) -> Result<DiscStructure, DiscError> {
+        // Read first 64KB
+        let mut buffer = vec![0u8; 65536];
+        reader.seek(SeekFrom::Start(0))
+            .map_err(|e| DiscError::IoError(e))?;
+        
+        let bytes_read = reader.read(&mut buffer)
+            .map_err(|e| DiscError::IoError(e))?;
+        
+        disc_log!(info, "Read {} bytes for disc structure detection", bytes_read);
+        
+        if bytes_read < 2048 {
+            disc_log!(warn, "File too small for disc structure detection");
+            return Ok(DiscStructure::Unknown);
+        }
+
+        // Log first few bytes for debugging
+        if bytes_read >= 16 {
+            disc_log!(info, "First 16 bytes: {:02X?}", &buffer[0..16]);
+        }
+        if bytes_read >= 1040 {
+            disc_log!(info, "Bytes 1024-1040: {:02X?}", &buffer[1024..1040]);
+        }
+        if bytes_read >= 32784 {
+            disc_log!(info, "Bytes 32768-32784 (ISO PVD): {:02X?}", &buffer[32768..32784]);
+        }
+
+        // Check for Apple Partition Map at byte 0 ("ER" = 0x4552)
+        if bytes_read >= 512 && buffer[0] == 0x45 && buffer[1] == 0x52 {
+            disc_log!(info, "Found Apple Partition Map signature (ER) at byte 0");
+            return Ok(DiscStructure::ApplePartitionMap);
+        } else if bytes_read >= 2 {
+            disc_log!(info, "Byte 0-1: 0x{:02X}{:02X} (not APM signature 0x4552)", buffer[0], buffer[1]);
+        }
+
+        // Check for HFS at byte 1024 ("BD" = 0x4244)
+        if bytes_read >= 1026 && buffer[1024] == 0x42 && buffer[1025] == 0x44 {
+            disc_log!(info, "Found HFS signature (BD) at byte 1024");
+            return Ok(DiscStructure::HfsDirectly);
+        } else if bytes_read >= 1026 {
+            disc_log!(info, "Byte 1024-1025: 0x{:02X}{:02X} (not HFS signature 0x4244)", buffer[1024], buffer[1025]);
+        }
+
+        // Check for HFS+ at byte 1024 ("H+" = 0x482B or "HX" = 0x4858)
+        if bytes_read >= 1026 {
+            if (buffer[1024] == 0x48 && buffer[1025] == 0x2B) ||
+               (buffer[1024] == 0x48 && buffer[1025] == 0x58) {
+                disc_log!(info, "Found HFS+ signature (H+ or HX) at byte 1024");
+                return Ok(DiscStructure::HfsDirectly);
+            }
+        }
+
+        // Check for ISO9660 PVD at sector 16 (byte 32768)
+        // PVD starts with 0x01 followed by "CD001"
+        if bytes_read >= 32774 && 
+           buffer[32768] == 0x01 &&
+           &buffer[32769..32774] == b"CD001" {
+            disc_log!(info, "Found ISO9660 PVD signature at byte 32768");
+            return Ok(DiscStructure::Iso9660);
+        } else if bytes_read >= 32774 {
+            disc_log!(info, "Byte 32768-32773: {:02X?} (not ISO9660 PVD)", &buffer[32768..32774]);
+        }
+
+        disc_log!(warn, "No recognized disc structure found in first {}KB", bytes_read / 1024);
+        Ok(DiscStructure::Unknown)
+    }
+
+    /// Try to detect HFS or HFS+ filesystem and extract volume name
+    fn try_hfs_detection<R: Read + Seek>(reader: &mut R) -> Result<(
+        FilesystemType,
+        Option<String>,
+        Option<PrimaryVolumeDescriptor>,
+        Option<super::hfs::MasterDirectoryBlock>,
+        Option<super::hfsplus::HfsPlusVolumeHeader>
+    ), String> {
+        disc_log!(info, "Starting HFS detection");
+        
+        // First, check for Apple Partition Map
+        let partition_offset = match super::apm::find_hfs_partition_offset(reader) {
+            Ok(offset) => {
+                disc_log!(info, "Found HFS partition at offset: {} (block {})", offset, offset / 512);
+                offset
+            }
+            Err(e) => {
+                // No partition map, try direct HFS detection at byte 1024
+                disc_log!(info, "No Apple Partition Map found ({}), trying direct HFS detection", e);
+                0
+            }
+        };
+
+        // HFS/HFS+ headers are at byte 1024 within the partition
+        let header_offset = partition_offset + 1024;
+        disc_log!(info, "Seeking to offset {} (partition {} + 1024) to read HFS headers", 
+            header_offset, partition_offset);
+
+        // Try HFS+ first (more common on newer Mac discs)
+        disc_log!(info, "Attempting to parse HFS+ header...");
+        reader.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| format!("Failed to seek to HFS+ header: {}", e))?;
+        
+        if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse_from_current_position(reader) {
+            disc_log!(info, "HFS+ header parsed, signature: 0x{:04X}, valid: {}", header.signature, header.is_valid());
+            if header.is_valid() {
+                disc_log!(info, "Detected HFS+ volume: {}", volume_name);
+                return Ok((FilesystemType::HfsPlus, Some(volume_name), None, None, Some(header)));
+            } else {
+                disc_log!(warn, "HFS+ header signature found but validation failed");
+            }
+        } else {
+            disc_log!(info, "Failed to parse HFS+ header");
+        }
+
+        // Try HFS (classic)
+        disc_log!(info, "Attempting to parse HFS (classic) header...");
+        reader.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| format!("Failed to seek to HFS header: {}", e))?;
+        
+        if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse_from_current_position(reader) {
+            disc_log!(info, "HFS MDB parsed, signature: 0x{:04X}, valid: {}, name: {}", 
+                mdb.signature, mdb.is_valid(), mdb.volume_name);
+            if mdb.is_valid() {
+                disc_log!(info, "Detected HFS volume: {}", mdb.volume_name);
+                return Ok((FilesystemType::Hfs, Some(mdb.volume_name.clone()), None, Some(mdb), None));
+            } else {
+                disc_log!(warn, "HFS MDB signature found but validation failed");
+            }
+        } else {
+            disc_log!(info, "Failed to parse HFS (classic) header");
+        }
+
+        disc_log!(warn, "No valid HFS/HFS+ filesystem found at partition offset");
+        Err("No HFS/HFS+ filesystem detected".to_string())
     }
 
     /// Read a CHD file
     fn read_chd(path: &Path, parsed_filename: ParsedFilename) -> Result<DiscInfo, DiscError> {
         match super::chd::read_chd(path) {
             Ok(chd_info) => {
-                // Determine filesystem type based on whether we found ISO9660 data
-                let filesystem = if chd_info.pvd.is_some() {
-                    FilesystemType::Iso9660
-                } else {
-                    FilesystemType::Unknown
-                };
-
                 // Determine title and confidence
                 let (title, confidence) = if let Some(ref label) = chd_info.volume_label {
                     if label.len() > 2 && !label.chars().all(|c| c.is_ascii_digit()) {
@@ -170,13 +426,15 @@ impl DiscReader {
                 Ok(DiscInfo {
                     path: path.to_path_buf(),
                     format: DiscFormat::Chd,
-                    filesystem,
+                    filesystem: chd_info.filesystem,
                     volume_label: chd_info.volume_label,
                     parsed_filename,
                     title,
                     confidence,
                     pvd: chd_info.pvd,
                     toc: chd_info.toc,
+                    hfs_mdb: chd_info.hfs_mdb,
+                    hfsplus_header: chd_info.hfsplus_header,
                 })
             }
             Err(e) => {
@@ -193,6 +451,8 @@ impl DiscReader {
                     confidence: ConfidenceLevel::Low,
                     pvd: None,
                     toc: None,
+                    hfs_mdb: None,
+                    hfsplus_header: None,
                 })
             }
         }
@@ -227,6 +487,8 @@ impl DiscReader {
                         confidence: ConfidenceLevel::Low,
                         pvd: None,
                         toc: None,
+                        hfs_mdb: None,
+                        hfsplus_header: None,
                     });
                 }
             }
@@ -234,12 +496,6 @@ impl DiscReader {
 
         match super::bincue::read_bincue(&cue_path) {
             Ok(bincue_info) => {
-                let filesystem = if bincue_info.pvd.is_some() {
-                    FilesystemType::Iso9660
-                } else {
-                    FilesystemType::Unknown
-                };
-
                 let (title, confidence) = if let Some(ref label) = bincue_info.volume_label {
                     if label.len() > 2 && !label.chars().all(|c| c.is_ascii_digit()) {
                         (super::identifier::normalize_volume_label(label), ConfidenceLevel::High)
@@ -253,13 +509,15 @@ impl DiscReader {
                 Ok(DiscInfo {
                     path: path.to_path_buf(),
                     format: DiscFormat::BinCue,
-                    filesystem,
+                    filesystem: bincue_info.filesystem,
                     volume_label: bincue_info.volume_label,
                     parsed_filename,
                     title,
                     confidence,
                     pvd: bincue_info.pvd,
                     toc: bincue_info.toc,
+                    hfs_mdb: bincue_info.hfs_mdb,
+                    hfsplus_header: bincue_info.hfsplus_header,
                 })
             }
             Err(e) => {
@@ -274,6 +532,8 @@ impl DiscReader {
                     confidence: ConfidenceLevel::Low,
                     pvd: None,
                     toc: None,
+                    hfs_mdb: None,
+                    hfsplus_header: None,
                 })
             }
         }
@@ -296,6 +556,8 @@ impl DiscReader {
             confidence: ConfidenceLevel::Low,
             pvd: None,
             toc: None,
+            hfs_mdb: None,
+            hfsplus_header: None,
         })
     }
 }

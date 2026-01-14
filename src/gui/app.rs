@@ -147,8 +147,28 @@ impl App {
         self.preview_texture = None;
         self.preview_url = None;
 
+        // Store log messages in a vector to add after disc reading
+        let log_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_messages_clone = log_messages.clone();
+        
+        // Set up logging callback to capture disc reading logs
+        crate::disc::set_log_callback(std::sync::Arc::new(std::sync::Mutex::new(
+            move |msg: String| {
+                if let Ok(mut messages) = log_messages_clone.lock() {
+                    messages.push(msg);
+                }
+            }
+        )));
+
         match DiscReader::read(&path) {
             Ok(info) => {
+                // Add collected log messages
+                if let Ok(messages) = log_messages.lock() {
+                    for msg in messages.iter() {
+                        self.log(LogLevel::Info, msg.clone());
+                    }
+                }
+                
                 self.log(
                     LogLevel::Success,
                     format!("Successfully read disc: {}", info.title),
@@ -156,6 +176,13 @@ impl App {
                 self.disc_info = Some(Ok(info));
             }
             Err(e) => {
+                // Add collected log messages even on error
+                if let Ok(messages) = log_messages.lock() {
+                    for msg in messages.iter() {
+                        self.log(LogLevel::Info, msg.clone());
+                    }
+                }
+                
                 let error_str = e.to_string();
                 // Check if this is likely an HFS/HFS+ disc or other non-ISO9660 format
                 let is_filesystem_error = error_str.contains("Primary Volume Descriptor")
@@ -183,6 +210,8 @@ impl App {
                         confidence: ConfidenceLevel::Low,
                         pvd: None,
                         toc: None,
+                        hfs_mdb: None,
+                        hfsplus_header: None,
                     };
 
                     self.disc_info = Some(Ok(fallback_info));
@@ -192,6 +221,9 @@ impl App {
                 }
             }
         }
+        
+        // Clear the log callback after processing
+        crate::disc::clear_log_callback();
     }
 
     /// Open file picker dialog
@@ -919,6 +951,60 @@ impl eframe::App for App {
                                             ui.output_mut(|o| o.copied_text = freedb_id.clone());
                                         }
                                     });
+                                    ui.end_row();
+                                }
+
+                                // HFS/HFS+ information
+                                if let Some(ref mdb) = info.hfs_mdb {
+                                    ui.label("HFS Volume:");
+                                    ui.label(&mdb.volume_name);
+                                    ui.end_row();
+
+                                    ui.label("Allocation Blocks:");
+                                    ui.label(format!("{}", mdb.alloc_blocks));
+                                    ui.end_row();
+
+                                    ui.label("Block Size:");
+                                    ui.label(format!("{} bytes", mdb.alloc_block_size));
+                                    ui.end_row();
+
+                                    ui.label("Files/Dirs:");
+                                    ui.label(format!("{} / {}", mdb.root_file_count, mdb.root_dir_count));
+                                    ui.end_row();
+                                }
+
+                                if let Some(ref header) = info.hfsplus_header {
+                                    ui.label("HFS+ Version:");
+                                    ui.label(format!("{}", header.version));
+                                    ui.end_row();
+
+                                    ui.label("Block Size:");
+                                    ui.label(format!("{} bytes", header.block_size));
+                                    ui.end_row();
+
+                                    ui.label("Total Blocks:");
+                                    ui.label(format!("{}", header.total_blocks));
+                                    ui.end_row();
+
+                                    ui.label("Free Blocks:");
+                                    ui.label(format!("{} ({:.1}%)", 
+                                        header.free_blocks,
+                                        (header.free_blocks as f64 / header.total_blocks as f64) * 100.0
+                                    ));
+                                    ui.end_row();
+
+                                    ui.label("Files/Folders:");
+                                    ui.label(format!("{} / {}", header.file_count, header.folder_count));
+                                    ui.end_row();
+
+                                    let total_size = header.total_blocks as u64 * header.block_size as u64;
+                                    let free_size = header.free_blocks as u64 * header.block_size as u64;
+                                    ui.label("Total Size:");
+                                    ui.label(format!("{:.2} GB", total_size as f64 / 1_073_741_824.0));
+                                    ui.end_row();
+
+                                    ui.label("Free Space:");
+                                    ui.label(format!("{:.2} GB", free_size as f64 / 1_073_741_824.0));
                                     ui.end_row();
                                 }
                             });

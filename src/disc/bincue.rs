@@ -74,6 +74,12 @@ pub struct BinCueInfo {
     pub track_count: usize,
     /// Table of Contents (for audio CDs)
     pub toc: Option<DiscTOC>,
+    /// HFS Master Directory Block (if found)
+    pub hfs_mdb: Option<super::hfs::MasterDirectoryBlock>,
+    /// HFS+ Volume Header (if found)
+    pub hfsplus_header: Option<super::hfsplus::HfsPlusVolumeHeader>,
+    /// Filesystem type detected
+    pub filesystem: super::formats::FilesystemType,
 }
 
 /// Track info extracted from CUE commands
@@ -122,6 +128,119 @@ fn normalize_cue_keywords(content: &str) -> String {
         .replace(" WAVE", " Wave")  // Be careful not to replace in filenames
         .replace(" MP3", " Mp3")
         .replace(" AIFF", " Aiff")
+}
+
+/// Detect filesystem type from BIN file
+/// Returns (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem_type)
+fn detect_filesystem<R: Read + Seek>(
+    reader: &mut R,
+    sector_size: u64,
+    data_offset: u64,
+) -> (
+    Option<String>,
+    Option<PrimaryVolumeDescriptor>,
+    Option<super::hfs::MasterDirectoryBlock>,
+    Option<super::hfsplus::HfsPlusVolumeHeader>,
+    super::formats::FilesystemType,
+) {
+    use super::formats::FilesystemType;
+
+    // Try ISO9660 first
+    match read_pvd_from_bin(reader, sector_size, data_offset) {
+        Ok(pvd) => {
+            log::debug!("ISO9660 PVD parsed successfully, volume_id: '{}'", pvd.volume_id);
+            let label = if pvd.volume_id.is_empty() {
+                None
+            } else {
+                Some(pvd.volume_id.clone())
+            };
+            return (label, Some(pvd), None, None, FilesystemType::Iso9660);
+        }
+        Err(e) => {
+            log::debug!("ISO9660 PVD read failed: {}, trying HFS/HFS+", e);
+        }
+    }
+
+    // Try HFS/HFS+ detection
+    // HFS headers are at logical byte 1024 from the start of the data
+    // We need to calculate the physical offset accounting for sector format
+    match read_hfs_headers_from_bin(reader, sector_size, data_offset) {
+        Ok((mdb, header, label, fs_type)) => {
+            log::debug!("Detected HFS/HFS+ filesystem: {:?}, label: {:?}", fs_type, label);
+            return (label, None, mdb, header, fs_type);
+        }
+        Err(e) => {
+            log::debug!("HFS/HFS+ detection failed: {}", e);
+        }
+    }
+
+    // No filesystem detected, try fallback PVD read
+    match try_read_pvd_fallback(reader) {
+        (Some(label), Some(pvd)) => {
+            (Some(label), Some(pvd), None, None, FilesystemType::Iso9660)
+        }
+        _ => {
+            log::warn!("No filesystem detected");
+            (None, None, None, None, FilesystemType::Unknown)
+        }
+    }
+}
+
+/// Read HFS/HFS+ headers from BIN file at logical offset 1024
+fn read_hfs_headers_from_bin<R: Read + Seek>(
+    reader: &mut R,
+    sector_size: u64,
+    data_offset: u64,
+) -> Result<(
+    Option<super::hfs::MasterDirectoryBlock>,
+    Option<super::hfsplus::HfsPlusVolumeHeader>,
+    Option<String>,
+    super::formats::FilesystemType,
+), String> {
+    use super::formats::FilesystemType;
+
+    // HFS headers are at logical byte 1024
+    // Calculate which sector contains byte 1024
+    let logical_offset = 1024u64;
+    
+    // For sector-based formats, we need to read the sector containing byte 1024
+    // and extract the header from within that sector
+    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED;  // Logical sector (2048-byte sectors)
+    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED;
+    
+    // Calculate physical byte offset in the BIN file
+    let physical_offset = (sector_number * sector_size) + data_offset + offset_in_sector;
+    
+    log::debug!("Reading HFS headers: logical_offset={}, sector={}, offset_in_sector={}, physical_offset={}", 
+        logical_offset, sector_number, offset_in_sector, physical_offset);
+    
+    // Read enough data for HFS+ header (512 bytes)
+    reader.seek(SeekFrom::Start(physical_offset))
+        .map_err(|e| format!("Failed to seek to HFS header: {}", e))?;
+    
+    let mut buffer = vec![0u8; 512];
+    reader.read_exact(&mut buffer)
+        .map_err(|e| format!("Failed to read HFS header: {}", e))?;
+    
+    // Try HFS+ first
+    let mut cursor = std::io::Cursor::new(&buffer);
+    if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse_from_current_position(&mut cursor) {
+        if header.is_valid() {
+            log::debug!("Detected HFS+ volume: {}", volume_name);
+            return Ok((None, Some(header), Some(volume_name), FilesystemType::HfsPlus));
+        }
+    }
+    
+    // Try HFS classic (needs 162 bytes but we have 512)
+    let mut cursor = std::io::Cursor::new(&buffer);
+    if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse_from_current_position(&mut cursor) {
+        if mdb.is_valid() {
+            log::debug!("Detected HFS volume: {}", mdb.volume_name);
+            return Ok((Some(mdb.clone()), None, Some(mdb.volume_name), FilesystemType::Hfs));
+        }
+    }
+    
+    Err("No valid HFS/HFS+ filesystem found".to_string())
 }
 
 /// Read BIN/CUE disc image and extract information
@@ -202,35 +321,20 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
     let bin_path = resolve_bin_path_with_cue_fallback(cue_dir, primary_bin_filename, Some(cue_path))?;
 
     // Try to read PVD from the data track's BIN file
-    let (volume_label, pvd) = if let Some(track) = data_track {
+    let (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem) = if let Some(track) = data_track {
         // Open the specific BIN file for this track
         let track_bin_path = resolve_bin_path_with_cue_fallback(cue_dir, &track.bin_filename, Some(cue_path))?;
         log::debug!("Opening data track BIN file: {}", track_bin_path.display());
         let file = File::open(&track_bin_path)?;
         let mut reader = BufReader::new(file);
 
-        match read_pvd_from_bin(&mut reader, track.sector_size, track.data_offset) {
-            Ok(pvd) => {
-                log::debug!("PVD parsed successfully, volume_id: '{}'", pvd.volume_id);
-                let label = if pvd.volume_id.is_empty() {
-                    log::debug!("Volume ID is empty");
-                    None
-                } else {
-                    Some(pvd.volume_id.clone())
-                };
-                (label, Some(pvd))
-            }
-            Err(e) => {
-                log::warn!("Failed to read PVD with track params: {}", e);
-                // Try fallback
-                try_read_pvd_fallback(&mut reader)
-            }
-        }
+        // Try to detect filesystem type
+        detect_filesystem(&mut reader, track.sector_size, track.data_offset)
     } else {
         log::warn!("No data track found, trying fallback on first BIN file");
         let file = File::open(&bin_path)?;
         let mut reader = BufReader::new(file);
-        try_read_pvd_fallback(&mut reader)
+        detect_filesystem(&mut reader, CD_SECTOR_SIZE_COOKED, 0)
     };
 
     // Extract TOC if we have audio tracks
@@ -246,6 +350,9 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
         bin_path,
         track_count: tracks.len(),
         toc,
+        hfs_mdb,
+        hfsplus_header,
+        filesystem,
     })
 }
 
@@ -377,6 +484,14 @@ fn extract_toc(tracks: &[ParsedTrack], bin_path: &Path) -> Option<DiscTOC> {
         .collect();
 
     if tracks_with_index.is_empty() {
+        log::debug!("No tracks with INDEX 01 found, skipping TOC extraction");
+        return None;
+    }
+
+    // Check if any tracks are audio
+    let has_audio = tracks.iter().any(|t| matches!(t.track_type, TrackType::Audio));
+    if !has_audio {
+        log::debug!("No audio tracks found (all data tracks), skipping TOC extraction");
         return None;
     }
 
@@ -404,6 +519,10 @@ fn extract_toc(tracks: &[ParsedTrack], bin_path: &Path) -> Option<DiscTOC> {
     if track_infos.is_empty() {
         return None;
     }
+
+    log::info!("Extracting TOC for {} tracks ({} audio)", 
+        track_infos.len(), 
+        track_infos.iter().filter(|t| t.track_type == "AUDIO").count());
 
     // Calculate total length from BIN file size
     let total_length_frames = if let Ok(metadata) = std::fs::metadata(bin_path) {
