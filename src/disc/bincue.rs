@@ -147,6 +147,7 @@ fn detect_filesystem<R: Read + Seek>(
     use super::formats::FilesystemType;
 
     // Try to detect an Apple Partition Map first
+    log::debug!("Attempting to detect Apple Partition Map...");
     if let Ok(hfs_partition_offset) = super::apm::find_hfs_partition_offset(reader) {
         let hfs_offset = track_start_offset + hfs_partition_offset;
 

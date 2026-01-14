@@ -107,6 +107,7 @@ impl MasterDirectoryBlock {
 
     /// Read HFS MDB from a specific offset
     pub fn read_at_offset<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Self, String> {
+        log::debug!("Attempting to read HFS MDB at offset {}", offset);
         reader.seek(SeekFrom::Start(offset))
             .map_err(|e| format!("Failed to seek to HFS MDB at offset {}: {}", offset, e))?;
         Self::parse_from_current_position(reader)

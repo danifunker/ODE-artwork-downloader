@@ -241,6 +241,7 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
     let mut chd_reader = ChdReader::new(chd, tracks);
 
     // Try to detect an Apple Partition Map first
+    log::debug!("Attempting to detect Apple Partition Map...");
     if let Ok(hfs_partition_offset) = super::apm::find_hfs_partition_offset(&mut chd_reader) {
         // Try HFS+ first
         if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::read_at_offset(&mut chd_reader, hfs_partition_offset + 1024) {
