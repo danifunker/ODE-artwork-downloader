@@ -146,7 +146,26 @@ fn detect_filesystem<R: Read + Seek>(
 ) {
     use super::formats::FilesystemType;
 
-    // Try ISO9660 first
+    // Try to detect an Apple Partition Map first
+    if let Ok(hfs_partition_offset) = super::apm::find_hfs_partition_offset(reader) {
+        let hfs_offset = track_start_offset + hfs_partition_offset;
+
+        // Try HFS+ first
+        if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::read_at_offset(reader, hfs_offset + 1024) {
+            if header.is_valid() {
+                return (Some(volume_name), None, None, Some(header), FilesystemType::HfsPlus);
+            }
+        }
+
+        // Try HFS classic
+        if let Ok(mdb) = super::hfs::MasterDirectoryBlock::read_at_offset(reader, hfs_offset + 1024) {
+            if mdb.is_valid() {
+                return (Some(mdb.volume_name.clone()), None, Some(mdb), None, FilesystemType::Hfs);
+            }
+        }
+    }
+
+    // Fallback to trying ISO9660 first
     match read_pvd_from_bin(reader, track_start_offset, sector_size, data_offset) {
         Ok(pvd) => {
             log::debug!("ISO9660 PVD parsed successfully, volume_id: '{}'", pvd.volume_id);
@@ -162,9 +181,7 @@ fn detect_filesystem<R: Read + Seek>(
         }
     }
 
-    // Try HFS/HFS+ detection
-    // HFS headers are at logical byte 1024 from the start of the data
-    // We need to calculate the physical offset accounting for sector format
+    // Fallback to HFS/HFS+ detection at a fixed offset
     match read_hfs_headers_from_bin(reader, track_start_offset, sector_size, data_offset) {
         Ok((mdb, header, label, fs_type)) => {
             log::debug!("Detected HFS/HFS+ filesystem: {:?}, label: {:?}", fs_type, label);

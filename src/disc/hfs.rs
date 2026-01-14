@@ -104,6 +104,13 @@ impl MasterDirectoryBlock {
     pub fn is_valid(&self) -> bool {
         self.signature == 0x4244 && !self.volume_name.is_empty()
     }
+
+    /// Read HFS MDB from a specific offset
+    pub fn read_at_offset<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Self, String> {
+        reader.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Failed to seek to HFS MDB at offset {}: {}", offset, e))?;
+        Self::parse_from_current_position(reader)
+    }
 }
 
 #[cfg(test)]

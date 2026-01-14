@@ -237,7 +237,27 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
 ) {
     use super::formats::FilesystemType;
 
-    // Try ISO9660 first
+    // Wrap the CHD reader in a type that implements Read and Seek
+    let mut chd_reader = ChdReader::new(chd, tracks);
+
+    // Try to detect an Apple Partition Map first
+    if let Ok(hfs_partition_offset) = super::apm::find_hfs_partition_offset(&mut chd_reader) {
+        // Try HFS+ first
+        if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::read_at_offset(&mut chd_reader, hfs_partition_offset + 1024) {
+            if header.is_valid() {
+                return (Some(volume_name), None, None, Some(header), FilesystemType::HfsPlus);
+            }
+        }
+
+        // Try HFS classic
+        if let Ok(mdb) = super::hfs::MasterDirectoryBlock::read_at_offset(&mut chd_reader, hfs_partition_offset + 1024) {
+            if mdb.is_valid() {
+                return (Some(mdb.volume_name.clone()), None, Some(mdb), None, FilesystemType::Hfs);
+            }
+        }
+    }
+
+    // Fallback to trying ISO9660 first
     match read_pvd_from_chd(chd, tracks) {
         Ok(pvd) => {
             log::debug!("ISO9660 PVD parsed successfully from CHD, volume_id: '{}'", pvd.volume_id);
@@ -253,9 +273,7 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
         }
     }
 
-    // Try HFS/HFS+ detection
-    // HFS headers are at logical byte 1024 (within sector 0 for 2048-byte sectors)
-    // Read the data containing the HFS header area
+    // Fallback to HFS/HFS+ detection at a fixed offset
     match read_hfs_headers_from_chd(chd, tracks) {
         Ok((mdb, header, label, fs_type)) => {
             log::debug!("Detected HFS/HFS+ filesystem from CHD: {:?}, label: {:?}", fs_type, label);
@@ -438,6 +456,73 @@ fn get_track_sector_size(track_type: &str) -> (u32, usize) {
     } else {
         // Cooked mode: 2048 bytes of user data
         (CD_SECTOR_SIZE_COOKED, 0)
+    }
+}
+
+struct ChdReader<'a, F: Read + Seek> {
+    chd: &'a mut Chd<F>,
+    pos: u64,
+    hunk_cache: Option<(u32, Vec<u8>)>,
+}
+
+impl<'a, F: Read + Seek> ChdReader<'a, F> {
+    fn new(chd: &'a mut Chd<F>, _tracks: &'a [TrackInfo]) -> Self {
+        Self { chd, pos: 0, hunk_cache: None }
+    }
+}
+
+impl<'a, F: Read + Seek> Read for ChdReader<'a, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let hunk_size = self.chd.header().hunk_size() as u64;
+        let mut bytes_read = 0;
+
+        while bytes_read < buf.len() {
+            let hunk_index = (self.pos / hunk_size) as u32;
+            let offset_in_hunk = (self.pos % hunk_size) as usize;
+
+            let hunk_data = match &self.hunk_cache {
+                Some((cached_index, cached_data)) if *cached_index == hunk_index => {
+                    cached_data
+                }
+                _ => {
+                    let mut compressed_buf = Vec::new();
+                    let mut new_hunk_data = self.chd.get_hunksized_buffer();
+                    self.chd.hunk(hunk_index)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CHD hunk error: {:?}", e)))?
+                        .read_hunk_in(&mut compressed_buf, &mut new_hunk_data)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CHD hunk read error: {:?}", e)))?;
+                    self.hunk_cache = Some((hunk_index, new_hunk_data));
+                    &self.hunk_cache.as_ref().unwrap().1
+                }
+            };
+
+            let bytes_to_read = (buf.len() - bytes_read).min(hunk_data.len() - offset_in_hunk);
+            if bytes_to_read == 0 {
+                break;
+            }
+
+            buf[bytes_read..bytes_read + bytes_to_read].copy_from_slice(&hunk_data[offset_in_hunk..offset_in_hunk + bytes_to_read]);
+            bytes_read += bytes_to_read;
+            self.pos += bytes_to_read as u64;
+        }
+
+        Ok(bytes_read)
+    }
+}
+
+impl<'a, F: Read + Seek> Seek for ChdReader<'a, F> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            std::io::SeekFrom::Start(p) => p as i64,
+            std::io::SeekFrom::End(p) => self.chd.header().logical_bytes() as i64 + p,
+            std::io::SeekFrom::Current(p) => self.pos as i64 + p,
+        };
+
+        if new_pos < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid seek"));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
     }
 }
 
