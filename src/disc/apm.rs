@@ -94,14 +94,15 @@ pub fn parse_partition_map<R: Read + Seek>(reader: &mut R) -> Result<Vec<Partiti
         .map_err(|e| format!("Failed to read DDM: {}", e))?;
 
     let ddm_signature = u16::from_be_bytes([ddm_block[0], ddm_block[1]]);
-    log::info!("DDM signature: 0x{:04X}", ddm_signature);
+    log::debug!("DDM signature: 0x{:04X}", ddm_signature);
     if ddm_signature != DDM_SIGNATURE {
+        log::warn!("Invalid DDM signature: 0x{:04X} (expected 0x4552)", ddm_signature);
         return Err(format!("Invalid DDM signature: 0x{:04X} (expected 0x4552)", ddm_signature));
     }
 
     // Block size at bytes 2-3 (should be 512)
     let block_size = u16::from_be_bytes([ddm_block[2], ddm_block[3]]);
-    log::info!("DDM block size: {}", block_size);
+    log::debug!("DDM block size: {}", block_size);
 
     // Read first partition entry at block 1
     reader.seek(SeekFrom::Start(APM_BLOCK_SIZE))
@@ -114,7 +115,7 @@ pub fn parse_partition_map<R: Read + Seek>(reader: &mut R) -> Result<Vec<Partiti
     let first_entry = PartitionEntry::parse(&first_entry_data)?;
     let num_partitions = first_entry.map_entries;
 
-    log::info!("Found {} partitions in Apple Partition Map", num_partitions);
+    log::debug!("Found {} partitions in Apple Partition Map", num_partitions);
 
     // Read all partition entries
     let mut partitions = vec![first_entry];
@@ -128,7 +129,7 @@ pub fn parse_partition_map<R: Read + Seek>(reader: &mut R) -> Result<Vec<Partiti
 
         match PartitionEntry::parse(&entry_data) {
             Ok(entry) => {
-                log::info!("Partition {}: {} (type: {}, blocks: {}+{})", 
+                log::debug!("Partition {}: {} (type: {}, blocks: {}+{})",
                     i, entry.name, entry.partition_type, entry.start_block, entry.block_count);
                 partitions.push(entry);
             }
@@ -149,7 +150,7 @@ pub fn find_hfs_partition_offset<R: Read + Seek>(reader: &mut R) -> Result<u64, 
     for partition in &partitions {
         if partition.is_hfs() {
             let offset = partition.start_block as u64 * APM_BLOCK_SIZE;
-            log::info!("Found HFS partition '{}' at block {} (byte offset: {})", 
+            log::debug!("Found HFS partition '{}' at block {} (byte offset: {})",
                 partition.name, partition.start_block, offset);
             return Ok(offset);
         }

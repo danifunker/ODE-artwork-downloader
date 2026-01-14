@@ -31,3 +31,35 @@ pub use hfs::MasterDirectoryBlock;
 pub use hfsplus::HfsPlusVolumeHeader;
 #[allow(unused_imports)]
 pub use apm::PartitionEntry;
+
+use std::io::{Read, Seek, SeekFrom};
+
+/// A reader that wraps another reader and applies a start offset.
+/// All seek and read operations are relative to this start offset.
+struct OffsetReader<R: Read + Seek> {
+    inner: R,
+    start_offset: u64,
+}
+
+impl<R: Read + Seek> OffsetReader<R> {
+    fn new(mut inner: R, start_offset: u64) -> std::io::Result<Self> {
+        inner.seek(SeekFrom::Start(start_offset))?;
+        Ok(Self { inner, start_offset })
+    }
+}
+
+impl<R: Read + Seek> Read for OffsetReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read + Seek> Seek for OffsetReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => self.start_offset + p,
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unsupported seek")),
+        };
+        self.inner.seek(SeekFrom::Start(new_pos)).map(|p| p - self.start_offset)
+    }
+}

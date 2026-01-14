@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(parse_msf("00:00:00"), Some(0));
         assert_eq!(parse_msf("00:02:00"), Some(150));
         assert_eq!(parse_msf("01:00:00"), Some(4500));
-        assert_eq!(parse_msf("74:59:74"), Some(337424));
+        assert_eq!(parse_msf("74:59:74"), Some(337499));
     }
 
     #[test]

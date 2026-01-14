@@ -204,7 +204,7 @@ mod tests {
     fn test_search_by_discid() {
         // Example disc ID for testing (Pink Floyd - The Wall)
         let disc_id = "Wn8eRBtd9vAbzyhjiSRQ_ZQT49w-";
-        let results = search_by_discid(disc_id).unwrap();
+        let results = search_by_discid(disc_id, None).unwrap();
         assert!(!results.is_empty());
     }
 }

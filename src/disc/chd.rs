@@ -237,7 +237,47 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
 ) {
     use super::formats::FilesystemType;
 
-    // Try ISO9660 first
+    // Find the start offset of the first data track. This is crucial for multi-track images.
+    let data_track_start_offset = tracks
+        .iter()
+        .find(|t| is_data_track(&t.track_type))
+        .map(|t| t.frame_offset as u64 * CD_FRAME_SIZE as u64)
+        .unwrap_or(0);
+    log::debug!("Data track start offset for APM scan: {}", data_track_start_offset);
+
+    // Wrap the CHD reader in a type that implements Read and Seek
+    let mut chd_reader = ChdReader::new(chd, tracks);
+
+    // Try to detect an Apple Partition Map first, using an OffsetReader to scope the search
+    log::debug!("Attempting to detect Apple Partition Map...");
+    let hfs_scan_result = match super::OffsetReader::new(&mut chd_reader, data_track_start_offset) {
+        Ok(mut offset_reader) => super::apm::find_hfs_partition_offset(&mut offset_reader),
+        Err(e) => {
+            log::warn!("Failed to create OffsetReader for APM scan: {}", e);
+            Err("OffsetReader creation failed".to_string())
+        }
+    };
+
+    if let Ok(hfs_partition_offset) = hfs_scan_result {
+        // The offset returned is relative to the track start. Calculate the absolute offset.
+        let hfs_offset = data_track_start_offset + hfs_partition_offset;
+
+        // Try HFS+ first, reading from the absolute offset in the original reader
+        if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::read_at_offset(&mut chd_reader, hfs_offset + 1024) {
+            if header.is_valid() {
+                return (Some(volume_name), None, None, Some(header), FilesystemType::HfsPlus);
+            }
+        }
+
+        // Try HFS classic
+        if let Ok(mdb) = super::hfs::MasterDirectoryBlock::read_at_offset(&mut chd_reader, hfs_offset + 1024) {
+            if mdb.is_valid() {
+                return (Some(mdb.volume_name.clone()), None, Some(mdb), None, FilesystemType::Hfs);
+            }
+        }
+    }
+
+    // Fallback to trying ISO9660 first
     match read_pvd_from_chd(chd, tracks) {
         Ok(pvd) => {
             log::debug!("ISO9660 PVD parsed successfully from CHD, volume_id: '{}'", pvd.volume_id);
@@ -253,9 +293,7 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
         }
     }
 
-    // Try HFS/HFS+ detection
-    // HFS headers are at logical byte 1024 (within sector 0 for 2048-byte sectors)
-    // Read the data containing the HFS header area
+    // Fallback to HFS/HFS+ detection at a fixed offset
     match read_hfs_headers_from_chd(chd, tracks) {
         Ok((mdb, header, label, fs_type)) => {
             log::debug!("Detected HFS/HFS+ filesystem from CHD: {:?}, label: {:?}", fs_type, label);
@@ -270,6 +308,96 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
     (None, None, None, None, FilesystemType::Unknown)
 }
 
+/// Helper function to read HFS headers from a specific physical offset in the CHD data,
+/// handling data that might span across hunk boundaries.
+fn read_hfs_data_at_offset<F: Read + Seek>(
+    chd: &mut Chd<F>,
+    physical_offset: u64,
+) -> Result<(
+    Option<super::hfs::MasterDirectoryBlock>,
+    Option<super::hfsplus::HfsPlusVolumeHeader>,
+    Option<String>,
+    super::formats::FilesystemType,
+), String> {
+    use super::formats::FilesystemType;
+
+    let header = chd.header();
+    let hunk_size = header.hunk_size() as u64;
+
+    // Read 512 bytes for the headers, handling hunk spanning
+    let mut buffer = vec![0; 512];
+    let mut bytes_read = 0;
+    let mut current_offset = physical_offset;
+
+    // Create buffers outside the loop
+    let mut compressed_buf = Vec::new();
+    let mut hunk_buf = chd.get_hunksized_buffer();
+
+    while bytes_read < 512 {
+        let hunk_index = (current_offset / hunk_size) as u32;
+        let offset_in_hunk = (current_offset % hunk_size) as usize;
+
+        chd.hunk(hunk_index)
+            .map_err(|e| format!("Failed to get hunk {}: {:?}", hunk_index, e))?
+            .read_hunk_in(&mut compressed_buf, &mut hunk_buf)
+            .map_err(|e| format!("Failed to read hunk {}: {:?}", hunk_index, e))?;
+
+        let bytes_to_read = (512 - bytes_read).min(hunk_buf.len() - offset_in_hunk);
+        buffer[bytes_read..bytes_read + bytes_to_read].copy_from_slice(&hunk_buf[offset_in_hunk..offset_in_hunk + bytes_to_read]);
+
+        bytes_read += bytes_to_read;
+        current_offset += bytes_to_read as u64;
+    }
+
+    // Try HFS+ first
+    let mut cursor = std::io::Cursor::new(&buffer);
+    if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse_from_current_position(&mut cursor) {
+        if header.is_valid() {
+            log::debug!("Detected HFS+ volume from CHD: {}", volume_name);
+            return Ok((None, Some(header), Some(volume_name), FilesystemType::HfsPlus));
+        }
+    }
+    
+    // Try HFS classic
+    let mut cursor = std::io::Cursor::new(&buffer);
+    if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse_from_current_position(&mut cursor) {
+        if mdb.is_valid() {
+            log::debug!("Detected HFS volume from CHD: {}", mdb.volume_name);
+            return Ok((Some(mdb.clone()), None, Some(mdb.volume_name), FilesystemType::Hfs));
+        }
+    }
+    
+    Err("No valid HFS/HFS+ filesystem found at specified offset".to_string())
+}
+
+/// Scan for HFS headers in a CHD without track metadata
+fn read_hfs_headers_from_chd_legacy<F: Read + Seek>(
+    chd: &mut Chd<F>,
+) -> Result<(
+    Option<super::hfs::MasterDirectoryBlock>,
+    Option<super::hfsplus::HfsPlusVolumeHeader>,
+    Option<String>,
+    super::formats::FilesystemType,
+), String> {
+    log::debug!("No track metadata found, trying legacy HFS scan");
+    let logical_offset = 1024u64;
+
+    // Attempt 1: Cooked mode (like an ISO, physical offset is the same)
+    if let Ok(result) = read_hfs_data_at_offset(chd, logical_offset) {
+        log::debug!("Found HFS via legacy cooked mode scan (offset {})", logical_offset);
+        return Ok(result);
+    }
+
+    // Attempt 2: Raw mode (assume Mode 1 data offset)
+    let raw_offset = logical_offset + CD_MODE1_DATA_OFFSET as u64;
+     if let Ok(result) = read_hfs_data_at_offset(chd, raw_offset) {
+        log::debug!("Found HFS via legacy raw mode scan (offset {})", raw_offset);
+        return Ok(result);
+    }
+
+    Err("No HFS filesystem found with legacy scan".to_string())
+}
+
 /// Read HFS/HFS+ headers from CHD at logical offset 1024
 fn read_hfs_headers_from_chd<F: Read + Seek>(
     chd: &mut Chd<F>,
@@ -280,11 +408,6 @@ fn read_hfs_headers_from_chd<F: Read + Seek>(
     Option<String>,
     super::formats::FilesystemType,
 )> {
-    use super::formats::FilesystemType;
-
-    let header = chd.header();
-    let hunk_size = header.hunk_size();
-
     // Find data tracks
     let data_tracks: Vec<_> = tracks
         .iter()
@@ -292,67 +415,26 @@ fn read_hfs_headers_from_chd<F: Read + Seek>(
         .collect();
 
     if data_tracks.is_empty() {
-        return Err(ChdError::Parse("No data tracks found".to_string()));
+        // If no data tracks found in metadata, try scanning from the start of the image
+        return read_hfs_headers_from_chd_legacy(chd).map_err(ChdError::Parse);
     }
 
     // Use first data track
     let track = data_tracks[0];
-    let track_byte_offset = track.frame_offset as u64 * CD_FRAME_SIZE as u64;
-    
-    // HFS headers are at logical byte 1024
-    // Calculate which frame/sector contains byte 1024
+
+    // HFS headers are at logical byte 1024 from the start of the data partition.
     let logical_offset = 1024u64;
-    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED as u64;
-    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED as u64;
-    
     let (_sector_size, data_offset) = get_track_sector_size(&track.track_type);
-    
-    // Physical offset in the CHD data
-    let frame_byte_offset = track_byte_offset + (sector_number * CD_FRAME_SIZE as u64);
-    let physical_offset = frame_byte_offset + data_offset as u64 + offset_in_sector;
-    
-    log::debug!("Reading HFS headers from CHD: logical={}, sector={}, offset_in_sector={}, physical={}", 
-        logical_offset, sector_number, offset_in_sector, physical_offset);
-    
-    // Calculate hunk and offset within hunk
-    let hunk_index = (physical_offset / hunk_size as u64) as u32;
-    let offset_in_hunk = (physical_offset % hunk_size as u64) as usize;
-    
-    // Read the hunk
-    let mut compressed_buf = Vec::new();
-    let mut hunk_buf = chd.get_hunksized_buffer();
-    
-    chd.hunk(hunk_index)
-        .map_err(|e| ChdError::Parse(format!("Failed to get hunk: {:?}", e)))?
-        .read_hunk_in(&mut compressed_buf, &mut hunk_buf)
-        .map_err(|e| ChdError::Parse(format!("Failed to read hunk: {:?}", e)))?;
-    
-    // Extract 512 bytes for HFS+ header
-    if offset_in_hunk + 512 > hunk_buf.len() {
-        return Err(ChdError::Parse("HFS header spans hunk boundary".to_string()));
-    }
-    
-    let header_data = &hunk_buf[offset_in_hunk..offset_in_hunk + 512];
-    
-    // Try HFS+ first
-    let mut cursor = std::io::Cursor::new(header_data);
-    if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse_from_current_position(&mut cursor) {
-        if header.is_valid() {
-            log::debug!("Detected HFS+ volume from CHD: {}", volume_name);
-            return Ok((None, Some(header), Some(volume_name), FilesystemType::HfsPlus));
-        }
-    }
-    
-    // Try HFS classic
-    let mut cursor = std::io::Cursor::new(header_data);
-    if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse_from_current_position(&mut cursor) {
-        if mdb.is_valid() {
-            log::debug!("Detected HFS volume from CHD: {}", mdb.volume_name);
-            return Ok((Some(mdb.clone()), None, Some(mdb.volume_name), FilesystemType::Hfs));
-        }
-    }
-    
-    Err(ChdError::Parse("No valid HFS/HFS+ filesystem found".to_string()))
+
+    // Physical offset in the CHD data is track start + data offset within frame + logical offset
+    let track_start_offset = track.frame_offset as u64 * CD_FRAME_SIZE as u64;
+    let physical_offset = track_start_offset + data_offset as u64 + logical_offset;
+
+    log::debug!("Reading HFS headers from CHD track {}: type={}, logical_offset={}, data_offset={}, physical_offset={}",
+        track.track_num, track.track_type, logical_offset, data_offset, physical_offset);
+
+    // Read the data at the calculated physical offset
+    read_hfs_data_at_offset(chd, physical_offset).map_err(ChdError::Parse)
 }
 
 /// Extract TOC information from CHD track metadata
@@ -394,6 +476,73 @@ fn get_track_sector_size(track_type: &str) -> (u32, usize) {
     } else {
         // Cooked mode: 2048 bytes of user data
         (CD_SECTOR_SIZE_COOKED, 0)
+    }
+}
+
+struct ChdReader<'a, F: Read + Seek> {
+    chd: &'a mut Chd<F>,
+    pos: u64,
+    hunk_cache: Option<(u32, Vec<u8>)>,
+}
+
+impl<'a, F: Read + Seek> ChdReader<'a, F> {
+    fn new(chd: &'a mut Chd<F>, _tracks: &'a [TrackInfo]) -> Self {
+        Self { chd, pos: 0, hunk_cache: None }
+    }
+}
+
+impl<'a, F: Read + Seek> Read for ChdReader<'a, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let hunk_size = self.chd.header().hunk_size() as u64;
+        let mut bytes_read = 0;
+
+        while bytes_read < buf.len() {
+            let hunk_index = (self.pos / hunk_size) as u32;
+            let offset_in_hunk = (self.pos % hunk_size) as usize;
+
+            let hunk_data = match &self.hunk_cache {
+                Some((cached_index, cached_data)) if *cached_index == hunk_index => {
+                    cached_data
+                }
+                _ => {
+                    let mut compressed_buf = Vec::new();
+                    let mut new_hunk_data = self.chd.get_hunksized_buffer();
+                    self.chd.hunk(hunk_index)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CHD hunk error: {:?}", e)))?
+                        .read_hunk_in(&mut compressed_buf, &mut new_hunk_data)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CHD hunk read error: {:?}", e)))?;
+                    self.hunk_cache = Some((hunk_index, new_hunk_data));
+                    &self.hunk_cache.as_ref().unwrap().1
+                }
+            };
+
+            let bytes_to_read = (buf.len() - bytes_read).min(hunk_data.len() - offset_in_hunk);
+            if bytes_to_read == 0 {
+                break;
+            }
+
+            buf[bytes_read..bytes_read + bytes_to_read].copy_from_slice(&hunk_data[offset_in_hunk..offset_in_hunk + bytes_to_read]);
+            bytes_read += bytes_to_read;
+            self.pos += bytes_to_read as u64;
+        }
+
+        Ok(bytes_read)
+    }
+}
+
+impl<'a, F: Read + Seek> Seek for ChdReader<'a, F> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            std::io::SeekFrom::Start(p) => p as i64,
+            std::io::SeekFrom::End(p) => self.chd.header().logical_bytes() as i64 + p,
+            std::io::SeekFrom::Current(p) => self.pos as i64 + p,
+        };
+
+        if new_pos < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid seek"));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
     }
 }
 

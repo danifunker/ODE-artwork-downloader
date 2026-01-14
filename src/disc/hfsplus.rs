@@ -159,6 +159,14 @@ impl HfsPlusVolumeHeader {
         self.block_size > 0 && 
         self.total_blocks > 0
     }
+
+    /// Read HFS+ Volume Header from a specific offset
+    pub fn read_at_offset<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<(Self, String), String> {
+        log::debug!("Attempting to read HFS+ header at offset {}", offset);
+        reader.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Failed to seek to HFS+ header at offset {}: {}", offset, e))?;
+        Self::parse_from_current_position(reader)
+    }
 }
 
 #[cfg(test)]
