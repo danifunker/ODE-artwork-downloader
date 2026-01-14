@@ -237,21 +237,40 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
 ) {
     use super::formats::FilesystemType;
 
+    // Find the start offset of the first data track. This is crucial for multi-track images.
+    let data_track_start_offset = tracks
+        .iter()
+        .find(|t| is_data_track(&t.track_type))
+        .map(|t| t.frame_offset as u64 * CD_FRAME_SIZE as u64)
+        .unwrap_or(0);
+    log::debug!("Data track start offset for APM scan: {}", data_track_start_offset);
+
     // Wrap the CHD reader in a type that implements Read and Seek
     let mut chd_reader = ChdReader::new(chd, tracks);
 
-    // Try to detect an Apple Partition Map first
+    // Try to detect an Apple Partition Map first, using an OffsetReader to scope the search
     log::debug!("Attempting to detect Apple Partition Map...");
-    if let Ok(hfs_partition_offset) = super::apm::find_hfs_partition_offset(&mut chd_reader) {
-        // Try HFS+ first
-        if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::read_at_offset(&mut chd_reader, hfs_partition_offset + 1024) {
+    let hfs_scan_result = match super::OffsetReader::new(&mut chd_reader, data_track_start_offset) {
+        Ok(mut offset_reader) => super::apm::find_hfs_partition_offset(&mut offset_reader),
+        Err(e) => {
+            log::warn!("Failed to create OffsetReader for APM scan: {}", e);
+            Err("OffsetReader creation failed".to_string())
+        }
+    };
+
+    if let Ok(hfs_partition_offset) = hfs_scan_result {
+        // The offset returned is relative to the track start. Calculate the absolute offset.
+        let hfs_offset = data_track_start_offset + hfs_partition_offset;
+
+        // Try HFS+ first, reading from the absolute offset in the original reader
+        if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::read_at_offset(&mut chd_reader, hfs_offset + 1024) {
             if header.is_valid() {
                 return (Some(volume_name), None, None, Some(header), FilesystemType::HfsPlus);
             }
         }
 
         // Try HFS classic
-        if let Ok(mdb) = super::hfs::MasterDirectoryBlock::read_at_offset(&mut chd_reader, hfs_partition_offset + 1024) {
+        if let Ok(mdb) = super::hfs::MasterDirectoryBlock::read_at_offset(&mut chd_reader, hfs_offset + 1024) {
             if mdb.is_valid() {
                 return (Some(mdb.volume_name.clone()), None, Some(mdb), None, FilesystemType::Hfs);
             }

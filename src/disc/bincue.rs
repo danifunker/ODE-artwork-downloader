@@ -148,7 +148,15 @@ fn detect_filesystem<R: Read + Seek>(
 
     // Try to detect an Apple Partition Map first
     log::debug!("Attempting to detect Apple Partition Map...");
-    if let Ok(hfs_partition_offset) = super::apm::find_hfs_partition_offset(reader) {
+    let hfs_scan_result = match super::OffsetReader::new(&mut *reader, track_start_offset) {
+        Ok(mut offset_reader) => super::apm::find_hfs_partition_offset(&mut offset_reader),
+        Err(e) => {
+            log::warn!("Failed to create OffsetReader for APM scan: {}", e);
+            Err("OffsetReader creation failed".to_string())
+        }
+    };
+
+    if let Ok(hfs_partition_offset) = hfs_scan_result {
         let hfs_offset = track_start_offset + hfs_partition_offset;
 
         // Try HFS+ first
