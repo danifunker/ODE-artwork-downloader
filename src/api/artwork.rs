@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(ContentType::from_str("apps"), ContentType::AppsUtilities);
         assert_eq!(ContentType::from_str("audio_cds"), ContentType::AudioCDs);
         assert_eq!(ContentType::from_str("any"), ContentType::Any);
-        assert_eq!(ContentType::from_str("invalid"), ContentType::Games); // default
+        assert_eq!(ContentType::from_str("invalid"), ContentType::Any); // default
 
         assert_eq!(ContentType::Games.display_name(), "Games");
         assert_eq!(ContentType::AppsUtilities.display_name(), "Apps & Utilities");

@@ -302,8 +302,9 @@ fn read_hfs_headers_from_chd<F: Read + Seek>(
     // HFS headers are at logical byte 1024
     // Calculate which frame/sector contains byte 1024
     let logical_offset = 1024u64;
-    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED as u64;
-    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED as u64;
+    let logical_sector_size = get_logical_sector_size(&track.track_type);
+    let sector_number = logical_offset / logical_sector_size;
+    let offset_in_sector = logical_offset % logical_sector_size;
     
     let (_sector_size, data_offset) = get_track_sector_size(&track.track_type);
     
@@ -394,6 +395,19 @@ fn get_track_sector_size(track_type: &str) -> (u32, usize) {
     } else {
         // Cooked mode: 2048 bytes of user data
         (CD_SECTOR_SIZE_COOKED, 0)
+    }
+}
+
+/// Get logical data sector size for a data track
+fn get_logical_sector_size(track_type: &str) -> u64 {
+    if track_type.starts_with("MODE1") {
+        CD_SECTOR_SIZE_COOKED as u64
+    } else if track_type == "MODE2_RAW" {
+        2336 // Mode 2/XA raw
+    } else if track_type.starts_with("MODE2") {
+        CD_SECTOR_SIZE_COOKED as u64 // Cooked Mode 2
+    } else {
+        CD_SECTOR_SIZE_COOKED as u64 // Fallback
     }
 }
 
