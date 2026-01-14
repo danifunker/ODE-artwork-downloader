@@ -134,9 +134,9 @@ fn normalize_cue_keywords(content: &str) -> String {
 /// Returns (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem_type)
 fn detect_filesystem<R: Read + Seek>(
     reader: &mut R,
+    track_start_offset: u64,
     sector_size: u64,
     data_offset: u64,
-    track_type: &TrackType,
 ) -> (
     Option<String>,
     Option<PrimaryVolumeDescriptor>,
@@ -147,7 +147,7 @@ fn detect_filesystem<R: Read + Seek>(
     use super::formats::FilesystemType;
 
     // Try ISO9660 first
-    match read_pvd_from_bin(reader, sector_size, data_offset) {
+    match read_pvd_from_bin(reader, track_start_offset, sector_size, data_offset) {
         Ok(pvd) => {
             log::debug!("ISO9660 PVD parsed successfully, volume_id: '{}'", pvd.volume_id);
             let label = if pvd.volume_id.is_empty() {
@@ -165,7 +165,7 @@ fn detect_filesystem<R: Read + Seek>(
     // Try HFS/HFS+ detection
     // HFS headers are at logical byte 1024 from the start of the data
     // We need to calculate the physical offset accounting for sector format
-    match read_hfs_headers_from_bin(reader, sector_size, data_offset, track_type) {
+    match read_hfs_headers_from_bin(reader, track_start_offset, sector_size, data_offset) {
         Ok((mdb, header, label, fs_type)) => {
             log::debug!("Detected HFS/HFS+ filesystem: {:?}, label: {:?}", fs_type, label);
             return (label, None, mdb, header, fs_type);
@@ -176,7 +176,7 @@ fn detect_filesystem<R: Read + Seek>(
     }
 
     // No filesystem detected, try fallback PVD read
-    match try_read_pvd_fallback(reader) {
+    match try_read_pvd_fallback(reader, track_start_offset) {
         (Some(label), Some(pvd)) => {
             (Some(label), Some(pvd), None, None, FilesystemType::Iso9660)
         }
@@ -187,23 +187,12 @@ fn detect_filesystem<R: Read + Seek>(
     }
 }
 
-/// Get logical data sector size for a data track
-fn get_logical_sector_size(track_type: &TrackType) -> u64 {
-    match track_type {
-        TrackType::Mode(1, _) => CD_SECTOR_SIZE_COOKED, // Mode 1 is always 2048
-        TrackType::Mode(2, 2352) => 2336, // Mode 2/XA raw has 2336 bytes of data
-        TrackType::Mode(2, size) => *size as u64, // Cooked Mode 2
-        TrackType::Cdi(size) => *size as u64,
-        _ => CD_SECTOR_SIZE_COOKED, // Fallback for other data track types
-    }
-}
-
 /// Read HFS/HFS+ headers from BIN file at logical offset 1024
 fn read_hfs_headers_from_bin<R: Read + Seek>(
     reader: &mut R,
+    track_start_offset: u64,
     sector_size: u64,
     data_offset: u64,
-    track_type: &TrackType,
 ) -> Result<(
     Option<super::hfs::MasterDirectoryBlock>,
     Option<super::hfsplus::HfsPlusVolumeHeader>,
@@ -212,21 +201,22 @@ fn read_hfs_headers_from_bin<R: Read + Seek>(
 ), String> {
     use super::formats::FilesystemType;
 
-    // HFS headers are at logical byte 1024
-    // Calculate which sector contains byte 1024
+    // HFS headers are at logical byte 1024 from the start of the data partition.
     let logical_offset = 1024u64;
-    
-    // For sector-based formats, we need to read the sector containing byte 1024
-    // and extract the header from within that sector
-    let logical_sector_size = get_logical_sector_size(track_type);
-    let sector_number = logical_offset / logical_sector_size;
-    let offset_in_sector = logical_offset % logical_sector_size;
-    
-    // Calculate physical byte offset in the BIN file
-    let physical_offset = (sector_number * sector_size) + data_offset + offset_in_sector;
-    
-    log::debug!("Reading HFS headers: logical_offset={}, sector={}, offset_in_sector={}, physical_offset={}", 
-        logical_offset, sector_number, offset_in_sector, physical_offset);
+    let physical_offset;
+
+    if sector_size == CD_SECTOR_SIZE_COOKED && data_offset == 0 {
+        // This is a "cooked" track, similar to an ISO file.
+        // The physical offset is the same as the logical offset.
+        physical_offset = track_start_offset + logical_offset;
+        log::debug!("Using cooked/ISO mode for HFS scan, offset={}", physical_offset);
+    } else {
+        // This is a "raw" track with headers/metadata in each sector.
+        // The data partition starts at `data_offset` into the first sector.
+        // The physical offset is the logical offset plus this initial data offset.
+        physical_offset = track_start_offset + logical_offset + data_offset;
+        log::debug!("Using raw mode for HFS scan, data_offset={}, physical_offset={}", data_offset, physical_offset);
+    }
     
     // Read enough data for HFS+ header (512 bytes)
     reader.seek(SeekFrom::Start(physical_offset))
@@ -342,15 +332,21 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
         let file = File::open(&track_bin_path)?;
         let mut reader = BufReader::new(file);
 
+        // Calculate the track's starting byte offset from its INDEX 01 MSF value
+        let track_start_offset = track.index_01.as_ref()
+            .and_then(|msf| parse_msf(msf))
+            .map(|frames| frames as u64 * track.sector_size)
+            .unwrap_or(0);
+
+        log::debug!("Data track starts at byte offset: {}", track_start_offset);
+
         // Try to detect filesystem type
-        detect_filesystem(&mut reader, track.sector_size, track.data_offset, &track.track_type)
+        detect_filesystem(&mut reader, track_start_offset, track.sector_size, track.data_offset)
     } else {
         log::warn!("No data track found, trying fallback on first BIN file");
         let file = File::open(&bin_path)?;
         let mut reader = BufReader::new(file);
-        // Fallback with default track type assumption
-        let fallback_track_type = TrackType::Mode(1, 2048);
-        detect_filesystem(&mut reader, CD_SECTOR_SIZE_COOKED, 0, &fallback_track_type)
+        detect_filesystem(&mut reader, 0, CD_SECTOR_SIZE_COOKED, 0)
     };
 
     // Extract TOC if we have audio tracks
@@ -441,16 +437,17 @@ fn resolve_bin_path_with_cue_fallback(
 /// Read PVD from BIN file
 fn read_pvd_from_bin<R: Read + Seek>(
     reader: &mut R,
+    track_start_offset: u64,
     sector_size: u64,
     data_offset: u64,
 ) -> BinCueResult<PrimaryVolumeDescriptor> {
     // Calculate byte offset to PVD (sector 16)
     // For raw sectors (2352), data_offset is where user data starts within the sector
-    let pvd_byte_offset = (PVD_SECTOR * sector_size) + data_offset;
+    let pvd_byte_offset = track_start_offset + (PVD_SECTOR * sector_size) + data_offset;
 
     log::debug!(
-        "Reading PVD: sector_size={}, data_offset={}, pvd_byte_offset={}",
-        sector_size, data_offset, pvd_byte_offset
+        "Reading PVD: track_start={}, sector_size={}, data_offset={}, pvd_byte_offset={}",
+        track_start_offset, sector_size, data_offset, pvd_byte_offset
     );
 
     reader.seek(SeekFrom::Start(pvd_byte_offset))?;
@@ -469,7 +466,7 @@ fn read_pvd_from_bin<R: Read + Seek>(
 }
 
 /// Try different sector formats as fallback
-fn try_read_pvd_fallback<R: Read + Seek>(reader: &mut R) -> (Option<String>, Option<PrimaryVolumeDescriptor>) {
+fn try_read_pvd_fallback<R: Read + Seek>(reader: &mut R, track_start_offset: u64) -> (Option<String>, Option<PrimaryVolumeDescriptor>) {
     let formats = [
         (CD_SECTOR_SIZE_COOKED, 0u64),       // Cooked 2048
         (CD_SECTOR_SIZE_RAW, MODE1_DATA_OFFSET), // Raw Mode 1
@@ -477,7 +474,7 @@ fn try_read_pvd_fallback<R: Read + Seek>(reader: &mut R) -> (Option<String>, Opt
     ];
 
     for (sector_size, data_offset) in formats {
-        if let Ok(pvd) = read_pvd_from_bin(reader, sector_size, data_offset) {
+        if let Ok(pvd) = read_pvd_from_bin(reader, track_start_offset, sector_size, data_offset) {
             log::debug!("Found PVD with fallback: sector_size={}, data_offset={}",
                 sector_size, data_offset);
             let label = if pvd.volume_id.is_empty() {

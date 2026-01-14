@@ -107,39 +107,9 @@ impl Default for App {
             search_config: SearchConfig::default(),
         }
     }
-
 }
 
 impl App {
-    /// Triggers a search based on the current application state
-    fn trigger_search(&mut self) {
-        let use_musicbrainz = self.search_config.content_type == ContentType::AudioCDs
-            && self.disc_info.as_ref().and_then(|r| r.as_ref().ok()).and_then(|i| i.toc.as_ref()).is_some();
-
-        if use_musicbrainz {
-            if let Some(disc_id) = self.disc_info.as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .and_then(|i| i.toc.as_ref())
-                .map(|toc| toc.calculate_musicbrainz_id())
-            {
-                self.log(LogLevel::Info, format!("Searching MusicBrainz for disc ID: {}", disc_id));
-                let toc_string = self.disc_info.as_ref()
-                    .and_then(|r| r.as_ref().ok())
-                    .and_then(|i| i.toc.as_ref())
-                    .map(|toc| toc.to_toc_string());
-                self.start_musicbrainz_search(&disc_id, toc_string);
-            } else {
-                self.log(LogLevel::Error, "No disc ID available for MusicBrainz search");
-            }
-        } else {
-            let query_for_search = self.search_query_text.clone();
-            if !query_for_search.is_empty() {
-                self.log(LogLevel::Info, format!("Searching: {}", query_for_search));
-                self.start_search(&query_for_search);
-            }
-        }
-    }
-
     /// Create a new App instance
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
@@ -254,12 +224,6 @@ impl App {
         
         // Clear the log callback after processing
         crate::disc::clear_log_callback();
-
-        // After processing, update the search query and trigger an automatic search
-        if self.disc_info.as_ref().and_then(|r| r.as_ref().ok()).is_some() {
-            self.update_search_query_from_disc();
-            self.trigger_search();
-        }
     }
 
     /// Open file picker dialog
@@ -1098,7 +1062,22 @@ impl eframe::App for App {
                         });
 
                         if search_clicked {
-                            self.trigger_search();
+                            if use_musicbrainz {
+                                if let Some(ref id) = disc_id {
+                                    self.log(LogLevel::Info, format!("Searching MusicBrainz for disc ID: {}", id));
+                                    // Get TOC string if available
+                                    let toc = self.disc_info.as_ref()
+                                        .and_then(|result| result.as_ref().ok())
+                                        .and_then(|info| info.toc.as_ref())
+                                        .map(|toc| toc.to_toc_string());
+                                    self.start_musicbrainz_search(id, toc);
+                                } else {
+                                    self.log(LogLevel::Error, "No disc ID available");
+                                }
+                            } else {
+                                self.log(LogLevel::Info, format!("Searching: {}", query_for_search));
+                                self.start_search(&query_for_search);
+                            }
                         }
 
                         if browser_clicked {
