@@ -2,8 +2,6 @@ app-id: io.github.dani.ODEArtworkDownloader
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
-sdk-extensions:
-  - org.freedesktop.Sdk.Extension.rust-stable
 command: ode-artwork-downloader
 
 finish-args:
@@ -18,22 +16,14 @@ finish-args:
   # GPU acceleration
   - --device=dri
 
-build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
-  env:
-    CARGO_HOME: /run/build/ode-artwork-downloader/cargo
-
 modules:
   - name: ode-artwork-downloader
     buildsystem: simple
     build-commands:
-      - cargo --offline fetch --manifest-path Cargo.toml --verbose
-      - cargo --offline build --release --verbose
-      - install -Dm755 target/release/ode-artwork-downloader -t /app/bin/
+      - install -Dm755 flatpak/bin/ode-artwork-downloader -t /app/bin/
       - install -Dm644 assets/icons/icon-256.png /app/share/icons/hicolor/256x256/apps/io.github.dani.ODEArtworkDownloader.png
       - install -Dm644 flatpak/io.github.dani.ODEArtworkDownloader.desktop -t /app/share/applications/
       - install -Dm644 flatpak/io.github.dani.ODEArtworkDownloader.metainfo.xml -t /app/share/metainfo/
     sources:
       - type: dir
         path: ..
-      - cargo-sources.json

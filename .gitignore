@@ -24,3 +24,7 @@ target
 # Secrets file (contains API keys)
 secrets.json
 secrets.enc
+
+# Pre-built binaries for packaging (created during CI)
+snap/local/
+flatpak/bin/

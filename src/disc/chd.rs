@@ -368,23 +368,42 @@ fn read_hfs_headers_from_chd<F: Read + Seek>(
 
 /// Extract TOC information from CHD track metadata
 fn extract_toc_from_tracks(tracks: &[TrackInfo]) -> Option<DiscTOC> {
-    // Filter for audio tracks only
-    let audio_tracks: Vec<_> = tracks.iter()
-        .filter(|t| is_audio_track(&t.track_type))
-        .collect();
-
-    if audio_tracks.is_empty() {
+    if tracks.is_empty() {
         return None;
     }
 
-    // Convert to TOC TrackInfo format
-    let toc_tracks: Vec<TocTrackInfo> = audio_tracks.iter()
-        .map(|t| TocTrackInfo {
-            number: t.track_num as u8,
-            offset: t.frame_offset,
-            track_type: t.track_type.clone(),
+    // Check if any tracks are audio - only generate TOC for discs with audio
+    let has_audio = tracks.iter().any(|t| is_audio_track(&t.track_type));
+    if !has_audio {
+        log::debug!("No audio tracks found (all data tracks), skipping TOC extraction");
+        return None;
+    }
+
+    // Include ALL tracks in TOC (data + audio) to match BIN/CUE behavior
+    // MusicBrainz Disc ID calculation needs the full physical TOC
+    let toc_tracks: Vec<TocTrackInfo> = tracks.iter()
+        .map(|t| {
+            let track_type = if is_audio_track(&t.track_type) {
+                "AUDIO"
+            } else if t.track_type.starts_with("MODE1") {
+                "MODE1"
+            } else if t.track_type.starts_with("MODE2") {
+                "MODE2"
+            } else {
+                "OTHER"
+            };
+
+            TocTrackInfo {
+                number: t.track_num as u8,
+                offset: t.frame_offset,
+                track_type: track_type.to_string(),
+            }
         })
         .collect();
+
+    log::info!("Extracting TOC for {} tracks ({} audio)",
+        toc_tracks.len(),
+        tracks.iter().filter(|t| is_audio_track(&t.track_type)).count());
 
     // Calculate total length from last track
     let total_length_frames = tracks.iter()
