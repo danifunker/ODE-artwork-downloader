@@ -3,8 +3,12 @@
 //! Provides the graphical user interface for the ODE Artwork Downloader.
 
 mod app;
+pub mod browse_view;
+pub mod hex_view;
+pub mod text_view;
 
 pub use app::App;
+pub use browse_view::BrowseView;
 
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;

@@ -5,6 +5,7 @@
 
 mod apm;
 mod bincue;
+pub mod browse;
 mod chd;
 mod formats;
 mod hfs;

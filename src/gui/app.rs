@@ -11,6 +11,8 @@ use crate::export::{export_artwork, export_artwork_from_url, generate_output_pat
 use crate::search::ImageResult;
 use crate::update::{UpdateConfig, UpdateInfo};
 
+use super::browse_view::BrowseView;
+
 /// Main application state
 pub struct App {
     /// Currently selected file path
@@ -63,6 +65,10 @@ pub struct App {
     search_config: SearchConfig,
     /// Receiver for log messages from the global logger
     global_log_receiver: Option<Receiver<String>>,
+    /// Browse view for filesystem browsing
+    browse_view: BrowseView,
+    /// Whether to show the browse window
+    show_browse_window: bool,
 }
 
 /// A log message with severity level
@@ -108,6 +114,8 @@ impl Default for App {
             update_check_done: false,
             search_config: SearchConfig::default(),
             global_log_receiver: None,
+            browse_view: BrowseView::new(),
+            show_browse_window: false,
         }
     }
 }
@@ -152,6 +160,10 @@ impl App {
         self.selected_image_index = None;
         self.preview_texture = None;
         self.preview_url = None;
+
+        // Clear browse view state
+        self.browse_view.clear();
+        self.show_browse_window = false;
 
         // Store log messages in a vector to add after disc reading
         let log_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -839,11 +851,35 @@ impl eframe::App for App {
                 });
         }
 
+        // Browse window (for filesystem browsing)
+        if self.show_browse_window {
+            let disc_info_clone = self.disc_info.as_ref().and_then(|r| r.as_ref().ok()).cloned();
+
+            egui::Window::new("Browse Disc Contents")
+                .open(&mut self.show_browse_window)
+                .default_size([900.0, 600.0])
+                .min_width(600.0)
+                .min_height(400.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    if let Some(ref info) = disc_info_clone {
+                        self.browse_view.show(ui, info);
+                    } else {
+                        ui.label("No disc loaded");
+                    }
+                });
+
+            // Clear browse view if window was closed
+            if !self.show_browse_window {
+                self.browse_view.clear();
+            }
+        }
+
         // Main central panel
         egui::CentralPanel::default().show(ctx, |ui| {
             // Top section with File Selection and Search Settings in columns
             ui.columns(2, |columns| {
-                
+
                 // --- Left Column: File Selection ---
                 columns[0].group(|ui| {
                     ui.set_min_height(120.0);
@@ -1072,6 +1108,43 @@ impl eframe::App for App {
                                     ui.end_row();
                                 }
                             });
+
+                        ui.add_space(8.0);
+
+                        // Browse contents button (for data discs with known filesystem)
+                        let can_browse = info.filesystem != FilesystemType::Unknown;
+                        let mut browse_clicked = false;
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(can_browse, egui::Button::new("Browse Contents")).clicked() {
+                                browse_clicked = true;
+                            }
+                            if !can_browse {
+                                ui.colored_label(egui::Color32::GRAY, "(Unknown filesystem)");
+                            }
+                        });
+
+                        // Handle browse button - clone info to avoid borrow issues
+                        if browse_clicked {
+                            let info_clone = info.clone();
+                            self.show_browse_window = true;
+                            if !self.browse_view.is_active() {
+                                match self.browse_view.initialize(&info_clone) {
+                                    Ok(()) => {
+                                        self.log_messages.push(LogMessage {
+                                            text: "Opened filesystem for browsing".to_string(),
+                                            level: LogLevel::Success,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        self.log_messages.push(LogMessage {
+                                            text: format!("Failed to open filesystem: {}", e),
+                                            level: LogLevel::Error,
+                                        });
+                                        self.show_browse_window = false;
+                                    }
+                                }
+                            }
+                        }
 
                         ui.add_space(16.0);
 
