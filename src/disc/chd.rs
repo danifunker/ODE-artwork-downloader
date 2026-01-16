@@ -24,6 +24,9 @@ const CD_MODE1_DATA_OFFSET: usize = 16;
 /// CHT2 metadata tag (CD-ROM Track v2)
 const CHT2_TAG: u32 = 0x43485432; // "CHT2"
 
+/// APM block size (always 512 bytes)
+const APM_BLOCK_SIZE: u64 = 512;
+
 /// Result type for CHD operations
 pub type ChdResult<T> = Result<T, ChdError>;
 
@@ -234,6 +237,149 @@ fn is_audio_track(track_type: &str) -> bool {
     track_type == "AUDIO"
 }
 
+/// Read bytes from CHD at a logical byte offset
+/// Accounts for sector format and hunk-based storage
+fn read_bytes_at_logical_offset_chd<F: Read + Seek>(
+    chd: &mut Chd<F>,
+    tracks: &[TrackInfo],
+    logical_offset: u64,
+    length: usize,
+) -> ChdResult<Vec<u8>> {
+    let header = chd.header();
+    let hunk_size = header.hunk_size();
+
+    // Find data tracks
+    let data_tracks: Vec<_> = tracks
+        .iter()
+        .filter(|t| is_data_track(&t.track_type))
+        .collect();
+
+    if data_tracks.is_empty() {
+        return Err(ChdError::Parse("No data tracks found".to_string()));
+    }
+
+    // Use first data track
+    let track = data_tracks[0];
+    let track_byte_offset = track.frame_offset as u64 * CD_FRAME_SIZE as u64;
+
+    // Calculate which sector contains this logical offset
+    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED as u64;
+    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED as u64;
+
+    let (_sector_size, data_offset) = get_track_sector_size(&track.track_type);
+
+    // Physical offset in the CHD data
+    let frame_byte_offset = track_byte_offset + (sector_number * CD_FRAME_SIZE as u64);
+    let physical_offset = frame_byte_offset + data_offset as u64 + offset_in_sector;
+
+    // Calculate hunk and offset within hunk
+    let hunk_index = (physical_offset / hunk_size as u64) as u32;
+    let offset_in_hunk = (physical_offset % hunk_size as u64) as usize;
+
+    // Read the hunk
+    let mut compressed_buf = Vec::new();
+    let mut hunk_buf = chd.get_hunksized_buffer();
+
+    chd.hunk(hunk_index)
+        .map_err(|e| ChdError::Parse(format!("Failed to get hunk: {:?}", e)))?
+        .read_hunk_in(&mut compressed_buf, &mut hunk_buf)
+        .map_err(|e| ChdError::Parse(format!("Failed to read hunk: {:?}", e)))?;
+
+    // Extract requested bytes
+    if offset_in_hunk + length > hunk_buf.len() {
+        return Err(ChdError::Parse("Data spans hunk boundary".to_string()));
+    }
+
+    Ok(hunk_buf[offset_in_hunk..offset_in_hunk + length].to_vec())
+}
+
+/// Check for Apple Partition Map and find HFS partition offset in CHD
+fn find_apm_hfs_offset_chd<F: Read + Seek>(
+    chd: &mut Chd<F>,
+    tracks: &[TrackInfo],
+) -> Option<u64> {
+    // Read DDM at logical byte 0
+    let ddm_data = match read_bytes_at_logical_offset_chd(chd, tracks, 0, 512) {
+        Ok(data) => data,
+        Err(e) => {
+            log::debug!("Failed to read DDM from CHD: {}", e);
+            return None;
+        }
+    };
+
+    // Check DDM signature (0x4552 = "ER")
+    let ddm_signature = u16::from_be_bytes([ddm_data[0], ddm_data[1]]);
+    if ddm_signature != 0x4552 {
+        log::debug!("No Apple Partition Map found in CHD (DDM signature: 0x{:04X})", ddm_signature);
+        return None;
+    }
+
+    log::info!("Found Apple Partition Map in CHD (DDM signature: 0x{:04X})", ddm_signature);
+
+    // Read first partition entry at logical byte 512
+    let first_entry = match read_bytes_at_logical_offset_chd(chd, tracks, APM_BLOCK_SIZE, 512) {
+        Ok(data) => data,
+        Err(e) => {
+            log::debug!("Failed to read first partition entry from CHD: {}", e);
+            return None;
+        }
+    };
+
+    // Check partition signature (0x504D = "PM")
+    let pm_signature = u16::from_be_bytes([first_entry[0], first_entry[1]]);
+    if pm_signature != 0x504D {
+        log::debug!("Invalid partition entry signature in CHD: 0x{:04X}", pm_signature);
+        return None;
+    }
+
+    // Get number of partitions
+    let num_partitions = u32::from_be_bytes([first_entry[4], first_entry[5], first_entry[6], first_entry[7]]);
+    log::info!("Apple Partition Map in CHD has {} partitions", num_partitions);
+
+    // Search all partitions for HFS/HFS+
+    for i in 1..=num_partitions {
+        let entry_offset = i as u64 * APM_BLOCK_SIZE;
+        let entry_data = match read_bytes_at_logical_offset_chd(chd, tracks, entry_offset, 512) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        // Check signature
+        let sig = u16::from_be_bytes([entry_data[0], entry_data[1]]);
+        if sig != 0x504D {
+            continue;
+        }
+
+        // Get partition type (bytes 48-79)
+        let partition_type = String::from_utf8_lossy(&entry_data[48..80])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+
+        // Get partition name (bytes 16-47)
+        let partition_name = String::from_utf8_lossy(&entry_data[16..48])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+
+        // Get start block (bytes 8-11)
+        let start_block = u32::from_be_bytes([entry_data[8], entry_data[9], entry_data[10], entry_data[11]]);
+
+        log::info!("  CHD Partition {}: '{}' type='{}' start_block={}",
+            i, partition_name, partition_type, start_block);
+
+        if partition_type.starts_with("Apple_HFS") || partition_type == "Apple_HFSX" {
+            let offset = start_block as u64 * APM_BLOCK_SIZE;
+            log::info!("Found HFS partition '{}' in CHD at block {} (logical byte offset: {})",
+                partition_name, start_block, offset);
+            return Some(offset);
+        }
+    }
+
+    log::debug!("No HFS/HFS+ partition found in CHD Apple Partition Map");
+    None
+}
+
 /// Detect filesystem type from CHD disc data
 /// Returns (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem_type)
 fn detect_filesystem_from_chd<F: Read + Seek>(
@@ -264,10 +410,11 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
         }
     }
 
-    // Try HFS/HFS+ detection
-    // HFS headers are at logical byte 1024 (within sector 0 for 2048-byte sectors)
-    // Read the data containing the HFS header area
-    match read_hfs_headers_from_chd(chd, tracks) {
+    // Check for Apple Partition Map first
+    let partition_offset = find_apm_hfs_offset_chd(chd, tracks).unwrap_or(0);
+
+    // Try HFS/HFS+ detection at partition_offset + 1024
+    match read_hfs_headers_from_chd(chd, tracks, partition_offset) {
         Ok((mdb, header, label, fs_type)) => {
             log::debug!("Detected HFS/HFS+ filesystem from CHD: {:?}, label: {:?}", fs_type, label);
             return (label, None, mdb, header, fs_type);
@@ -281,10 +428,11 @@ fn detect_filesystem_from_chd<F: Read + Seek>(
     (None, None, None, None, FilesystemType::Unknown)
 }
 
-/// Read HFS/HFS+ headers from CHD at logical offset 1024
+/// Read HFS/HFS+ headers from CHD at partition_offset + 1024
 fn read_hfs_headers_from_chd<F: Read + Seek>(
     chd: &mut Chd<F>,
     tracks: &[TrackInfo],
+    partition_offset: u64,
 ) -> ChdResult<(
     Option<super::hfs::MasterDirectoryBlock>,
     Option<super::hfsplus::HfsPlusVolumeHeader>,
@@ -293,76 +441,33 @@ fn read_hfs_headers_from_chd<F: Read + Seek>(
 )> {
     use super::formats::FilesystemType;
 
-    let header = chd.header();
-    let hunk_size = header.hunk_size();
+    // HFS headers are at logical byte 1024 within the partition
+    let logical_offset = partition_offset + 1024;
 
-    // Find data tracks
-    let data_tracks: Vec<_> = tracks
-        .iter()
-        .filter(|t| is_data_track(&t.track_type))
-        .collect();
+    log::debug!("Reading HFS headers from CHD: partition_offset={}, logical_offset={}",
+        partition_offset, logical_offset);
 
-    if data_tracks.is_empty() {
-        return Err(ChdError::Parse("No data tracks found".to_string()));
-    }
+    // Read 512 bytes for HFS header
+    let header_data = read_bytes_at_logical_offset_chd(chd, tracks, logical_offset, 512)?;
 
-    // Use first data track
-    let track = data_tracks[0];
-    let track_byte_offset = track.frame_offset as u64 * CD_FRAME_SIZE as u64;
-    
-    // HFS headers are at logical byte 1024
-    // Calculate which frame/sector contains byte 1024
-    let logical_offset = 1024u64;
-    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED as u64;
-    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED as u64;
-    
-    let (_sector_size, data_offset) = get_track_sector_size(&track.track_type);
-    
-    // Physical offset in the CHD data
-    let frame_byte_offset = track_byte_offset + (sector_number * CD_FRAME_SIZE as u64);
-    let physical_offset = frame_byte_offset + data_offset as u64 + offset_in_sector;
-    
-    log::debug!("Reading HFS headers from CHD: logical={}, sector={}, offset_in_sector={}, physical={}", 
-        logical_offset, sector_number, offset_in_sector, physical_offset);
-    
-    // Calculate hunk and offset within hunk
-    let hunk_index = (physical_offset / hunk_size as u64) as u32;
-    let offset_in_hunk = (physical_offset % hunk_size as u64) as usize;
-    
-    // Read the hunk
-    let mut compressed_buf = Vec::new();
-    let mut hunk_buf = chd.get_hunksized_buffer();
-    
-    chd.hunk(hunk_index)
-        .map_err(|e| ChdError::Parse(format!("Failed to get hunk: {:?}", e)))?
-        .read_hunk_in(&mut compressed_buf, &mut hunk_buf)
-        .map_err(|e| ChdError::Parse(format!("Failed to read hunk: {:?}", e)))?;
-    
-    // Extract 512 bytes for HFS+ header
-    if offset_in_hunk + 512 > hunk_buf.len() {
-        return Err(ChdError::Parse("HFS header spans hunk boundary".to_string()));
-    }
-    
-    let header_data = &hunk_buf[offset_in_hunk..offset_in_hunk + 512];
-    
     // Try HFS+ first
-    let mut cursor = std::io::Cursor::new(header_data);
+    let mut cursor = std::io::Cursor::new(&header_data);
     if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse_from_current_position(&mut cursor) {
         if header.is_valid() {
-            log::debug!("Detected HFS+ volume from CHD: {}", volume_name);
+            log::info!("Detected HFS+ volume from CHD: {}", volume_name);
             return Ok((None, Some(header), Some(volume_name), FilesystemType::HfsPlus));
         }
     }
-    
+
     // Try HFS classic
-    let mut cursor = std::io::Cursor::new(header_data);
+    let mut cursor = std::io::Cursor::new(&header_data);
     if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse_from_current_position(&mut cursor) {
         if mdb.is_valid() {
-            log::debug!("Detected HFS volume from CHD: {}", mdb.volume_name);
+            log::info!("Detected HFS volume from CHD: {}", mdb.volume_name);
             return Ok((Some(mdb.clone()), None, Some(mdb.volume_name), FilesystemType::Hfs));
         }
     }
-    
+
     Err(ChdError::Parse("No valid HFS/HFS+ filesystem found".to_string()))
 }
 

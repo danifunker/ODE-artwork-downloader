@@ -21,6 +21,9 @@ const CD_SECTOR_SIZE_COOKED: u64 = 2048;
 /// Offset to user data in a raw Mode 1 sector
 const MODE1_DATA_OFFSET: u64 = 16;
 
+/// APM block size (always 512 bytes)
+const APM_BLOCK_SIZE: u64 = 512;
+
 /// Result type for BIN/CUE operations
 pub type BinCueResult<T> = Result<T, BinCueError>;
 
@@ -130,6 +133,120 @@ fn normalize_cue_keywords(content: &str) -> String {
         .replace(" AIFF", " Aiff")
 }
 
+/// Read bytes from BIN file at a logical byte offset
+/// Accounts for sector format (raw vs cooked) when calculating physical offset
+fn read_bytes_at_logical_offset<R: Read + Seek>(
+    reader: &mut R,
+    logical_offset: u64,
+    length: usize,
+    sector_size: u64,
+    data_offset: u64,
+) -> Result<Vec<u8>, String> {
+    // Calculate which sector contains this logical offset
+    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED;
+    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED;
+
+    // Calculate physical byte offset in the BIN file
+    let physical_offset = (sector_number * sector_size) + data_offset + offset_in_sector;
+
+    reader.seek(SeekFrom::Start(physical_offset))
+        .map_err(|e| format!("Failed to seek to offset {}: {}", physical_offset, e))?;
+
+    let mut buffer = vec![0u8; length];
+    reader.read_exact(&mut buffer)
+        .map_err(|e| format!("Failed to read {} bytes at offset {}: {}", length, physical_offset, e))?;
+
+    Ok(buffer)
+}
+
+/// Check for Apple Partition Map and find HFS partition offset
+fn find_apm_hfs_offset<R: Read + Seek>(
+    reader: &mut R,
+    sector_size: u64,
+    data_offset: u64,
+) -> Option<u64> {
+    // Read DDM at logical byte 0
+    let ddm_data = match read_bytes_at_logical_offset(reader, 0, 512, sector_size, data_offset) {
+        Ok(data) => data,
+        Err(e) => {
+            log::debug!("Failed to read DDM: {}", e);
+            return None;
+        }
+    };
+
+    // Check DDM signature (0x4552 = "ER")
+    let ddm_signature = u16::from_be_bytes([ddm_data[0], ddm_data[1]]);
+    if ddm_signature != 0x4552 {
+        log::debug!("No Apple Partition Map found (DDM signature: 0x{:04X})", ddm_signature);
+        return None;
+    }
+
+    log::info!("Found Apple Partition Map (DDM signature: 0x{:04X})", ddm_signature);
+
+    // Read first partition entry at logical byte 512
+    let first_entry = match read_bytes_at_logical_offset(reader, APM_BLOCK_SIZE, 512, sector_size, data_offset) {
+        Ok(data) => data,
+        Err(e) => {
+            log::debug!("Failed to read first partition entry: {}", e);
+            return None;
+        }
+    };
+
+    // Check partition signature (0x504D = "PM")
+    let pm_signature = u16::from_be_bytes([first_entry[0], first_entry[1]]);
+    if pm_signature != 0x504D {
+        log::debug!("Invalid partition entry signature: 0x{:04X}", pm_signature);
+        return None;
+    }
+
+    // Get number of partitions
+    let num_partitions = u32::from_be_bytes([first_entry[4], first_entry[5], first_entry[6], first_entry[7]]);
+    log::info!("Apple Partition Map has {} partitions", num_partitions);
+
+    // Search all partitions for HFS/HFS+
+    for i in 1..=num_partitions {
+        let entry_offset = i as u64 * APM_BLOCK_SIZE;
+        let entry_data = match read_bytes_at_logical_offset(reader, entry_offset, 512, sector_size, data_offset) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        // Check signature
+        let sig = u16::from_be_bytes([entry_data[0], entry_data[1]]);
+        if sig != 0x504D {
+            continue;
+        }
+
+        // Get partition type (bytes 48-79)
+        let partition_type = String::from_utf8_lossy(&entry_data[48..80])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+
+        // Get partition name (bytes 16-47)
+        let partition_name = String::from_utf8_lossy(&entry_data[16..48])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+
+        // Get start block (bytes 8-11)
+        let start_block = u32::from_be_bytes([entry_data[8], entry_data[9], entry_data[10], entry_data[11]]);
+
+        log::info!("  Partition {}: '{}' type='{}' start_block={}",
+            i, partition_name, partition_type, start_block);
+
+        if partition_type.starts_with("Apple_HFS") || partition_type == "Apple_HFSX" {
+            let offset = start_block as u64 * APM_BLOCK_SIZE;
+            log::info!("Found HFS partition '{}' at block {} (logical byte offset: {})",
+                partition_name, start_block, offset);
+            return Some(offset);
+        }
+    }
+
+    log::debug!("No HFS/HFS+ partition found in Apple Partition Map");
+    None
+}
+
 /// Detect filesystem type from BIN file
 /// Returns (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem_type)
 fn detect_filesystem<R: Read + Seek>(
@@ -161,10 +278,11 @@ fn detect_filesystem<R: Read + Seek>(
         }
     }
 
-    // Try HFS/HFS+ detection
-    // HFS headers are at logical byte 1024 from the start of the data
-    // We need to calculate the physical offset accounting for sector format
-    match read_hfs_headers_from_bin(reader, sector_size, data_offset) {
+    // Check for Apple Partition Map first
+    let partition_offset = find_apm_hfs_offset(reader, sector_size, data_offset).unwrap_or(0);
+
+    // Try HFS/HFS+ detection at partition_offset + 1024
+    match read_hfs_headers_from_bin(reader, sector_size, data_offset, partition_offset) {
         Ok((mdb, header, label, fs_type)) => {
             log::debug!("Detected HFS/HFS+ filesystem: {:?}, label: {:?}", fs_type, label);
             return (label, None, mdb, header, fs_type);
@@ -186,11 +304,12 @@ fn detect_filesystem<R: Read + Seek>(
     }
 }
 
-/// Read HFS/HFS+ headers from BIN file at logical offset 1024
+/// Read HFS/HFS+ headers from BIN file at partition_offset + 1024
 fn read_hfs_headers_from_bin<R: Read + Seek>(
     reader: &mut R,
     sector_size: u64,
     data_offset: u64,
+    partition_offset: u64,
 ) -> Result<(
     Option<super::hfs::MasterDirectoryBlock>,
     Option<super::hfsplus::HfsPlusVolumeHeader>,
@@ -199,47 +318,33 @@ fn read_hfs_headers_from_bin<R: Read + Seek>(
 ), String> {
     use super::formats::FilesystemType;
 
-    // HFS headers are at logical byte 1024
-    // Calculate which sector contains byte 1024
-    let logical_offset = 1024u64;
-    
-    // For sector-based formats, we need to read the sector containing byte 1024
-    // and extract the header from within that sector
-    let sector_number = logical_offset / CD_SECTOR_SIZE_COOKED;  // Logical sector (2048-byte sectors)
-    let offset_in_sector = logical_offset % CD_SECTOR_SIZE_COOKED;
-    
-    // Calculate physical byte offset in the BIN file
-    let physical_offset = (sector_number * sector_size) + data_offset + offset_in_sector;
-    
-    log::debug!("Reading HFS headers: logical_offset={}, sector={}, offset_in_sector={}, physical_offset={}", 
-        logical_offset, sector_number, offset_in_sector, physical_offset);
-    
-    // Read enough data for HFS+ header (512 bytes)
-    reader.seek(SeekFrom::Start(physical_offset))
-        .map_err(|e| format!("Failed to seek to HFS header: {}", e))?;
-    
-    let mut buffer = vec![0u8; 512];
-    reader.read_exact(&mut buffer)
-        .map_err(|e| format!("Failed to read HFS header: {}", e))?;
-    
+    // HFS headers are at logical byte 1024 within the partition
+    let logical_offset = partition_offset + 1024;
+
+    log::debug!("Reading HFS headers: partition_offset={}, logical_offset={}",
+        partition_offset, logical_offset);
+
+    // Read 512 bytes for HFS header
+    let buffer = read_bytes_at_logical_offset(reader, logical_offset, 512, sector_size, data_offset)?;
+
     // Try HFS+ first
     let mut cursor = std::io::Cursor::new(&buffer);
     if let Ok((header, volume_name)) = super::hfsplus::HfsPlusVolumeHeader::parse_from_current_position(&mut cursor) {
         if header.is_valid() {
-            log::debug!("Detected HFS+ volume: {}", volume_name);
+            log::info!("Detected HFS+ volume: {}", volume_name);
             return Ok((None, Some(header), Some(volume_name), FilesystemType::HfsPlus));
         }
     }
-    
-    // Try HFS classic (needs 162 bytes but we have 512)
+
+    // Try HFS classic
     let mut cursor = std::io::Cursor::new(&buffer);
     if let Ok(mdb) = super::hfs::MasterDirectoryBlock::parse_from_current_position(&mut cursor) {
         if mdb.is_valid() {
-            log::debug!("Detected HFS volume: {}", mdb.volume_name);
+            log::info!("Detected HFS volume: {}", mdb.volume_name);
             return Ok((Some(mdb.clone()), None, Some(mdb.volume_name), FilesystemType::Hfs));
         }
     }
-    
+
     Err("No valid HFS/HFS+ filesystem found".to_string())
 }
 
