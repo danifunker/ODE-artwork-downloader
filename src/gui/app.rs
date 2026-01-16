@@ -61,6 +61,8 @@ pub struct App {
     update_check_done: bool,
     /// Search configuration
     search_config: SearchConfig,
+    /// Receiver for log messages from the global logger
+    global_log_receiver: Option<Receiver<String>>,
 }
 
 /// A log message with severity level
@@ -105,6 +107,7 @@ impl Default for App {
             show_update_notification: false,
             update_check_done: false,
             search_config: SearchConfig::default(),
+            global_log_receiver: None,
         }
     }
 }
@@ -113,12 +116,15 @@ impl App {
     /// Create a new App instance
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
-        
+
+        // Take the log receiver from the global storage (set in main.rs)
+        app.global_log_receiver = super::take_log_receiver();
+
         // Start update check in background if enabled
         if app.update_config.update_check.enabled {
             app.start_update_check();
         }
-        
+
         app
     }
 
@@ -331,24 +337,44 @@ impl App {
                 
                 all_results.extend(mb_images);
                 
-                // If we got at least one MusicBrainz result, search Discogs for the album
+                // If we got at least one MusicBrainz result, search Discogs API for the album
                 if let Some(first_release) = releases.first() {
-                    let search_query = format!("site:discogs.com {} {}", first_release.artist, first_release.title);
-                    log::info!("Searching Discogs for album: {} - {}", first_release.artist, first_release.title);
-                    
-                    // Search specifically on Discogs
-                    match crate::search::search_images(&search_query, 20) {
-                        Ok(mut discogs_results) => {
-                            // Mark Discogs results with their source
-                            for result in &mut discogs_results {
-                                if result.source.contains("discogs.com") {
-                                    result.source = format!("Discogs");
-                                }
-                            }
-                            all_results.extend(discogs_results);
+                    log::info!("Searching Discogs API for album: {} - {}", first_release.artist, first_release.title);
+
+                    // Use Discogs API directly instead of DDG
+                    match crate::api::discogs_search(&first_release.artist, &first_release.title) {
+                        Ok(discogs_results) => {
+                            // Convert Discogs results to ImageResult format
+                            let discogs_images: Vec<_> = discogs_results.iter()
+                                .filter_map(|result| {
+                                    // Need at least a thumbnail or cover image
+                                    let image_url = result.image_url.clone()
+                                        .or_else(|| result.thumbnail_url.clone())?;
+                                    let thumbnail = result.thumbnail_url.clone()
+                                        .unwrap_or_else(|| image_url.clone());
+
+                                    let title = if let Some(year) = result.year {
+                                        format!("{} - {} ({})", result.artist, result.title, year)
+                                    } else {
+                                        format!("{} - {}", result.artist, result.title)
+                                    };
+
+                                    Some(crate::search::ImageResult {
+                                        image_url,
+                                        thumbnail_url: thumbnail,
+                                        title,
+                                        source: format!("Discogs ({})", result.discogs_id),
+                                        width: None,
+                                        height: None,
+                                    })
+                                })
+                                .collect();
+
+                            log::info!("Discogs API returned {} results with images", discogs_images.len());
+                            all_results.extend(discogs_images);
                         }
                         Err(e) => {
-                            log::warn!("Failed to search Discogs: {}", e);
+                            log::warn!("Failed to search Discogs API: {}", e);
                         }
                     }
                 }
@@ -607,6 +633,36 @@ impl App {
         });
     }
 
+    /// Poll for global log messages (from the UiLogger)
+    fn poll_global_logs(&mut self) {
+        if let Some(ref receiver) = self.global_log_receiver {
+            // Drain all available log messages
+            while let Ok(msg) = receiver.try_recv() {
+                // Parse log level from the message format: "[LEVEL] target: message"
+                let level = if msg.starts_with("[ERROR]") {
+                    LogLevel::Error
+                } else if msg.starts_with("[WARN]") {
+                    LogLevel::Warning
+                } else if msg.starts_with("[INFO]") {
+                    LogLevel::Info
+                } else {
+                    // DEBUG and TRACE are shown as Info in the UI
+                    LogLevel::Info
+                };
+
+                self.log_messages.push(LogMessage {
+                    text: msg,
+                    level,
+                });
+
+                // Keep only last 100 messages
+                if self.log_messages.len() > 100 {
+                    self.log_messages.remove(0);
+                }
+            }
+        }
+    }
+
     /// Poll for update check results
     fn poll_update_check(&mut self) {
         if let Some(ref receiver) = self.update_receiver {
@@ -678,6 +734,9 @@ fn load_image_from_bytes(bytes: &[u8]) -> Result<egui::ColorImage, String> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll for global log messages
+        self.poll_global_logs();
+
         // Poll for search results
         self.poll_search();
 
@@ -931,13 +990,18 @@ impl eframe::App for App {
 
                                     ui.label("MusicBrainz ID:");
                                     let disc_id = toc.calculate_musicbrainz_id();
+                                    let toc_string = toc.to_toc_string();
                                     ui.horizontal(|ui| {
                                         ui.label(&disc_id);
                                         if ui.small_button("📋").on_hover_text("Copy to clipboard").clicked() {
                                             ui.output_mut(|o| o.copied_text = disc_id.clone());
                                         }
                                         if ui.small_button("🔍").on_hover_text("Search on MusicBrainz").clicked() {
-                                            let url = format!("https://musicbrainz.org/cdtoc/{}", disc_id);
+                                            // Use the exact same URL as the API lookup
+                                            let url = format!(
+                                                "https://musicbrainz.org/ws/2/discid/{}?fmt=json&inc=artist-credits+release-groups&toc={}",
+                                                disc_id, toc_string
+                                            );
                                             let _ = crate::api::open_in_browser(&url);
                                         }
                                     });
@@ -1039,6 +1103,7 @@ impl eframe::App for App {
                         let query_for_search = self.search_query_text.clone();
                         let use_musicbrainz = self.search_config.content_type == ContentType::AudioCDs && info.toc.is_some();
                         let disc_id = info.toc.as_ref().map(|toc| toc.calculate_musicbrainz_id());
+                        let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
 
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(!self.search_in_progress, |ui| {
@@ -1083,8 +1148,15 @@ impl eframe::App for App {
                         if browser_clicked {
                             if use_musicbrainz {
                                 if let Some(ref id) = disc_id {
-                                    let url = format!("https://musicbrainz.org/cdtoc/{}", id);
-                                    self.log(LogLevel::Info, "Opening MusicBrainz in browser".to_string());
+                                    // Use the exact same URL as the API lookup
+                                    let mut url = format!(
+                                        "https://musicbrainz.org/ws/2/discid/{}?fmt=json&inc=artist-credits+release-groups",
+                                        id
+                                    );
+                                    if let Some(ref toc_str) = toc_string_for_browser {
+                                        url.push_str(&format!("&toc={}", toc_str));
+                                    }
+                                    self.log(LogLevel::Info, format!("Opening MusicBrainz: {}", url));
                                     if let Err(e) = open_in_browser(&url) {
                                         self.log(LogLevel::Error, e);
                                     }

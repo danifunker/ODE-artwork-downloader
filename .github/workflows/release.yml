@@ -38,6 +38,7 @@ jobs:
     name: Build Windows
     needs: generate-version
     runs-on: windows-latest
+    environment: PRODUCTION
     strategy:
       matrix:
         include:
@@ -47,31 +48,36 @@ jobs:
             arch: x64
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Build
+        env:
+          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          DISCOGS_CONSUMER_KEY: ${{ secrets.DISCOGS_CONSUMER_KEY }}
+          DISCOGS_CONSUMER_SECRET: ${{ secrets.DISCOGS_CONSUMER_SECRET }}
         run: cargo build --release --target ${{ matrix.target }}
       
       - name: Package
@@ -94,6 +100,7 @@ jobs:
     name: Build macOS
     needs: generate-version
     runs-on: macos-latest
+    environment: PRODUCTION
     strategy:
       matrix:
         include:
@@ -103,33 +110,36 @@ jobs:
             arch: x64
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Build
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          DISCOGS_CONSUMER_KEY: ${{ secrets.DISCOGS_CONSUMER_KEY }}
+          DISCOGS_CONSUMER_SECRET: ${{ secrets.DISCOGS_CONSUMER_SECRET }}
         run: cargo build --release --target ${{ matrix.target }}
       
       - name: Create macOS app bundle
@@ -197,6 +207,7 @@ jobs:
     name: Build Linux AppImage
     needs: generate-version
     runs-on: ${{ matrix.runs-on }}
+    environment: PRODUCTION
     strategy:
       matrix:
         include:
@@ -208,39 +219,42 @@ jobs:
             runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      
+
       - name: Install dependencies (GitHub-hosted only)
         if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libssl-dev pkg-config
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Build
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          DISCOGS_CONSUMER_KEY: ${{ secrets.DISCOGS_CONSUMER_KEY }}
+          DISCOGS_CONSUMER_SECRET: ${{ secrets.DISCOGS_CONSUMER_SECRET }}
         run: cargo build --release --target ${{ matrix.target }}
       
       - name: Download AppImage tools

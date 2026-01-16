@@ -8,15 +8,17 @@
 
 use eframe::egui;
 
-mod api;
-mod disc;
-mod export;
-mod gui;
-mod search;
-mod update;
+mod logging;
+
+use ode_artwork_downloader::gui;
 
 fn main() -> eframe::Result<()> {
-    env_logger::init();
+    // Initialize the UI logger - logs will be forwarded to the GUI
+    let log_receiver = logging::ui_logger::UiLogger::init()
+        .expect("Failed to initialize logger");
+
+    // Store the receiver so the App can take it during initialization
+    gui::set_log_receiver(log_receiver);
 
     // Load icon from bytes with transparency preserved
     let icon_bytes = include_bytes!("../assets/icons/icon-256.png");

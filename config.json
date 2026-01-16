@@ -4,7 +4,7 @@
       "CD",
       "jewel case"
     ],
-    "content_type": "any",
+    "content_type": "audio_cds",
     "dvd_keywords": [
       "DVD",
       "Box art"
@@ -88,5 +88,10 @@
   "update_check": {
     "enabled": true,
     "repository_url": "https://github.com/danifunker/ODE-artwork-downloader"
+  },
+  "discogs": {
+    "request_token_url": "https://api.discogs.com/oauth/request_token",
+    "authorize_url": "https://www.discogs.com/oauth/authorize",
+    "access_token_url": "https://api.discogs.com/oauth/access_token"
   }
 }

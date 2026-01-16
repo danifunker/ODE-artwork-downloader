@@ -117,9 +117,20 @@ pub fn read_chd(path: &Path) -> ChdResult<ChdInfo> {
         );
     }
 
-    // Try to detect filesystem from the disc data
-    let (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem) = 
-        detect_filesystem_from_chd(&mut chd, &tracks);
+    // Check if this is an audio-only disc (no data tracks)
+    let has_audio = tracks.iter().any(|t| is_audio_track(&t.track_type));
+    let has_data = tracks.iter().any(|t| is_data_track(&t.track_type));
+    let is_audio_only = has_audio && !has_data;
+
+    // For audio-only CDs, skip filesystem detection entirely
+    let (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem) = if is_audio_only {
+        log::info!("Audio-only CD detected ({} audio tracks), skipping filesystem detection",
+            tracks.iter().filter(|t| is_audio_track(&t.track_type)).count());
+        (None, None, None, None, super::formats::FilesystemType::Unknown)
+    } else {
+        // Try to detect filesystem from the disc data
+        detect_filesystem_from_chd(&mut chd, &tracks)
+    };
 
     // Extract TOC if we have audio tracks
     let toc = extract_toc_from_tracks(&tracks);

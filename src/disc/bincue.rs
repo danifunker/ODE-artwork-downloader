@@ -309,6 +309,11 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
     // Find first data track
     let data_track = tracks.iter().find(|t| t.is_data);
 
+    // Check if this is an audio-only disc (no data tracks)
+    let has_audio = tracks.iter().any(|t| matches!(t.track_type, TrackType::Audio));
+    let has_data = data_track.is_some();
+    let is_audio_only = has_audio && !has_data;
+
     // Resolve CUE directory for finding BIN files
     let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
 
@@ -320,8 +325,12 @@ pub fn read_bincue(cue_path: &Path) -> BinCueResult<BinCueInfo> {
 
     let bin_path = resolve_bin_path_with_cue_fallback(cue_dir, primary_bin_filename, Some(cue_path))?;
 
-    // Try to read PVD from the data track's BIN file
-    let (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem) = if let Some(track) = data_track {
+    // For audio-only CDs, skip filesystem detection entirely
+    let (volume_label, pvd, hfs_mdb, hfsplus_header, filesystem) = if is_audio_only {
+        log::info!("Audio-only CD detected ({} audio tracks), skipping filesystem detection",
+            tracks.iter().filter(|t| matches!(t.track_type, TrackType::Audio)).count());
+        (None, None, None, None, super::formats::FilesystemType::Unknown)
+    } else if let Some(track) = data_track {
         // Open the specific BIN file for this track
         let track_bin_path = resolve_bin_path_with_cue_fallback(cue_dir, &track.bin_filename, Some(cue_path))?;
         log::debug!("Opening data track BIN file: {}", track_bin_path.display());

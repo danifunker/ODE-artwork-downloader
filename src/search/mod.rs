@@ -43,6 +43,8 @@ struct DdgImagesResponse {
 
 /// Search for images using DuckDuckGo
 pub fn search_images(query: &str, max_results: usize) -> Result<Vec<ImageResult>, String> {
+    log::info!("DDG Search Query: {}", query);
+
     let client = build_client()?;
 
     // Step 1: Get the vqd token from the search page
@@ -50,6 +52,11 @@ pub fn search_images(query: &str, max_results: usize) -> Result<Vec<ImageResult>
 
     // Step 2: Fetch image results using the token
     let results = fetch_image_results(&client, query, &vqd, max_results)?;
+
+    log::info!("DDG Search returned {} results", results.len());
+    for (i, result) in results.iter().take(5).enumerate() {
+        log::debug!("  Result {}: {} ({})", i + 1, result.title, result.source);
+    }
 
     Ok(results)
 }
