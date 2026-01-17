@@ -34,6 +34,8 @@ pub struct SearchConfig {
     pub apps_sites: Vec<String>,
     /// Known sites for audio CDs
     pub audio_sites: Vec<String>,
+    /// Custom user agent string for HTTP requests
+    pub user_agent: Option<String>,
 }
 
 /// Content type for different disc categories
@@ -128,6 +130,10 @@ impl Default for SearchConfig {
                             .and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                             .unwrap_or_default(),
+
+                        user_agent: search.get("user_agent")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     };
                 }
             }
@@ -148,6 +154,7 @@ impl Default for SearchConfig {
             apps_sites: Vec::new(),
             audio_sites: Vec::new(),
             known_publishers: Vec::new(),
+            user_agent: None,
         }
     }
 }
@@ -223,7 +230,7 @@ impl ArtworkSearchQuery {
                         .iter()
                         .map(|s| format!("site:{}", s))
                         .collect();
-                    parts.push(format!("({})", site_terms.join(" OR ")));
+                    parts.push(site_terms.join(" OR "));
                 }
             }
             ContentType::Any => {
@@ -448,7 +455,7 @@ impl ArtworkSearchQuery {
 
         // Build title part with OR if we have an alt title
         if let Some(ref alt) = self.alt_title {
-            parts.push(format!("(\"{}\" OR \"{}\")", self.title, alt));
+            parts.push(format!("\"{}\" OR \"{}\"", self.title, alt));
         } else {
             parts.push(format!("\"{}\"", self.title));
         }
@@ -623,7 +630,7 @@ mod tests {
             original_filename: None,
         };
 
-        assert_eq!(query.build_query(), "(\"Final Fantasy VII\" OR \"FF7\") CD art");
+        assert_eq!(query.build_query(), "\"Final Fantasy VII\" OR \"FF7\" CD art");
     }
 
     #[test]

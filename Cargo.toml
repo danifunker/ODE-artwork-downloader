@@ -29,6 +29,7 @@ env_logger = "0.11"
 urlencoding = "2.1"
 sha1 = "0.10"
 base64 = "0.22"
+tiny_http = "0.12"
 
 # Encryption
 aes-gcm = "0.10"

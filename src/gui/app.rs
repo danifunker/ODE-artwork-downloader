@@ -69,6 +69,10 @@ pub struct App {
     browse_view: BrowseView,
     /// Whether to show the browse window
     show_browse_window: bool,
+    /// Receiver for user agent capture result
+    user_agent_receiver: Option<Receiver<Result<String, String>>>,
+    /// Whether user agent capture is in progress
+    user_agent_capture_in_progress: bool,
 }
 
 /// A log message with severity level
@@ -116,6 +120,8 @@ impl Default for App {
             global_log_receiver: None,
             browse_view: BrowseView::new(),
             show_browse_window: false,
+            user_agent_receiver: None,
+            user_agent_capture_in_progress: false,
         }
     }
 }
@@ -293,6 +299,7 @@ impl App {
     /// Start an async image search
     fn start_search(&mut self, query: &str) {
         let query = query.to_string();
+        let user_agent = self.search_config.user_agent.clone();
         let (tx, rx) = mpsc::channel();
 
         self.search_in_progress = true;
@@ -301,7 +308,20 @@ impl App {
         self.search_receiver = Some(rx);
 
         thread::spawn(move || {
-            let result = crate::search::search_images(&query, 20);
+            let result = crate::search::search_images_with_ua(&query, 20, user_agent.as_deref());
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Start async user agent capture from browser
+    fn start_user_agent_capture(&mut self) {
+        let (tx, rx) = mpsc::channel();
+
+        self.user_agent_capture_in_progress = true;
+        self.user_agent_receiver = Some(rx);
+
+        thread::spawn(move || {
+            let result = crate::search::capture_browser_user_agent();
             let _ = tx.send(result);
         });
     }
@@ -707,6 +727,39 @@ impl App {
             }
         }
     }
+
+    /// Poll for user agent capture results
+    fn poll_user_agent_capture(&mut self) {
+        if let Some(ref receiver) = self.user_agent_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(user_agent)) => {
+                    self.user_agent_capture_in_progress = false;
+                    self.user_agent_receiver = None;
+
+                    // Save to config file
+                    if let Err(e) = crate::search::save_user_agent_to_config(&user_agent) {
+                        self.log(LogLevel::Error, format!("Failed to save user agent: {}", e));
+                    } else {
+                        self.log(LogLevel::Info, "Browser identity captured and saved".to_string());
+                        // Reload the search config to pick up the new user agent
+                        self.search_config = SearchConfig::default();
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.user_agent_capture_in_progress = false;
+                    self.user_agent_receiver = None;
+                    self.log(LogLevel::Error, format!("Failed to capture browser identity: {}", e));
+                }
+                Err(TryRecvError::Empty) => {
+                    // Still waiting for browser
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.user_agent_capture_in_progress = false;
+                    self.user_agent_receiver = None;
+                }
+            }
+        }
+    }
 }
 
 /// Fetch image bytes from a URL
@@ -761,8 +814,11 @@ impl eframe::App for App {
         // Poll for update check
         self.poll_update_check();
 
+        // Poll for user agent capture
+        self.poll_user_agent_capture();
+
         // Request repaint while loading
-        if self.search_in_progress || self.preview_loading || self.export_in_progress {
+        if self.search_in_progress || self.preview_loading || self.export_in_progress || self.user_agent_capture_in_progress {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -932,6 +988,31 @@ impl eframe::App for App {
                         if changed {
                             self.save_search_config();
                             self.update_search_query_from_disc();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Browser Identity section
+                    ui.horizontal(|ui| {
+                        ui.label("Browser Identity:");
+                        if self.search_config.user_agent.is_some() {
+                            ui.label(egui::RichText::new("Configured").color(egui::Color32::GREEN));
+                        } else {
+                            ui.label(egui::RichText::new("Not set").color(egui::Color32::YELLOW));
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        let button_enabled = !self.user_agent_capture_in_progress;
+                        let button_text = if self.user_agent_capture_in_progress {
+                            "Waiting for browser..."
+                        } else {
+                            "Configure Browser Identity"
+                        };
+
+                        if ui.add_enabled(button_enabled, egui::Button::new(button_text)).clicked() {
+                            self.start_user_agent_capture();
                         }
                     });
                 });
