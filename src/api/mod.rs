@@ -5,10 +5,12 @@
 
 pub mod artwork;
 pub mod discogs;
+pub mod mobygames;
 pub mod musicbrainz;
 pub mod redump;
 
 pub use artwork::{open_in_browser, ArtworkSearchQuery, SearchConfig, ContentType};
 pub use discogs::{search_release as discogs_search, DiscogsResult};
+pub use mobygames::search_game_covers;
 pub use musicbrainz::{search_by_discid, MusicBrainzResult};
 pub use redump::{RedumpDatabase, RedumpGame};

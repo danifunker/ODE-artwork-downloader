@@ -178,6 +178,10 @@ pub struct ArtworkSearchQuery {
     pub publisher: Option<String>,
     /// Original filename for context
     pub original_filename: Option<String>,
+    /// Whether this is a Mac game (detected via HFS/HFS+ filesystem)
+    pub is_mac_game: bool,
+    /// Content type for query formatting
+    pub content_type: ContentType,
 }
 
 impl ArtworkSearchQuery {
@@ -366,7 +370,7 @@ impl ArtworkSearchQuery {
     /// Create a search query from parsed filename information with custom config
     pub fn from_parsed_filename_with_config(parsed: &ParsedFilename, config: &SearchConfig) -> Self {
         let (title, publisher) = Self::process_title(&parsed.title, config);
-        
+
         Self {
             title,
             alt_title: None,
@@ -376,6 +380,8 @@ impl ArtworkSearchQuery {
             search_suffix: Self::build_default_suffix(config, Some(&parsed.original)),
             publisher,
             original_filename: Some(parsed.original.clone()),
+            is_mac_game: false, // Can't detect from filename alone
+            content_type: config.content_type,
         }
     }
 
@@ -387,6 +393,14 @@ impl ArtworkSearchQuery {
     /// Create a search query from disc info with custom config
     pub fn from_disc_info_with_config(info: &DiscInfo, config: &SearchConfig) -> Self {
         let filename_title = info.parsed_filename.title.clone();
+
+        // Detect if this is a Mac game based on:
+        // 1. Filesystem type (HFS or HFS+)
+        // 2. Folder path containing "mac"
+        let is_mac_game = matches!(
+            info.filesystem,
+            crate::disc::FilesystemType::Hfs | crate::disc::FilesystemType::HfsPlus
+        ) || is_mac_path(&info.path);
 
         // Get normalized volume label if available and useful
         let volume_title = info.volume_label.as_ref().and_then(|label| {
@@ -407,13 +421,20 @@ impl ArtworkSearchQuery {
             processed
         });
 
-        // Use filename as primary, volume label as alt if different
-        let (title, alt_title) = match processed_volume {
-            Some(ref vol) if vol.to_lowercase() != processed_filename.to_lowercase() => {
+        // For Mac games, prefer volume label over filename (if available)
+        // For other games, use filename as primary, volume label as alt
+        let (title, alt_title) = match (is_mac_game, &processed_volume) {
+            // Mac game with volume label: use volume label as primary
+            (true, Some(vol)) if vol.to_lowercase() != processed_filename.to_lowercase() => {
+                (vol.clone(), Some(processed_filename.clone()))
+            }
+            // Non-Mac or same title: use filename as primary, volume as alt if different
+            (_, Some(vol)) if vol.to_lowercase() != processed_filename.to_lowercase() => {
                 (processed_filename.clone(), Some(vol.clone()))
             }
-            Some(vol) => (vol, None), // Same title, just use one
-            None => (processed_filename, None),
+            // Same title or no volume: just use one
+            (_, Some(vol)) => (vol.clone(), None),
+            (_, None) => (processed_filename, None),
         };
 
         // Detect platform from file path
@@ -428,6 +449,8 @@ impl ArtworkSearchQuery {
             search_suffix: Self::build_default_suffix(config, Some(&info.parsed_filename.original)),
             publisher: publisher_from_filename,
             original_filename: Some(info.parsed_filename.original.clone()),
+            is_mac_game,
+            content_type: config.content_type,
         }
     }
 
@@ -451,6 +474,13 @@ impl ArtworkSearchQuery {
 
     /// Build the full search query string
     pub fn build_query(&self) -> String {
+        // For Games content type, use a simpler query format
+        if self.content_type == ContentType::Games {
+            let platform = if self.is_mac_game { "mac" } else { "pc" };
+            return format!("\"{}\" case {} site:mobygames.com", self.title, platform);
+        }
+
+        // For other content types, use the full query format
         let mut parts = Vec::new();
 
         // Build title part with OR if we have an alt title
@@ -510,6 +540,13 @@ fn detect_platform_from_path(path: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Check if file path indicates a Mac game
+///
+/// Returns true if any folder in the path contains "mac" (case insensitive).
+fn is_mac_path(path: &Path) -> bool {
+    path.to_string_lossy().to_lowercase().contains("mac")
 }
 
 impl ArtworkSearchQuery {
@@ -577,6 +614,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         assert_eq!(query.build_query(), "\"Final Fantasy VII\" CD art");
@@ -593,6 +632,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         assert_eq!(query.build_query(), "\"Final Fantasy VII\" USA CD art");
@@ -609,6 +650,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         assert_eq!(
@@ -628,6 +671,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         assert_eq!(query.build_query(), "\"Final Fantasy VII\" OR \"FF7\" CD art");
@@ -644,6 +689,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         assert_eq!(query.build_query(), "\"Doom\" 1993 DOS CD art");
@@ -660,9 +707,47 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: Some("Westwood".to_string()),
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         assert_eq!(query.build_query(), "\"Command & Conquer\" \"Westwood\" CD art");
+    }
+
+    #[test]
+    fn test_build_query_games_pc() {
+        let query = ArtworkSearchQuery {
+            title: "Doom".to_string(),
+            alt_title: None,
+            region: None,
+            platform: None,
+            year: None,
+            search_suffix: String::new(),
+            publisher: None,
+            original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Games,
+        };
+
+        assert_eq!(query.build_query(), "\"Doom\" case pc site:mobygames.com");
+    }
+
+    #[test]
+    fn test_build_query_games_mac() {
+        let query = ArtworkSearchQuery {
+            title: "Myst".to_string(),
+            alt_title: None,
+            region: None,
+            platform: None,
+            year: None,
+            search_suffix: String::new(),
+            publisher: None,
+            original_filename: None,
+            is_mac_game: true,
+            content_type: ContentType::Games,
+        };
+
+        assert_eq!(query.build_query(), "\"Myst\" case mac site:mobygames.com");
     }
 
     #[test]
@@ -808,6 +893,15 @@ mod tests {
     }
 
     #[test]
+    fn test_is_mac_path() {
+        assert!(is_mac_path(Path::new("/games/Mac/Myst.iso")));
+        assert!(is_mac_path(Path::new("/games/Macintosh/Marathon.iso")));
+        assert!(is_mac_path(Path::new("C:\\Games\\MAC\\Myst.iso")));
+        assert!(!is_mac_path(Path::new("/games/PC/Doom.iso")));
+        assert!(!is_mac_path(Path::new("/games/DOS/Doom.iso")));
+    }
+
+    #[test]
     fn test_year_extraction() {
         let parsed = crate::disc::parse_filename(Path::new("Doom (1993).iso"));
         assert_eq!(parsed.year, Some(1993));
@@ -824,6 +918,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         let url = query.google_images_url();
@@ -843,6 +939,8 @@ mod tests {
             search_suffix: "CD art".to_string(),
             publisher: None,
             original_filename: None,
+            is_mac_game: false,
+            content_type: ContentType::Any,
         };
 
         let url = query.duckduckgo_images_url();
@@ -860,7 +958,7 @@ mod tests {
         assert_eq!(ContentType::from_str("apps"), ContentType::AppsUtilities);
         assert_eq!(ContentType::from_str("audio_cds"), ContentType::AudioCDs);
         assert_eq!(ContentType::from_str("any"), ContentType::Any);
-        assert_eq!(ContentType::from_str("invalid"), ContentType::Games); // default
+        assert_eq!(ContentType::from_str("invalid"), ContentType::Any); // default
 
         assert_eq!(ContentType::Games.display_name(), "Games");
         assert_eq!(ContentType::AppsUtilities.display_name(), "Apps & Utilities");

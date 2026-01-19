@@ -324,6 +324,155 @@ pub fn save_user_agent_to_config(user_agent: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A web search result (URL + title)
+#[derive(Debug, Clone)]
+pub struct WebSearchResult {
+    /// The URL of the search result
+    pub url: String,
+    /// The title of the search result
+    pub title: String,
+}
+
+/// Search DuckDuckGo for web results (not images)
+/// Returns a list of URLs matching the query
+pub fn ddg_web_search(query: &str, user_agent: Option<&str>, max_results: usize) -> Result<Vec<WebSearchResult>, String> {
+    log::info!("DDG Web Search Query: {}", query);
+
+    let client = build_client(user_agent)?;
+
+    // Use DuckDuckGo HTML search
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        urlencoding::encode(query)
+    );
+
+    log::debug!("Fetching DDG HTML results from: {}", url);
+
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Failed to fetch search page: {}", e))?;
+
+    let text = response
+        .text()
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    // Parse results from HTML
+    // DDG HTML results have links in <a class="result__a" href="...">
+    let results = parse_ddg_html_results(&text, max_results)?;
+
+    log::info!("DDG Web Search returned {} results", results.len());
+    for (i, result) in results.iter().take(3).enumerate() {
+        log::debug!("  Result {}: {} - {}", i + 1, result.title, result.url);
+    }
+
+    Ok(results)
+}
+
+/// Parse DuckDuckGo HTML search results
+fn parse_ddg_html_results(html: &str, max_results: usize) -> Result<Vec<WebSearchResult>, String> {
+    let mut results = Vec::new();
+
+    // Pattern to match result links
+    // DDG HTML has: <a rel="nofollow" class="result__a" href="URL">TITLE</a>
+    let link_pattern = regex::Regex::new(
+        r#"<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>"#
+    ).map_err(|e| format!("Failed to compile regex: {}", e))?;
+
+    // Also try alternate pattern with href before class
+    let link_pattern_alt = regex::Regex::new(
+        r#"<a[^>]*href="([^"]+)"[^>]*class="result__a"[^>]*>([^<]+)</a>"#
+    ).map_err(|e| format!("Failed to compile alt regex: {}", e))?;
+
+    // Collect matches from both patterns
+    for caps in link_pattern.captures_iter(html) {
+        if results.len() >= max_results {
+            break;
+        }
+        if let (Some(url_match), Some(title_match)) = (caps.get(1), caps.get(2)) {
+            let url = decode_ddg_url(url_match.as_str());
+            let title = html_decode(title_match.as_str());
+            if !url.is_empty() && !title.is_empty() {
+                results.push(WebSearchResult { url, title });
+            }
+        }
+    }
+
+    // Try alternate pattern if we didn't get enough results
+    if results.len() < max_results {
+        for caps in link_pattern_alt.captures_iter(html) {
+            if results.len() >= max_results {
+                break;
+            }
+            if let (Some(url_match), Some(title_match)) = (caps.get(1), caps.get(2)) {
+                let url = decode_ddg_url(url_match.as_str());
+                let title = html_decode(title_match.as_str());
+                if !url.is_empty() && !title.is_empty() {
+                    // Avoid duplicates
+                    if !results.iter().any(|r| r.url == url) {
+                        results.push(WebSearchResult { url, title });
+                    }
+                }
+            }
+        }
+    }
+
+    // If still no results, try a more general pattern
+    if results.is_empty() {
+        // Look for any link with uddg= parameter (DDG's redirect format)
+        let uddg_pattern = regex::Regex::new(
+            r#"href="[^"]*uddg=([^&"]+)"#
+        ).map_err(|e| format!("Failed to compile uddg regex: {}", e))?;
+
+        for caps in uddg_pattern.captures_iter(html) {
+            if results.len() >= max_results {
+                break;
+            }
+            if let Some(url_match) = caps.get(1) {
+                let url = urlencoding::decode(url_match.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                if !url.is_empty() && url.starts_with("http") {
+                    results.push(WebSearchResult {
+                        url,
+                        title: "Search Result".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Decode DDG redirect URLs
+fn decode_ddg_url(url: &str) -> String {
+    // DDG sometimes wraps URLs in redirects
+    // Format: //duckduckgo.com/l/?uddg=ENCODED_URL&...
+    if url.contains("uddg=") {
+        if let Some(start) = url.find("uddg=") {
+            let encoded = &url[start + 5..];
+            let end = encoded.find('&').unwrap_or(encoded.len());
+            let encoded_url = &encoded[..end];
+            return urlencoding::decode(encoded_url)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| url.to_string());
+        }
+    }
+    // Return as-is if not a redirect
+    url.to_string()
+}
+
+/// Basic HTML entity decoding
+fn html_decode(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

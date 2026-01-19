@@ -31,6 +31,9 @@ sha1 = "0.10"
 base64 = "0.22"
 tiny_http = "0.12"
 
+# Browser automation
+headless_chrome = "1.0"
+
 # Encryption
 aes-gcm = "0.10"
 

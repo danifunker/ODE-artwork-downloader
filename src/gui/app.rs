@@ -327,8 +327,10 @@ impl App {
     }
 
     /// Start an async MusicBrainz search using disc ID
-    fn start_musicbrainz_search(&mut self, disc_id: &str, toc_string: Option<String>) {
+    /// If fallback_query is provided and MusicBrainz returns no results, fall back to DDG search
+    fn start_musicbrainz_search(&mut self, disc_id: &str, toc_string: Option<String>, fallback_query: Option<String>) {
         let disc_id = disc_id.to_string();
+        let user_agent = self.search_config.user_agent.clone();
         let (tx, rx) = mpsc::channel();
 
         self.search_in_progress = true;
@@ -339,17 +341,17 @@ impl App {
         thread::spawn(move || {
             // Query MusicBrainz for releases
             let mb_results = crate::api::search_by_discid(&disc_id, toc_string.as_deref());
-            
+
             let result = mb_results.and_then(|releases| {
                 let mut all_results = Vec::new();
-                
+
                 // Convert MusicBrainz results to ImageResult format
                 let mb_images: Vec<_> = releases.iter()
                     .filter_map(|release| {
                         // Prefer cover art URL, fall back to thumbnail
                         let image_url = release.cover_art_url.clone().or_else(|| release.thumbnail_url.clone())?;
                         let thumbnail = release.thumbnail_url.clone().unwrap_or_else(|| image_url.clone());
-                        
+
                         let title = if let Some(ref date) = release.date {
                             format!("{} - {} ({})", release.artist, release.title, date)
                         } else {
@@ -366,9 +368,9 @@ impl App {
                         })
                     })
                     .collect();
-                
+
                 all_results.extend(mb_images);
-                
+
                 // If we got at least one MusicBrainz result, search Discogs API for the album
                 if let Some(first_release) = releases.first() {
                     log::info!("Searching Discogs API for album: {} - {}", first_release.artist, first_release.title);
@@ -410,11 +412,33 @@ impl App {
                         }
                     }
                 }
-                
+
                 Ok(all_results)
             });
-            
-            let _ = tx.send(result);
+
+            // If MusicBrainz returned no results and we have a fallback query, use DDG
+            let final_result = match result {
+                Ok(results) if results.is_empty() => {
+                    if let Some(query) = fallback_query {
+                        log::info!("MusicBrainz returned no results, falling back to DDG search");
+                        crate::search::search_images_with_ua(&query, 20, user_agent.as_deref())
+                    } else {
+                        Ok(results)
+                    }
+                }
+                Err(e) => {
+                    // MusicBrainz failed, try fallback
+                    if let Some(query) = fallback_query {
+                        log::warn!("MusicBrainz search failed: {}, falling back to DDG search", e);
+                        crate::search::search_images_with_ua(&query, 20, user_agent.as_deref())
+                    } else {
+                        Err(e)
+                    }
+                }
+                other => other,
+            };
+
+            let _ = tx.send(final_result);
         });
     }
 
@@ -424,21 +448,33 @@ impl App {
             match receiver.try_recv() {
                 Ok(Ok(mut results)) => {
                     let count = results.len();
-                    
+
+                    // Always clear previous results and selection
+                    self.search_results.clear();
+                    self.selected_image_index = None;
+
+                    if count == 0 {
+                        // No results found
+                        self.search_in_progress = false;
+                        self.search_receiver = None;
+                        self.log(LogLevel::Warning, "No results found");
+                        return;
+                    }
+
                     // Count MusicBrainz vs Discogs results
                     let mb_count = results.iter().filter(|r| r.source.starts_with("MusicBrainz")).count();
                     let discogs_count = results.iter().filter(|r| r.source == "Discogs").count();
-                    
+
                     // Sort: MusicBrainz results first, then web results by aspect ratio
                     results.sort_by(|a, b| {
                         // MusicBrainz results always come first
                         let a_is_mb = a.source.starts_with("MusicBrainz");
                         let b_is_mb = b.source.starts_with("MusicBrainz");
-                        
+
                         if a_is_mb != b_is_mb {
                             return if a_is_mb { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
                         }
-                        
+
                         // Within same category, sort by aspect ratio (closest to 1.0)
                         let aspect_a = match (a.width, a.height) {
                             (Some(w), Some(h)) if h > 0 => {
@@ -456,11 +492,11 @@ impl App {
                         };
                         aspect_a.partial_cmp(&aspect_b).unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    
+
                     self.search_results = results;
                     self.search_in_progress = false;
                     self.search_receiver = None;
-                    
+
                     let msg = if mb_count > 0 && discogs_count > 0 {
                         format!("Found {} MusicBrainz releases + {} Discogs images", mb_count, discogs_count)
                     } else if mb_count > 0 {
@@ -471,6 +507,8 @@ impl App {
                     self.log(LogLevel::Success, msg);
                 }
                 Ok(Err(e)) => {
+                    self.search_results.clear();
+                    self.selected_image_index = None;
                     self.search_in_progress = false;
                     self.search_receiver = None;
                     self.log(LogLevel::Error, format!("Search failed: {}", e));
@@ -479,6 +517,8 @@ impl App {
                     // Still searching, keep waiting
                 }
                 Err(TryRecvError::Disconnected) => {
+                    self.search_results.clear();
+                    self.selected_image_index = None;
                     self.search_in_progress = false;
                     self.search_receiver = None;
                     self.log(LogLevel::Error, "Search thread terminated unexpectedly");
@@ -1068,12 +1108,6 @@ impl eframe::App for App {
                                 ui.label(&info.parsed_filename.title);
                                 ui.end_row();
 
-                                if let Some(ref region) = info.parsed_filename.region {
-                                    ui.label("Region:");
-                                    ui.label(region);
-                                    ui.end_row();
-                                }
-
                                 if let Some(disc) = info.parsed_filename.disc_number {
                                     ui.label("Disc Number:");
                                     ui.label(format!("{}", disc));
@@ -1123,32 +1157,10 @@ impl eframe::App for App {
                                         }
                                     });
                                     ui.end_row();
-
-                                    ui.label("FreeDB ID:");
-                                    let freedb_id = toc.calculate_freedb_id();
-                                    ui.horizontal(|ui| {
-                                        ui.label(&freedb_id);
-                                        if ui.small_button("📋").on_hover_text("Copy to clipboard").clicked() {
-                                            ui.output_mut(|o| o.copied_text = freedb_id.clone());
-                                        }
-                                    });
-                                    ui.end_row();
                                 }
 
-                                // HFS/HFS+ information
+                                // HFS information
                                 if let Some(ref mdb) = info.hfs_mdb {
-                                    ui.label("HFS Volume:");
-                                    ui.label(&mdb.volume_name);
-                                    ui.end_row();
-
-                                    ui.label("Allocation Blocks:");
-                                    ui.label(format!("{}", mdb.alloc_blocks));
-                                    ui.end_row();
-
-                                    ui.label("Block Size:");
-                                    ui.label(format!("{} bytes", mdb.alloc_block_size));
-                                    ui.end_row();
-
                                     ui.label("Files/Dirs:");
                                     ui.label(format!("{} / {}", mdb.root_file_count, mdb.root_dir_count));
                                     ui.end_row();
@@ -1157,21 +1169,6 @@ impl eframe::App for App {
                                 if let Some(ref header) = info.hfsplus_header {
                                     ui.label("HFS+ Version:");
                                     ui.label(format!("{}", header.version));
-                                    ui.end_row();
-
-                                    ui.label("Block Size:");
-                                    ui.label(format!("{} bytes", header.block_size));
-                                    ui.end_row();
-
-                                    ui.label("Total Blocks:");
-                                    ui.label(format!("{}", header.total_blocks));
-                                    ui.end_row();
-
-                                    ui.label("Free Blocks:");
-                                    ui.label(format!("{} ({:.1}%)", 
-                                        header.free_blocks,
-                                        (header.free_blocks as f64 / header.total_blocks as f64) * 100.0
-                                    ));
                                     ui.end_row();
 
                                     ui.label("Files/Folders:");
@@ -1255,7 +1252,8 @@ impl eframe::App for App {
                         let mut search_clicked = false;
                         let mut browser_clicked = false;
                         let query_for_search = self.search_query_text.clone();
-                        let use_musicbrainz = self.search_config.content_type == ContentType::AudioCDs && info.toc.is_some();
+                        // Use MusicBrainz for any disc with audio tracks
+                        let use_musicbrainz = info.toc.is_some();
                         let disc_id = info.toc.as_ref().map(|toc| toc.calculate_musicbrainz_id());
                         let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
 
@@ -1289,7 +1287,8 @@ impl eframe::App for App {
                                         .and_then(|result| result.as_ref().ok())
                                         .and_then(|info| info.toc.as_ref())
                                         .map(|toc| toc.to_toc_string());
-                                    self.start_musicbrainz_search(id, toc);
+                                    // Pass fallback query for when MusicBrainz returns no results
+                                    self.start_musicbrainz_search(id, toc, Some(query_for_search.clone()));
                                 } else {
                                     self.log(LogLevel::Error, "No disc ID available");
                                 }
