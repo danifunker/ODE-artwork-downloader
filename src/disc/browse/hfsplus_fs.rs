@@ -331,6 +331,55 @@ impl HfsPlusFilesystem {
         String::from_utf16(&utf16_chars).unwrap_or_default()
     }
 
+    /// Read a byte range from a HFS+ fork, iterating through all extents.
+    fn read_fork_range(
+        &mut self,
+        fork: &HfsPlusForkData,
+        range_offset: u64,
+        range_length: usize,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let end = (range_offset + range_length as u64).min(fork.logical_size);
+
+        if range_offset >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::with_capacity((end - range_offset) as usize);
+        let mut logical_pos: u64 = 0;
+
+        for extent in &fork.extents {
+            if extent.block_count == 0 {
+                break;
+            }
+            let ext_size = extent.block_count as u64 * self.block_size as u64;
+            let ext_end = logical_pos + ext_size;
+
+            if ext_end <= range_offset {
+                logical_pos = ext_end;
+                continue;
+            }
+            if logical_pos >= end {
+                break;
+            }
+
+            let read_start = range_offset.max(logical_pos);
+            let read_end = end.min(ext_end);
+            let read_len = (read_end - read_start) as usize;
+            let offset_in_ext = read_start - logical_pos;
+
+            let physical_offset = self.partition_offset
+                + extent.start_block as u64 * self.block_size as u64
+                + offset_in_ext;
+
+            let chunk = self.reader.read_bytes(physical_offset, read_len)?;
+            result.extend_from_slice(&chunk);
+
+            logical_pos = ext_end;
+        }
+
+        Ok(result)
+    }
+
     /// Find file record by CNID and get its fork data
     fn find_file_fork(&mut self, cnid: u32) -> Result<HfsPlusForkData, FilesystemError> {
         let mut current_node = self.first_leaf_node;
@@ -417,8 +466,8 @@ impl HfsPlusFilesystem {
                 continue;
             }
 
-            // Found it! Parse data fork
-            // Data fork starts at offset 88 from record data start
+            // Found it! Parse data fork (80 bytes at data_offset + 88).
+            // ForkData layout: logical_size(8) + clump_size(4) + total_blocks(4) + extents(8 × 8)
             let fork_offset = data_offset + 88;
             let logical_size = u64::from_be_bytes([
                 node_data[fork_offset],
@@ -431,28 +480,32 @@ impl HfsPlusFilesystem {
                 node_data[fork_offset + 7],
             ]);
 
-            // First extent at fork_offset + 16
-            let ext_offset = fork_offset + 16;
-            let start_block = u32::from_be_bytes([
-                node_data[ext_offset],
-                node_data[ext_offset + 1],
-                node_data[ext_offset + 2],
-                node_data[ext_offset + 3],
-            ]);
-            let block_count = u32::from_be_bytes([
-                node_data[ext_offset + 4],
-                node_data[ext_offset + 5],
-                node_data[ext_offset + 6],
-                node_data[ext_offset + 7],
-            ]);
+            // Extents begin at fork_offset + 16, each 8 bytes (start_block u32 + block_count u32)
+            let mut extents = Vec::new();
+            for j in 0..8usize {
+                let ext_offset = fork_offset + 16 + j * 8;
+                if ext_offset + 8 > node_data.len() {
+                    break;
+                }
+                let start_block = u32::from_be_bytes([
+                    node_data[ext_offset],
+                    node_data[ext_offset + 1],
+                    node_data[ext_offset + 2],
+                    node_data[ext_offset + 3],
+                ]);
+                let block_count = u32::from_be_bytes([
+                    node_data[ext_offset + 4],
+                    node_data[ext_offset + 5],
+                    node_data[ext_offset + 6],
+                    node_data[ext_offset + 7],
+                ]);
+                if block_count == 0 {
+                    break;
+                }
+                extents.push(HfsPlusExtent { start_block, block_count });
+            }
 
-            return Some(HfsPlusForkData {
-                logical_size,
-                extents: vec![HfsPlusExtent {
-                    start_block,
-                    block_count,
-                }],
-            });
+            return Some(HfsPlusForkData { logical_size, extents });
         }
 
         None
@@ -487,19 +540,11 @@ impl Filesystem for HfsPlusFilesystem {
         }
 
         let fork = self.find_file_fork(entry.location as u32)?;
-
-        if fork.extents.is_empty() || fork.extents[0].block_count == 0 {
+        if fork.extents.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Read from first extent (simplified - real impl would handle multiple extents)
-        let extent = &fork.extents[0];
-        let offset =
-            self.partition_offset + (extent.start_block as u64 * self.block_size as u64);
-        let bytes_to_read = fork.logical_size as usize;
-
-        let data = self.reader.read_bytes(offset, bytes_to_read)?;
-        Ok(data)
+        self.read_fork_range(&fork, 0, fork.logical_size as usize)
     }
 
     fn read_file_range(
@@ -516,8 +561,7 @@ impl Filesystem for HfsPlusFilesystem {
         }
 
         let fork = self.find_file_fork(entry.location as u32)?;
-
-        if fork.extents.is_empty() || fork.extents[0].block_count == 0 {
+        if fork.extents.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -527,13 +571,7 @@ impl Filesystem for HfsPlusFilesystem {
             return Ok(Vec::new());
         }
 
-        // Read from first extent (simplified)
-        let extent = &fork.extents[0];
-        let file_offset =
-            self.partition_offset + (extent.start_block as u64 * self.block_size as u64) + offset;
-
-        let data = self.reader.read_bytes(file_offset, actual_length)?;
-        Ok(data)
+        self.read_fork_range(&fork, offset, actual_length)
     }
 
     fn volume_name(&self) -> Option<&str> {
