@@ -252,7 +252,7 @@ impl App {
 
     /// Open file picker dialog
     fn open_file_picker(&mut self) {
-        let extensions: Vec<&str> = supported_extensions();
+        let extensions = supported_extensions();
 
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Disc Images", &extensions)
@@ -1140,7 +1140,7 @@ impl eframe::App for App {
                                     ui.end_row();
 
                                     ui.label("MusicBrainz ID:");
-                                    let disc_id = toc.calculate_musicbrainz_id();
+                                    let disc_id = toc.musicbrainz_id();
                                     let toc_string = toc.to_toc_string();
                                     ui.horizontal(|ui| {
                                         ui.label(&disc_id);
@@ -1161,8 +1161,8 @@ impl eframe::App for App {
 
                                 // HFS information
                                 if let Some(ref mdb) = info.hfs_mdb {
-                                    ui.label("Files/Dirs:");
-                                    ui.label(format!("{} / {}", mdb.root_file_count, mdb.root_dir_count));
+                                    ui.label("Files:");
+                                    ui.label(format!("{}", mdb.file_count));
                                     ui.end_row();
                                 }
 
@@ -1254,7 +1254,7 @@ impl eframe::App for App {
                         let query_for_search = self.search_query_text.clone();
                         // Use MusicBrainz for any disc with audio tracks
                         let use_musicbrainz = info.toc.is_some();
-                        let disc_id = info.toc.as_ref().map(|toc| toc.calculate_musicbrainz_id());
+                        let disc_id = info.toc.as_ref().map(|toc| toc.musicbrainz_id());
                         let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
 
                         ui.horizontal(|ui| {

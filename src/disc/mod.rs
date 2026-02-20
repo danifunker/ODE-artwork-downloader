@@ -2,33 +2,21 @@
 //!
 //! Provides functionality for reading various disc image formats and extracting
 //! volume labels and other identifying information.
+//!
+//! Format/filesystem parsing is delegated to the `opticaldiscs` library.
+//! ODE-specific logic (game title parsing, confidence scoring) lives here.
 
-mod apm;
-mod bincue;
 pub mod browse;
-mod chd;
-mod formats;
-mod hfs;
-mod hfsplus;
 mod identifier;
-mod iso9660;
 mod reader;
-mod toc;
 
-// Public API re-exports (some may be unused until later phases)
-#[allow(unused_imports)]
-pub use formats::{DiscFormat, FilesystemType, supported_extensions};
-#[allow(unused_imports)]
-pub use identifier::{parse_filename, normalize_volume_label, ConfidenceLevel, ParsedFilename};
-#[allow(unused_imports)]
-pub use iso9660::PrimaryVolumeDescriptor;
-#[allow(unused_imports)]
-pub use reader::{DiscInfo, DiscReader, DiscError, set_log_callback, clear_log_callback};
-#[allow(unused_imports)]
-pub use toc::{DiscTOC, TrackInfo};
-#[allow(unused_imports)]
-pub use hfs::MasterDirectoryBlock;
-#[allow(unused_imports)]
-pub use hfsplus::HfsPlusVolumeHeader;
-#[allow(unused_imports)]
-pub use apm::PartitionEntry;
+// Re-exports from opticaldiscs
+pub use opticaldiscs::formats::{supported_extensions, DiscFormat, FilesystemType};
+pub use opticaldiscs::hfs::MasterDirectoryBlock;
+pub use opticaldiscs::hfsplus::HfsPlusVolumeHeader;
+pub use opticaldiscs::iso9660::PrimaryVolumeDescriptor;
+pub use opticaldiscs::toc::{DiscTOC, TrackInfo};
+
+// ODE-specific re-exports
+pub use identifier::{normalize_volume_label, parse_filename, ConfidenceLevel, ParsedFilename};
+pub use reader::{clear_log_callback, set_log_callback, DiscError, DiscInfo, DiscReader};

@@ -3,7 +3,7 @@ name = "ode-artwork-downloader"
 version = "1.0.0"
 edition = "2021"
 description = "Cross-platform GUI application to download cover art for USBODE disc images"
-license = "MIT"
+license = "GPL-3.0"
 repository = "https://github.com/dani/ODE-artwork-downloader"
 
 [dependencies]
@@ -27,7 +27,6 @@ thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
 urlencoding = "2.1"
-sha1 = "0.10"
 base64 = "0.22"
 tiny_http = "0.12"
 
@@ -37,9 +36,8 @@ headless_chrome = "1.0"
 # Encryption
 aes-gcm = "0.10"
 
-# Disc image formats
-chd = "0.2"
-cue_sheet = "0.1"
+# Disc image formats (delegated to opticaldiscs)
+opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["toc"] }
 musicbrainz_rs = "0.5"
 
 # DAT file parsing

@@ -4,7 +4,7 @@ use eframe::egui;
 use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 
-use crate::disc::browse::{FileEntry, EntryType, open_filesystem};
+use crate::disc::browse::{EntryType, FileEntry, open_filesystem};
 use crate::disc::DiscInfo;
 
 use super::hex_view::HexView;

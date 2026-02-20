@@ -3596,8 +3596,6 @@ version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
- "chd",
- "cue_sheet",
  "eframe",
  "egui",
  "egui_extras",
@@ -3606,13 +3604,13 @@ dependencies = [
  "image",
  "log",
  "musicbrainz_rs",
+ "opticaldiscs",
  "quick-xml 0.37.5",
  "regex 1.12.2",
  "reqwest 0.12.28",
  "rfd",
  "serde",
  "serde_json",
- "sha1",
  "tempfile",
  "thiserror 2.0.17",
  "tiny_http",
@@ -3681,6 +3679,18 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "opticaldiscs"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chd",
+ "cue_sheet",
+ "log",
+ "sha1",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
