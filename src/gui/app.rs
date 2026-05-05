@@ -838,7 +838,9 @@ fn load_image_from_bytes(bytes: &[u8]) -> Result<egui::ColorImage, String> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // Poll for global log messages
         self.poll_global_logs();
 
@@ -846,7 +848,7 @@ impl eframe::App for App {
         self.poll_search();
 
         // Poll for preview image
-        self.poll_preview(ctx);
+        self.poll_preview(&ctx);
 
         // Poll for export results
         self.poll_export();
@@ -897,7 +899,7 @@ impl eframe::App for App {
         }
 
         // Top panel with title
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("ODE Artwork Downloader");
@@ -924,7 +926,7 @@ impl eframe::App for App {
                 .open(&mut self.show_log_window)
                 .default_size([500.0, 300.0])
                 .resizable(true)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     if ui.button("Clear").clicked() {
                         self.log_messages.clear();
                     }
@@ -957,7 +959,7 @@ impl eframe::App for App {
                 .min_width(600.0)
                 .min_height(400.0)
                 .resizable(true)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     if let Some(ref info) = disc_info_clone {
                         self.browse_view.show(ui, info);
                     } else {
@@ -972,7 +974,7 @@ impl eframe::App for App {
         }
 
         // Main central panel
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             // Top section with File Selection and Search Settings in columns
             ui.columns(2, |columns| {
 
@@ -1145,7 +1147,7 @@ impl eframe::App for App {
                                     ui.horizontal(|ui| {
                                         ui.label(&disc_id);
                                         if ui.small_button("📋").on_hover_text("Copy to clipboard").clicked() {
-                                            ui.output_mut(|o| o.copied_text = disc_id.clone());
+                                            ui.ctx().copy_text(disc_id.clone());
                                         }
                                         if ui.small_button("🔍").on_hover_text("Search on MusicBrainz").clicked() {
                                             // Use the exact same URL as the API lookup
@@ -1431,12 +1433,12 @@ impl eframe::App for App {
                                     let response = response.on_hover_text(&result.image_url);
                                     response.context_menu(|ui| {
                                         if ui.button("Copy URL to clipboard").clicked() {
-                                            ui.output_mut(|o| o.copied_text = result.image_url.clone());
-                                            ui.close_menu();
+                                            ui.ctx().copy_text(result.image_url.clone());
+                                            ui.close();
                                         }
                                         if ui.button("Open in browser").clicked() {
                                             let _ = open_in_browser(&result.image_url);
-                                            ui.close_menu();
+                                            ui.close();
                                         }
                                     });
                                 }
@@ -1566,7 +1568,7 @@ impl eframe::App for App {
         });
 
         // Show drag-and-drop preview
-        preview_files_being_dropped(ctx);
+        preview_files_being_dropped(&ctx);
 
         // Show update notification dialog
         if self.show_update_notification {
@@ -1575,7 +1577,7 @@ impl eframe::App for App {
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
+                    .show(&ctx, |ui| {
                         ui.label(format!(
                             "A new version is available: v{}",
                             update_info.latest_version
@@ -1608,13 +1610,13 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
         let painter =
             ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
         painter.text(
             screen_rect.center(),
             Align2::CENTER_CENTER,
             "Drop disc image to scan",
-            TextStyle::Heading.resolve(&ctx.style()),
+            TextStyle::Heading.resolve(&ctx.global_style()),
             Color32::WHITE,
         );
     }
