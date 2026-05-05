@@ -91,7 +91,7 @@ jobs:
           fi
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OAD-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: OAD-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
@@ -266,7 +266,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
@@ -390,7 +390,7 @@ jobs:
           ARCH=${{ matrix.arch }} ./squashfs-root/appimagetool --no-appstream AppDir OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-appimage
           path: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
@@ -436,7 +436,7 @@ jobs:
           mv ${{ steps.build.outputs.snap }} OAD-linux-amd64-${{ needs.generate-version.outputs.version }}.snap
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OAD-linux-amd64-${{ needs.generate-version.outputs.version }}-snap
           path: OAD-linux-amd64-${{ needs.generate-version.outputs.version }}.snap
@@ -479,7 +479,7 @@ jobs:
           mv *.snap OAD-linux-arm64-${{ needs.generate-version.outputs.version }}.snap
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OAD-linux-arm64-${{ needs.generate-version.outputs.version }}-snap
           path: OAD-linux-arm64-${{ needs.generate-version.outputs.version }}.snap
@@ -552,7 +552,7 @@ jobs:
           flatpak build-bundle repo OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.flatpak io.github.dani.ODEArtworkDownloader
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-flatpak
           path: OAD-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.flatpak
@@ -564,7 +564,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
       
