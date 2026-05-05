@@ -38,10 +38,10 @@ aes-gcm = "0.10"
 
 # Disc image formats (delegated to opticaldiscs)
 opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["toc"] }
-musicbrainz_rs = "0.5"
+musicbrainz_rs = "0.13"
 
 # DAT file parsing
-quick-xml = { version = "0.37", features = ["serde", "serialize"] }
+quick-xml = { version = "0.39", features = ["serde", "serialize"] }
 zip = "8"
 
 [dev-dependencies]
