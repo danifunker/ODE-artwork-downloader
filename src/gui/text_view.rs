@@ -110,7 +110,7 @@ pub fn detect_text_encoding(data: &[u8]) -> Option<TextEncoding> {
         .iter()
         .filter(|&&b| {
             (b >= 0x20 && b <= 0x7E) // ASCII printable
-            || (b >= 0x80 && b <= 0xFF) // Latin-1 extended
+            || b >= 0x80 // Latin-1 extended
             || b == 0x09 // Tab
             || b == 0x0A // LF
             || b == 0x0D // CR

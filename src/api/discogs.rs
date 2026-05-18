@@ -21,42 +21,6 @@ struct DiscogsSearchResult {
     title: String,
     thumb: Option<String>,
     cover_image: Option<String>,
-    resource_url: String,
-}
-
-/// Discogs release details
-#[derive(Debug, Deserialize)]
-struct DiscogsRelease {
-    id: u64,
-    title: String,
-    artists: Option<Vec<DiscogsArtist>>,
-    images: Option<Vec<DiscogsImage>>,
-    year: Option<u32>,
-}
-
-/// Discogs master release details
-#[derive(Debug, Deserialize)]
-struct DiscogsMaster {
-    id: u64,
-    title: String,
-    artists: Option<Vec<DiscogsArtist>>,
-    images: Option<Vec<DiscogsImage>>,
-    year: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscogsArtist {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscogsImage {
-    #[serde(rename = "type")]
-    image_type: String,
-    uri: String,
-    uri150: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
 }
 
 /// Result from Discogs search
