@@ -13,16 +13,65 @@ on:
       - "/update-os-sublist.sh"
       # - ".github/**"
   workflow_dispatch:
+  # Weekly database-refresh build. Picks up any new redump.sqlite even when
+  # there are no app-code changes. Mondays 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: write
+  # Required by the release-window gate so it can call `gh run cancel` on its
+  # own workflow run when a release was published in the last 7 days.
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Embed the latest redump.sqlite seed at build time. Empty locally; opted in
+  # for CI so released binaries ship with a pre-populated DB.
+  EMBED_REDUMP_DB: "1"
+  # Hard-fail the build only on the weekly scheduled run, where the entire
+  # point is to refresh the embedded DB. On push / manual runs we tolerate a
+  # transient upstream outage and ship an unseeded build instead.
+  EMBED_REDUMP_DB_REQUIRED: ${{ github.event_name == 'schedule' && '1' || '' }}
+  # Forces build.rs to rerun (and refetch the seed) on every CI invocation
+  # regardless of cargo's incremental cache.
+  EMBED_REDUMP_DB_NONCE: ${{ github.run_id }}
 
 jobs:
+  # Gate for scheduled runs: if a release was published in the last 7 days,
+  # cancel the whole workflow before any builds start. Non-schedule triggers
+  # skip this job entirely (so push / workflow_dispatch always proceed).
+  release-window:
+    name: Check release window
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel run if last release is younger than 7 days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
+                   --json publishedAt --jq '.[0].publishedAt // empty')
+          if [ -z "$last" ]; then
+            echo "No prior release; proceeding."
+            exit 0
+          fi
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+          echo "Most recent release was $age_days days ago ($last)"
+          if [ "$age_days" -lt 7 ]; then
+            echo "::notice::Cancelling — last release was $age_days days ago."
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+            # Give the cancel call time to propagate before this step exits.
+            sleep 30
+          fi
+
   generate-version:
     name: Generate Version
+    needs: release-window
+    # release-window is `skipped` on push/dispatch (its own `if:` is false).
+    # The default downstream `if: success()` would treat that as not-met, so
+    # explicitly allow both success and skipped.
+    if: needs.release-window.result == 'success' || needs.release-window.result == 'skipped'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -566,6 +615,29 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
       
+      - name: Compose release notes prelude
+        id: notes
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            cat > body.md <<'EOF'
+          ### Weekly database refresh
+
+          This release was produced by the weekly scheduled build. The embedded
+          [redump.org](http://redump.org) lookup database has been refreshed from
+          the latest [ODE-lookup-db](https://github.com/danifunker/ODE-lookup-db)
+          release; application code is unchanged from the previous tag.
+
+          ---
+          EOF
+          else
+            : > body.md
+          fi
+          {
+            echo 'body<<RELEASE_BODY_EOF'
+            cat body.md
+            echo 'RELEASE_BODY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
@@ -575,5 +647,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
+          append_body: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

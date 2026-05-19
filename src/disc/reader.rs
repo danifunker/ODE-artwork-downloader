@@ -110,6 +110,10 @@ pub struct DiscInfo {
     pub hfs_mdb: Option<MasterDirectoryBlock>,
     /// HFS+ Volume Header (if HFS+ filesystem detected)
     pub hfsplus_header: Option<HfsPlusVolumeHeader>,
+    /// Redump database matches, populated by the caller after a successful
+    /// read. `None` means no lookup was attempted; `Some(vec![])` means it was
+    /// attempted and found nothing.
+    pub redump_matches: Option<Vec<crate::db::RedumpMatch>>,
 }
 
 impl DiscInfo {
@@ -169,6 +173,7 @@ impl DiscReader {
                     toc: info.toc,
                     hfs_mdb: info.hfs_mdb,
                     hfsplus_header: info.hfsplus_header,
+                    redump_matches: None,
                 })
             }
             Err(opticaldiscs::error::OpticaldiscsError::UnsupportedFormat(fmt)) => {
@@ -200,6 +205,7 @@ impl DiscReader {
                     toc: None,
                     hfs_mdb: None,
                     hfsplus_header: None,
+                    redump_matches: None,
                 })
             }
         }

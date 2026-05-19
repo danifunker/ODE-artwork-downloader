@@ -73,6 +73,10 @@ pub struct App {
     user_agent_receiver: Option<Receiver<Result<String, String>>>,
     /// Whether user agent capture is in progress
     user_agent_capture_in_progress: bool,
+    /// Receiver for the background redump DB update job
+    db_update_receiver: Option<Receiver<Result<crate::db::UpdateOutcome, String>>>,
+    /// Whether the DB update has finished (success or failure)
+    db_update_done: bool,
 }
 
 /// A log message with severity level
@@ -122,6 +126,8 @@ impl Default for App {
             show_browse_window: false,
             user_agent_receiver: None,
             user_agent_capture_in_progress: false,
+            db_update_receiver: None,
+            db_update_done: false,
         }
     }
 }
@@ -139,7 +145,123 @@ impl App {
             app.start_update_check();
         }
 
+        // Refresh the redump lookup DB in the background.
+        app.start_db_update();
+
         app
+    }
+
+    /// Spawn a background thread to check for / download the latest redump DB.
+    fn start_db_update(&mut self) {
+        if self.db_update_done || self.db_update_receiver.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.db_update_receiver = Some(rx);
+        thread::spawn(move || {
+            let result = match crate::db::DatabaseManager::new() {
+                Ok(mgr) => mgr.update_if_needed().map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Run the redump lookup cascade against the current disc info.
+    /// Attaches matches in-place and writes a one-line log entry. Failures
+    /// (missing DB, query error) are logged at debug level and treated as
+    /// "no match" — the rest of the flow continues unchanged.
+    fn enrich_with_redump(&mut self, info: &mut DiscInfo) {
+        let mgr = match crate::db::DatabaseManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("Redump lookup skipped (manager init): {e}");
+                return;
+            }
+        };
+        let conn = match mgr.open() {
+            Ok(c) => c,
+            Err(crate::db::manager::DbError::NotInstalled) => {
+                log::debug!("Redump lookup skipped: DB not yet downloaded");
+                return;
+            }
+            Err(e) => {
+                log::warn!("Redump lookup skipped: {e}");
+                return;
+            }
+        };
+        match crate::db::cascade_from_disc(&conn, info) {
+            Ok(matches) => {
+                if matches.is_empty() {
+                    self.log(LogLevel::Info, "Redump: no match");
+                } else {
+                    let head = &matches[0];
+                    let more = matches.len().saturating_sub(1);
+                    let suffix = if more > 0 {
+                        format!(" (+{more} more)")
+                    } else {
+                        String::new()
+                    };
+                    self.log(
+                        LogLevel::Success,
+                        format!(
+                            "Redump match via {:?}: {} [#{}]{}",
+                            head.matched_via, head.title, head.redump_id, suffix
+                        ),
+                    );
+                }
+                info.redump_matches = Some(matches);
+            }
+            Err(e) => {
+                log::warn!("Redump cascade failed: {e}");
+            }
+        }
+    }
+
+    /// Poll the background DB update channel and log the outcome once.
+    fn poll_db_update(&mut self) {
+        let Some(rx) = self.db_update_receiver.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(outcome)) => {
+                match &outcome {
+                    crate::db::UpdateOutcome::UpToDate { .. } => {
+                        self.log(LogLevel::Info, "Redump DB is up to date");
+                    }
+                    crate::db::UpdateOutcome::Updated { local_path, .. } => {
+                        self.log(
+                            LogLevel::Success,
+                            format!("Redump DB updated: {}", local_path.display()),
+                        );
+                    }
+                    crate::db::UpdateOutcome::OfflineUsingCached { error, .. } => {
+                        self.log(
+                            LogLevel::Warning,
+                            format!("Redump DB update skipped (offline): {error}"),
+                        );
+                    }
+                    crate::db::UpdateOutcome::OfflineNoCache { error } => {
+                        self.log(
+                            LogLevel::Warning,
+                            format!("Redump DB unavailable (offline, no cache): {error}"),
+                        );
+                    }
+                }
+                self.db_update_done = true;
+                self.db_update_receiver = None;
+            }
+            Ok(Err(e)) => {
+                self.log(LogLevel::Error, format!("Redump DB update failed: {e}"));
+                self.db_update_done = true;
+                self.db_update_receiver = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.db_update_done = true;
+                self.db_update_receiver = None;
+            }
+        }
     }
 
     /// Add a log message
@@ -197,6 +319,8 @@ impl App {
                     LogLevel::Success,
                     format!("Successfully read disc: {}", info.title),
                 );
+                let mut info = info;
+                self.enrich_with_redump(&mut info);
                 self.disc_info = Some(Ok(info));
             }
             Err(e) => {
@@ -236,8 +360,11 @@ impl App {
                         toc: None,
                         hfs_mdb: None,
                         hfsplus_header: None,
+                        redump_matches: None,
                     };
 
+                    let mut fallback_info = fallback_info;
+                    self.enrich_with_redump(&mut fallback_info);
                     self.disc_info = Some(Ok(fallback_info));
                 } else {
                     self.log(LogLevel::Error, format!("Error reading disc: {}", e));
@@ -859,6 +986,9 @@ impl eframe::App for App {
         // Poll for user agent capture
         self.poll_user_agent_capture();
 
+        // Poll for redump DB update result
+        self.poll_db_update();
+
         // Request repaint while loading
         if self.search_in_progress || self.preview_loading || self.export_in_progress || self.user_agent_capture_in_progress {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1119,6 +1249,31 @@ impl eframe::App for App {
                                 if let Some(ref serial) = info.parsed_filename.serial {
                                     ui.label("Serial:");
                                     ui.label(serial);
+                                    ui.end_row();
+                                }
+
+                                // Redump database match
+                                if let Some(matches) = &info.redump_matches {
+                                    ui.label("Redump:");
+                                    if let Some(first) = matches.first() {
+                                        let count_suffix = if matches.len() > 1 {
+                                            format!(" (+{} more)", matches.len() - 1)
+                                        } else {
+                                            String::new()
+                                        };
+                                        ui.colored_label(
+                                            egui::Color32::GREEN,
+                                            format!(
+                                                "#{} {} [{:?}]{}",
+                                                first.redump_id,
+                                                first.title,
+                                                first.matched_via,
+                                                count_suffix,
+                                            ),
+                                        );
+                                    } else {
+                                        ui.colored_label(egui::Color32::GRAY, "No match");
+                                    }
                                     ui.end_row();
                                 }
 
