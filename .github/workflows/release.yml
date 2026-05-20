@@ -68,10 +68,12 @@ jobs:
   generate-version:
     name: Generate Version
     needs: release-window
-    # release-window is `skipped` on push/dispatch (its own `if:` is false).
-    # The default downstream `if: success()` would treat that as not-met, so
-    # explicitly allow both success and skipped.
-    if: needs.release-window.result == 'success' || needs.release-window.result == 'skipped'
+    # release-window is `skipped` on push/dispatch (its own `if:` is false)
+    # and `success` on schedule when the run isn't cancelled by the gate.
+    # GitHub's implicit "skip downstream when a need is skipped" behavior
+    # kicks in unless the `if:` is wrapped with always()/!cancelled(), so
+    # we have to spell out the proceed condition explicitly.
+    if: ${{ !cancelled() && needs.release-window.result != 'failure' && needs.release-window.result != 'cancelled' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
