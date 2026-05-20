@@ -39,14 +39,15 @@ env:
 
 jobs:
   # Gate for scheduled runs: if a release was published in the last 7 days,
-  # cancel the whole workflow before any builds start. Non-schedule triggers
-  # skip this job entirely (so push / workflow_dispatch always proceed).
+  # cancel the whole workflow before any builds start. The job itself runs
+  # on every trigger so downstream success() checks cascade cleanly; the
+  # schedule check lives on the step instead.
   release-window:
     name: Check release window
-    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Cancel run if last release is younger than 7 days
+        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -68,12 +69,6 @@ jobs:
   generate-version:
     name: Generate Version
     needs: release-window
-    # release-window is `skipped` on push/dispatch (its own `if:` is false)
-    # and `success` on schedule when the run isn't cancelled by the gate.
-    # GitHub's implicit "skip downstream when a need is skipped" behavior
-    # kicks in unless the `if:` is wrapped with always()/!cancelled(), so
-    # we have to spell out the proceed condition explicitly.
-    if: ${{ !cancelled() && needs.release-window.result != 'failure' && needs.release-window.result != 'cancelled' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
