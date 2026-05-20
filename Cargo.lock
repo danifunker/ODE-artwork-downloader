@@ -3548,6 +3548,7 @@ dependencies = [
  "headless_chrome",
  "hex",
  "image",
+ "libchdman-rs",
  "log",
  "md-5",
  "musicbrainz_rs",

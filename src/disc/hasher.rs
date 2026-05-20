@@ -13,6 +13,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crc32fast::Hasher as Crc32;
+use libchdman_rs::cd::{extract_to_cue, list_tracks};
+use libchdman_rs::Chd;
 use md5::{Digest as Md5Digest, Md5};
 use opticaldiscs::bincue::parse_cue_tracks;
 use opticaldiscs::formats::DiscFormat;
@@ -87,7 +89,7 @@ pub fn hash_data_track(
     match info.format {
         DiscFormat::BinCue => hash_bincue(&info.path, &progress),
         DiscFormat::Iso => hash_iso(&info.path, &progress),
-        DiscFormat::Chd => Err(HashError::Unsupported("CHD".to_string())),
+        DiscFormat::Chd => hash_chd(&info.path, &progress),
         // MDS/MDF (and anything else) not implemented yet.
         other => Err(HashError::Unsupported(format!("{other:?}"))),
     }
@@ -186,6 +188,79 @@ fn hash_iso(
         size_bytes: hashed.size_bytes,
         source,
     })
+}
+
+/// CHD path: extract to a temp BIN/CUE using libchdman-rs (which wraps
+/// MAME's `chdman` core, so the BIN is byte-identical to redump's source),
+/// then hash track 1 of the BIN with the existing BIN/CUE path.
+///
+/// Two stages get progress: "Extracting CHD" (libchdman-rs decompression)
+/// and "Hashing BIN track 1 (raw)" (handed off to `hash_bincue`). The
+/// `RateTracker` resets its rolling window on stage change so the ETA stays
+/// sane across the transition.
+fn hash_chd(
+    chd_path: &Path,
+    progress: &Arc<Mutex<HashProgress>>,
+) -> Result<TrackHashes, HashError> {
+    // Open the CHD just to enumerate tracks so we can guess a sensible
+    // total-bytes target for the extract progress bar.
+    let chd_path_str = chd_path
+        .to_str()
+        .ok_or_else(|| HashError::Opticaldiscs(format!("non-UTF8 path: {}", chd_path.display())))?;
+    let chd = Chd::open(chd_path_str, false, None)
+        .map_err(|e| HashError::Opticaldiscs(format!("open CHD: {e:?}")))?;
+    let tracks = list_tracks(&chd)
+        .map_err(|e| HashError::Opticaldiscs(format!("list CHD tracks: {e:?}")))?;
+    // Conservative upper bound: every frame at the raw 2352 sector size.
+    // Cooked Mode1 tracks would write 2048/frame so the counter tops out
+    // a bit short — acceptable for a progress estimate.
+    let extract_total: u64 = tracks
+        .iter()
+        .map(|t| t.frames as u64 * 2352)
+        .sum();
+    drop(chd);
+
+    let tmp = tempfile::tempdir()?;
+    let cue_path = tmp.path().join("disc.cue");
+    let bin_path = tmp.path().join("disc.bin");
+
+    {
+        let mut p = progress.lock().unwrap();
+        p.stage = "Extracting CHD".into();
+        p.total_bytes = extract_total;
+        p.current_bytes = 0;
+        p.active = true;
+        p.cancelled = false;
+    }
+
+    // libchdman-rs's extract callback fires per frame with the cumulative
+    // bytes-written counter. Forward straight into HashProgress.
+    let progress_for_cb = Arc::clone(progress);
+    let mut cb = move |bytes_written: u64| {
+        if let Ok(mut p) = progress_for_cb.lock() {
+            p.current_bytes = bytes_written;
+        }
+    };
+
+    extract_to_cue(chd_path, &cue_path, &bin_path, &mut cb)
+        .map_err(|e| HashError::Opticaldiscs(format!("CHD extract: {e:?}")))?;
+
+    // Cancellation check between stages.
+    if progress.lock().unwrap().cancelled {
+        return Err(HashError::Cancelled);
+    }
+
+    // Hand the extracted BIN/CUE to the regular hashing path. `hash_bincue`
+    // overwrites `stage`/`total_bytes`/`current_bytes`, so `RateTracker`
+    // will see a new stage label and reset its rolling window.
+    let mut hashes = hash_bincue(&cue_path, progress)?;
+
+    // Re-label so the success log says "from a CHD" rather than "from a
+    // BIN" (which would be confusing — the user picked a .chd).
+    hashes.source = format!("CHD track 1 (raw, extracted)");
+
+    // `tmp` drops here, cleaning up the extracted BIN/CUE.
+    Ok(hashes)
 }
 
 struct StreamHashResult {

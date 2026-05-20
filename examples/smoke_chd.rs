@@ -14,7 +14,9 @@
 //! after the swap?"
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use ode_artwork_downloader::disc::hasher::{hash_data_track, HashProgress};
 use ode_artwork_downloader::disc::DiscReader;
 
 fn main() {
@@ -70,6 +72,26 @@ fn main() {
 
     if let Some(serial) = &info.parsed_filename.serial {
         println!("Filename serial: {serial}");
+    }
+
+    // Exercise the hashing path. For a small fixture this finishes fast;
+    // a real game CHD takes seconds. No progress UI here — we just block.
+    let progress = Arc::new(Mutex::new(HashProgress::default()));
+    println!("\nHashing data track…");
+    let started = std::time::Instant::now();
+    match hash_data_track(&info, progress) {
+        Ok(h) => {
+            println!("  source:    {}", h.source);
+            println!("  bytes:     {}", h.size_bytes);
+            println!("  sha1:      {}", h.sha1);
+            println!("  md5:       {}", h.md5);
+            println!("  crc32:     {}", h.crc32);
+            println!("  elapsed:   {:.2}s", started.elapsed().as_secs_f64());
+        }
+        Err(e) => {
+            eprintln!("hash failed: {e}");
+            std::process::exit(3);
+        }
     }
 
     println!("\nSmoke test OK.");
