@@ -5,6 +5,7 @@
 mod app;
 pub mod browse_view;
 pub mod hex_view;
+pub mod progress;
 pub mod text_view;
 
 pub use app::App;
