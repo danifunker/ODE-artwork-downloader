@@ -36,8 +36,10 @@ headless_chrome = "1.0"
 # Encryption
 aes-gcm = "0.10"
 
-# Disc image formats (delegated to opticaldiscs)
-opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", features = ["toc"] }
+# Disc image formats (delegated to opticaldiscs). 0.4.0+ uses libchdman-rs
+# under the hood for CHD reading, with `prebuilt` enabled so CI doesn't have
+# to compile MAME's C++.
+opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", tag = "0.4.0", features = ["toc"] }
 musicbrainz_rs = "0.13"
 
 # Redump SQLite lookup DB (download + open)
@@ -46,6 +48,11 @@ zstd = "0.13"
 sha2 = "0.10"
 directories = "5"
 hex = "0.4"
+
+# Track-level hashing for redump lookup
+sha1 = "0.10"
+md-5 = "0.10"
+crc32fast = "1.4"
 
 [dev-dependencies]
 tempfile = "3"
@@ -62,3 +69,4 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+

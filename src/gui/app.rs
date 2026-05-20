@@ -77,6 +77,12 @@ pub struct App {
     db_update_receiver: Option<Receiver<Result<crate::db::UpdateOutcome, String>>>,
     /// Whether the DB update has finished (success or failure)
     db_update_done: bool,
+    /// Live progress of the current hashing job (shared with the worker thread)
+    hash_progress: Option<std::sync::Arc<std::sync::Mutex<crate::disc::hasher::HashProgress>>>,
+    /// Receiver for the hashing worker's final result
+    hash_receiver: Option<Receiver<Result<crate::disc::hasher::TrackHashes, String>>>,
+    /// Rolling rate/ETA estimator for the active hashing job
+    hash_rate_tracker: super::progress::RateTracker,
 }
 
 /// A log message with severity level
@@ -128,6 +134,9 @@ impl Default for App {
             user_agent_capture_in_progress: false,
             db_update_receiver: None,
             db_update_done: false,
+            hash_progress: None,
+            hash_receiver: None,
+            hash_rate_tracker: super::progress::RateTracker::default(),
         }
     }
 }
@@ -216,6 +225,139 @@ impl App {
                 log::warn!("Redump cascade failed: {e}");
             }
         }
+    }
+
+    /// Spawn the hashing worker for the currently loaded disc.
+    fn start_hashing(&mut self) {
+        // Cancel any in-flight hasher first; user just loaded a new disc.
+        self.cancel_hashing();
+
+        let Some(Ok(info)) = self.disc_info.as_ref() else {
+            return;
+        };
+        let info = info.clone();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::disc::hasher::HashProgress::default(),
+        ));
+        let (tx, rx) = mpsc::channel();
+        self.hash_progress = Some(progress.clone());
+        self.hash_receiver = Some(rx);
+        self.hash_rate_tracker.reset();
+
+        thread::spawn(move || {
+            let result = crate::disc::hasher::hash_data_track(&info, progress)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn cancel_hashing(&mut self) {
+        if let Some(p) = self.hash_progress.as_ref() {
+            if let Ok(mut g) = p.lock() {
+                g.cancelled = true;
+            }
+        }
+        self.hash_progress = None;
+        self.hash_receiver = None;
+        self.hash_rate_tracker.reset();
+    }
+
+    /// Poll the hashing worker and refresh redump_matches when it finishes.
+    fn poll_hash(&mut self) {
+        if let Some(progress) = self.hash_progress.as_ref() {
+            // Pump the rate tracker each frame while hashing is in flight.
+            if let Ok(p) = progress.lock() {
+                self.hash_rate_tracker.record(p.current_bytes, &p.stage);
+            }
+        }
+        let Some(rx) = self.hash_receiver.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(hashes)) => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Hashed {} ({}): sha1={}, md5={}, crc32={}",
+                        hashes.source,
+                        super::progress::format_size(hashes.size_bytes),
+                        &hashes.sha1[..16],
+                        &hashes.md5[..16],
+                        hashes.crc32,
+                    ),
+                );
+                self.apply_hash_match(&hashes);
+                self.hash_progress = None;
+                self.hash_receiver = None;
+            }
+            Ok(Err(e)) => {
+                // "Unsupported format" / "cancelled" are not real failures.
+                if !e.contains("cancelled") && !e.contains("not yet supported") {
+                    log::warn!("Hashing failed: {e}");
+                    self.log(LogLevel::Warning, format!("Hashing failed: {e}"));
+                } else {
+                    log::info!("Hashing skipped: {e}");
+                }
+                self.hash_progress = None;
+                self.hash_receiver = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.hash_progress = None;
+                self.hash_receiver = None;
+            }
+        }
+    }
+
+    /// Re-run the redump cascade with hash inputs filled in. Replaces the
+    /// existing match list when the hash tier produces a hit, otherwise
+    /// leaves the serial/PVD result in place.
+    fn apply_hash_match(&mut self, hashes: &crate::disc::hasher::TrackHashes) {
+        // Run the lookup first; only touch self.disc_info to apply the
+        // result. Keeps the &mut borrow narrow so we can also call self.log.
+        let mgr = match crate::db::DatabaseManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("hash match skipped (manager init): {e}");
+                return;
+            }
+        };
+        let conn = match mgr.open() {
+            Ok(c) => c,
+            Err(e) => {
+                log::debug!("hash match skipped: {e}");
+                return;
+            }
+        };
+        let inputs = crate::db::CascadeInputs {
+            track_sha1: Some(&hashes.sha1),
+            track_md5: Some(&hashes.md5),
+            track_crc32: Some(&hashes.crc32),
+            ..Default::default()
+        };
+        let matches = match crate::db::lookup::cascade(&conn, &inputs) {
+            Ok(Some(m)) if !m.is_empty() => m,
+            Ok(_) => {
+                self.log(LogLevel::Info, "Redump: no hash match (kept prior match)");
+                return;
+            }
+            Err(e) => {
+                log::warn!("hash cascade failed: {e}");
+                return;
+            }
+        };
+
+        let head_summary = {
+            let head = &matches[0];
+            format!(
+                "Redump hash match: {} [#{}] via {:?}",
+                head.title, head.redump_id, head.matched_via
+            )
+        };
+        if let Some(Ok(info)) = self.disc_info.as_mut() {
+            info.redump_matches = Some(matches);
+        }
+        self.log(LogLevel::Success, head_summary);
     }
 
     /// Poll the background DB update channel and log the outcome once.
@@ -375,6 +517,11 @@ impl App {
         
         // Clear the log callback after processing
         crate::disc::clear_log_callback();
+
+        // Kick off track hashing in the background. The disc info is already
+        // displayed; when hashing finishes we'll re-run the cascade with the
+        // hash tier active and refresh `redump_matches`.
+        self.start_hashing();
     }
 
     /// Open file picker dialog
@@ -989,8 +1136,11 @@ impl eframe::App for App {
         // Poll for redump DB update result
         self.poll_db_update();
 
+        // Poll the track-hashing worker
+        self.poll_hash();
+
         // Request repaint while loading
-        if self.search_in_progress || self.preview_loading || self.export_in_progress || self.user_agent_capture_in_progress {
+        if self.search_in_progress || self.preview_loading || self.export_in_progress || self.user_agent_capture_in_progress || self.hash_progress.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -1197,6 +1347,29 @@ impl eframe::App for App {
                 ui.heading("Disc Information");
                 ui.add_space(8.0);
 
+                // Snapshot the hashing state outside the match so we can reach
+                // both self.hash_progress (worker state) and self.hash_rate_tracker
+                // (UI-thread state) without fighting the borrow checker inside
+                // the egui closures below.
+                let hash_snapshot: Option<HashRowSnapshot> = self
+                    .hash_progress
+                    .as_ref()
+                    .and_then(|p| p.lock().ok().map(|g| (g.current_bytes, g.total_bytes, g.stage.clone(), g.active)))
+                    .and_then(|(cur, tot, stage, active)| {
+                        if !active || tot == 0 {
+                            None
+                        } else {
+                            Some(HashRowSnapshot {
+                                fraction: (cur as f32 / tot as f32).clamp(0.0, 1.0),
+                                current_bytes: cur,
+                                total_bytes: tot,
+                                stage,
+                                rate_suffix: self.hash_rate_tracker.suffix(cur, tot),
+                            })
+                        }
+                    });
+                let hashing_in_progress = hash_snapshot.is_some();
+
                 match &self.disc_info {
                     Some(Ok(info)) => {
                         egui::Grid::new("disc_info_grid")
@@ -1252,28 +1425,96 @@ impl eframe::App for App {
                                     ui.end_row();
                                 }
 
+                                // Hashing progress row (only while a worker is active)
+                                if let Some(ref h) = hash_snapshot {
+                                    ui.label("Hashing:");
+                                    let text = format!(
+                                        "{} / {} ({:.0}%){}",
+                                        super::progress::format_size(h.current_bytes),
+                                        super::progress::format_size(h.total_bytes),
+                                        h.fraction * 100.0,
+                                        h.rate_suffix,
+                                    );
+                                    ui.add(
+                                        egui::ProgressBar::new(h.fraction)
+                                            .text(text)
+                                            .animate(true),
+                                    );
+                                    ui.end_row();
+                                }
+
                                 // Redump database match
                                 if let Some(matches) = &info.redump_matches {
                                     ui.label("Redump:");
                                     if let Some(first) = matches.first() {
-                                        let count_suffix = if matches.len() > 1 {
-                                            format!(" (+{} more)", matches.len() - 1)
-                                        } else {
-                                            String::new()
-                                        };
+                                        let (color, label) = match_styling(first.matched_via);
+                                        ui.vertical(|ui| {
+                                            ui.colored_label(
+                                                color,
+                                                format!(
+                                                    "{label}: {} (#{})",
+                                                    first.title, first.redump_id
+                                                ),
+                                            );
+                                            let mut details: Vec<String> = Vec::new();
+                                            if let Some(e) = first.edition.as_ref().filter(|s| !s.is_empty()) {
+                                                details.push(e.clone());
+                                            }
+                                            if let Some(v) = first.version.as_ref().filter(|s| !s.is_empty()) {
+                                                details.push(format!("v{v}"));
+                                            }
+                                            if let Some(m) = first.media.as_ref().filter(|s| !s.is_empty()) {
+                                                details.push(m.clone());
+                                            }
+                                            if !details.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(details.join(" · "))
+                                                        .small()
+                                                        .color(egui::Color32::LIGHT_GRAY),
+                                                );
+                                            }
+                                            ui.hyperlink_to(
+                                                "View on redump.org",
+                                                &first.redump_url,
+                                            );
+                                            if matches.len() > 1 {
+                                                ui.collapsing(
+                                                    format!(
+                                                        "{} other candidate(s)",
+                                                        matches.len() - 1
+                                                    ),
+                                                    |ui| {
+                                                        for m in matches.iter().skip(1) {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(format!(
+                                                                    "#{}: {}",
+                                                                    m.redump_id, m.title
+                                                                ));
+                                                                ui.hyperlink_to(
+                                                                    "↗",
+                                                                    &m.redump_url,
+                                                                );
+                                                            });
+                                                        }
+                                                    },
+                                                );
+                                            }
+                                        });
+                                    } else if hashing_in_progress {
                                         ui.colored_label(
-                                            egui::Color32::GREEN,
-                                            format!(
-                                                "#{} {} [{:?}]{}",
-                                                first.redump_id,
-                                                first.title,
-                                                first.matched_via,
-                                                count_suffix,
-                                            ),
+                                            egui::Color32::LIGHT_GRAY,
+                                            "Searching… (waiting on hash)",
                                         );
                                     } else {
                                         ui.colored_label(egui::Color32::GRAY, "No match");
                                     }
+                                    ui.end_row();
+                                } else if hashing_in_progress {
+                                    ui.label("Redump:");
+                                    ui.colored_label(
+                                        egui::Color32::LIGHT_GRAY,
+                                        "Searching… (waiting on hash)",
+                                    );
                                     ui.end_row();
                                 }
 
@@ -1774,5 +2015,30 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
             TextStyle::Heading.resolve(&ctx.global_style()),
             Color32::WHITE,
         );
+    }
+}
+
+/// Captured for one frame so the disc-info grid can render the hashing row
+/// without re-locking `hash_progress` mid-closure.
+struct HashRowSnapshot {
+    fraction: f32,
+    current_bytes: u64,
+    total_bytes: u64,
+    #[allow(dead_code)]
+    stage: String,
+    rate_suffix: String,
+}
+
+/// Map a redump match source to (badge color, human label).
+fn match_styling(source: crate::db::MatchSource) -> (egui::Color32, &'static str) {
+    use crate::db::MatchSource as M;
+    match source {
+        M::TrackSha1 | M::TrackMd5 | M::TrackCrc32 => {
+            (egui::Color32::GREEN, "Confirmed (hash)")
+        }
+        M::Serial => (egui::Color32::GREEN, "Confirmed (serial)"),
+        M::Barcode => (egui::Color32::GREEN, "Confirmed (barcode)"),
+        M::PvdVolumeId => (egui::Color32::YELLOW, "Likely (volume label)"),
+        M::FuzzyTitle => (egui::Color32::from_rgb(220, 200, 80), "Possible (title)"),
     }
 }

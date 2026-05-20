@@ -7,6 +7,7 @@
 //! ODE-specific logic (game title parsing, confidence scoring) lives here.
 
 pub mod browse;
+pub mod hasher;
 mod identifier;
 mod reader;
 
