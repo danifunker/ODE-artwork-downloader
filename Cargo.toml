@@ -36,10 +36,10 @@ headless_chrome = "1.0"
 # Encryption
 aes-gcm = "0.10"
 
-# Disc image formats (delegated to opticaldiscs). 0.4.0+ uses libchdman-rs
+# Disc image formats (delegated to opticaldiscs). 0.4.x uses libchdman-rs
 # under the hood for CHD reading, with `prebuilt` enabled so CI doesn't have
 # to compile MAME's C++.
-opticaldiscs = { git = "https://github.com/danifunker/opticaldiscs-rs", tag = "0.4.0", features = ["toc"] }
+opticaldiscs = { version = "0.4", features = ["toc"] }
 musicbrainz_rs = "0.13"
 
 # Redump SQLite lookup DB (download + open)
@@ -55,7 +55,10 @@ md-5 = "0.10"
 crc32fast = "1.4"
 # Direct CHD reader; uses the same prebuilt static lib opticaldiscs already
 # links, so this adds no compile-time cost.
-libchdman-rs = { git = "https://github.com/danifunker/libchdman-rs", tag = "v0.287.0-l6", features = ["prebuilt"] }
+# Note: 0.287.0-lN releases have a prerelease suffix, so the version must
+# be pinned exactly (no `^0.287` shorthand) until libchdman-rs ships a
+# non-prerelease version. Bump the exact pin when a new MAME release lands.
+libchdman-rs = { version = "=0.287.0-l7", features = ["prebuilt"] }
 # Temp scratch dir for CHD → BIN extraction during hashing.
 tempfile = "3"
 
