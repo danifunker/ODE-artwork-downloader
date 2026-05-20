@@ -169,23 +169,29 @@ impl BrowseView {
     }
 
     /// Render the browse view
-    pub fn show(&mut self, ui: &mut egui::Ui, disc_info: &DiscInfo) {
+    pub fn show(&mut self, ui: &mut egui::Ui, disc_info: &DiscInfo, panel_height: f32) {
         self.poll();
 
-        // Two-column layout: tree on left, content on right
-        ui.horizontal(|ui| {
-            // Left panel: file tree
-            ui.vertical(|ui| {
-                ui.set_min_width(300.0);
-                ui.set_max_width(400.0);
+        // `panel_height` is supplied by the caller (derived from the window size)
+        // rather than read from `ui.available_height()`, which returns the full
+        // viewport height and would make the panes ignore the window size.
+        let scroll_height = (panel_height - 50.0).max(120.0);
 
+        // Left panel: file tree. A resizable SidePanel lets the user drag the
+        // divider to give the content viewer more room.
+        egui::Panel::left("browse_tree_panel")
+            .resizable(true)
+            .default_size(320.0)
+            .size_range(200.0..=700.0)
+            .show_inside(ui, |ui| {
+                ui.set_min_height(panel_height);
                 ui.heading("Files");
                 ui.separator();
 
                 egui::ScrollArea::vertical()
                     .id_salt("file_tree")
                     .auto_shrink([false, false])
-                    .max_height(ui.available_height() - 50.0)
+                    .max_height(scroll_height)
                     .show(ui, |ui| {
                         if let Some(root) = self.root.clone() {
                             self.render_tree_entry(ui, &root, disc_info);
@@ -193,10 +199,10 @@ impl BrowseView {
                     });
             });
 
-            ui.separator();
-
-            // Right panel: content viewer
+        // Right panel: content viewer (fills remaining space).
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.vertical(|ui| {
+                ui.set_min_height(panel_height);
                 ui.heading("Content");
 
                 // View mode selector
@@ -287,13 +293,13 @@ impl BrowseView {
 
         match entry.entry_type {
             EntryType::Directory => {
-                let is_expanded = self.expanded_paths.contains(&path);
                 let has_children = self.directory_cache.contains_key(&path);
 
+                // Let the header track its own open/closed state so folders can be
+                // freely collapsed and re-expanded.
                 let header = egui::CollapsingHeader::new(&entry.name)
                     .id_salt(&path)
                     .default_open(path == "/")
-                    .open(if is_expanded { Some(true) } else { None })
                     .show(ui, |ui| {
                         if let Some(children) = self.directory_cache.get(&path).cloned() {
                             for child in children {

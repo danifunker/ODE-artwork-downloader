@@ -2,6 +2,7 @@
 //!
 //! Fetches image search results from DuckDuckGo and parses them for display.
 
+use crate::config::config_file_path;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -290,16 +291,17 @@ fn open_url_in_browser(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Save user agent to config.json
+/// Save user agent to the per-user `config.json`.
 pub fn save_user_agent_to_config(user_agent: &str) -> Result<(), String> {
-    let config_path = "config.json";
+    let config_path = config_file_path()?;
 
-    // Read existing config
-    let config_str = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config.json: {}", e))?;
-
-    let mut json: serde_json::Value = serde_json::from_str(&config_str)
-        .map_err(|e| format!("Failed to parse config.json: {}", e))?;
+    // Read existing config, or start fresh if it doesn't exist yet.
+    let mut json: serde_json::Value = match std::fs::read_to_string(&config_path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("Failed to parse config.json: {}", e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("Failed to read config.json: {}", e)),
+    };
 
     // Update or create the search.user_agent field
     if let Some(search) = json.get_mut("search") {
@@ -317,10 +319,10 @@ pub fn save_user_agent_to_config(user_agent: &str) -> Result<(), String> {
     let updated = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-    std::fs::write(config_path, updated)
+    std::fs::write(&config_path, updated)
         .map_err(|e| format!("Failed to write config.json: {}", e))?;
 
-    log::info!("Saved user agent to config.json");
+    log::info!("Saved user agent to {}", config_path.display());
     Ok(())
 }
 

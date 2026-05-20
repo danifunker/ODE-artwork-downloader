@@ -2,6 +2,7 @@
 //!
 //! Handles loading and managing configuration from config.json and secrets.json
 
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -12,6 +13,48 @@ static APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
 /// Global secrets
 static APP_SECRETS: OnceLock<AppSecrets> = OnceLock::new();
+
+/// Per-user config directory (e.g. ~/Library/Application Support/ODE-artwork-downloader
+/// on macOS). The directory is created on demand so callers can write into it
+/// immediately.
+pub fn config_dir() -> Result<PathBuf, String> {
+    let dirs = ProjectDirs::from("", "", "ODE-artwork-downloader")
+        .ok_or_else(|| "could not resolve a per-user config directory".to_string())?;
+    let dir = dirs.config_dir().to_path_buf();
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Canonical location of `config.json` under the per-user config directory.
+pub fn config_file_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("config.json"))
+}
+
+/// Canonical location of `secrets.json` under the per-user config directory.
+pub fn secrets_file_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("secrets.json"))
+}
+
+/// Update a single top-level field in `config.json`, preserving everything else.
+/// The file is created if it does not exist.
+pub fn save_config_field(key: &str, value: serde_json::Value) -> Result<(), String> {
+    let path = config_file_path()?;
+    let mut json: serde_json::Value = match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("Failed to parse config.json: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("Failed to read config.json: {e}")),
+    };
+    if !json.is_object() {
+        json = serde_json::json!({});
+    }
+    json[key] = value;
+    let updated = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    fs::write(&path, updated).map_err(|e| format!("Failed to write config.json: {e}"))?;
+    Ok(())
+}
 
 /// Get the global application config
 pub fn get_config() -> &'static AppConfig {
@@ -30,6 +73,13 @@ pub struct AppConfig {
     pub update_check: UpdateCheckConfig,
     #[serde(default)]
     pub discogs: DiscogsConfig,
+    /// UI log verbosity. One of: error, warn, info, debug, trace, off.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 /// Application secrets (loaded from secrets.json)
@@ -58,34 +108,38 @@ impl DiscogsSecrets {
 }
 
 impl AppSecrets {
-    /// Load secrets from secrets.json
+    /// Load secrets from the per-user `secrets.json`.
     pub fn load() -> Self {
-        // Try to load from current directory first
-        if let Ok(secrets) = Self::load_from_path("secrets.json") {
-            log::info!("Loaded secrets from ./secrets.json");
-            return secrets;
-        }
-
-        // Try to load from executable directory
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let secrets_path = exe_dir.join("secrets.json");
-                if let Ok(secrets) = Self::load_from_path(&secrets_path) {
-                    log::info!("Loaded secrets from {}", secrets_path.display());
-                    return secrets;
+        let path = match secrets_file_path() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("{e}; Discogs API will use anonymous access");
+                return Self::default();
+            }
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str::<AppSecrets>(&content) {
+                Ok(secrets) => {
+                    log::info!("Loaded secrets from {}", path.display());
+                    secrets
                 }
+                Err(e) => {
+                    log::warn!("Failed to parse {}: {e}", path.display());
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!(
+                    "No secrets.json at {}, Discogs API will use anonymous access",
+                    path.display()
+                );
+                Self::default()
+            }
+            Err(e) => {
+                log::warn!("Failed to read {}: {e}", path.display());
+                Self::default()
             }
         }
-
-        log::info!("No secrets.json found, Discogs API will use anonymous access");
-        Self::default()
-    }
-
-    fn load_from_path(path: impl Into<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = path.into();
-        let content = fs::read_to_string(&path)?;
-        let secrets: AppSecrets = serde_json::from_str(&content)?;
-        Ok(secrets)
     }
 }
 
@@ -162,38 +216,40 @@ impl Default for AppConfig {
         Self {
             update_check: UpdateCheckConfig::default(),
             discogs: DiscogsConfig::default(),
+            log_level: default_log_level(),
         }
     }
 }
 
 impl AppConfig {
-    /// Load configuration from config.json
+    /// Load configuration from the per-user `config.json`.
     pub fn load() -> Self {
-        // Try to load from current directory first
-        if let Ok(config) = Self::load_from_path("config.json") {
-            log::info!("Loaded config from ./config.json");
-            return config;
-        }
-
-        // Try to load from executable directory
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let config_path = exe_dir.join("config.json");
-                if let Ok(config) = Self::load_from_path(&config_path) {
-                    log::info!("Loaded config from {}", config_path.display());
-                    return config;
+        let path = match config_file_path() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("{e}; using default config");
+                return Self::default();
+            }
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
+                Ok(config) => {
+                    log::info!("Loaded config from {}", path.display());
+                    config
                 }
+                Err(e) => {
+                    log::warn!("Failed to parse {}: {e}", path.display());
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!("No config.json at {}, using defaults", path.display());
+                Self::default()
+            }
+            Err(e) => {
+                log::warn!("Failed to read {}: {e}", path.display());
+                Self::default()
             }
         }
-
-        log::info!("No config.json found, using defaults");
-        Self::default()
-    }
-
-    fn load_from_path(path: impl Into<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = path.into();
-        let content = fs::read_to_string(&path)?;
-        let config: AppConfig = serde_json::from_str(&content)?;
-        Ok(config)
     }
 }

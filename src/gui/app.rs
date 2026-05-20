@@ -49,6 +49,12 @@ pub struct App {
     manual_url: String,
     /// Whether to show the log window
     show_log_window: bool,
+    /// Whether to show the log settings dialog
+    show_log_settings: bool,
+    /// Whether to show the artwork search results / preview window
+    show_search_window: bool,
+    /// Current UI log level (one of error/warn/info/debug/trace/off)
+    log_level: String,
     /// Last preview error message
     preview_error: Option<String>,
     /// Update configuration
@@ -120,6 +126,9 @@ impl Default for App {
             search_query_text: String::new(),
             manual_url: String::new(),
             show_log_window: false,
+            show_log_settings: false,
+            show_search_window: false,
+            log_level: crate::config::get_config().log_level.clone(),
             preview_error: None,
             update_config: UpdateConfig::load(),
             update_receiver: None,
@@ -548,25 +557,29 @@ impl App {
         }
     }
 
-    /// Save search configuration to config.json
+    /// Save search configuration to the per-user `config.json`.
     fn save_search_config(&self) {
-        if let Ok(config_str) = std::fs::read_to_string("config.json") {
-            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                // Update the content_type field
-                if let Some(search) = json.get_mut("search") {
-                    if let Some(obj) = search.as_object_mut() {
-                        obj.insert(
-                            "content_type".to_string(),
-                            serde_json::Value::String(self.search_config.content_type.as_str().to_string())
-                        );
-                        
-                        // Write back to file
-                        if let Ok(updated) = serde_json::to_string_pretty(&json) {
-                            let _ = std::fs::write("config.json", updated);
-                        }
-                    }
-                }
-            }
+        let Ok(path) = crate::config::config_file_path() else { return };
+        let mut json: serde_json::Value = match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(_) => return,
+        };
+
+        let search = json
+            .as_object_mut()
+            .expect("config root is an object")
+            .entry("search".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = search.as_object_mut() {
+            obj.insert(
+                "content_type".to_string(),
+                serde_json::Value::String(self.search_config.content_type.as_str().to_string()),
+            );
+        }
+
+        if let Ok(updated) = serde_json::to_string_pretty(&json) {
+            let _ = std::fs::write(&path, updated);
         }
     }
 
@@ -580,6 +593,7 @@ impl App {
         self.search_results.clear();
         self.selected_image_index = None;
         self.search_receiver = Some(rx);
+        self.show_search_window = true;
 
         thread::spawn(move || {
             let result = crate::search::search_images_with_ua(&query, 20, user_agent.as_deref());
@@ -611,6 +625,7 @@ impl App {
         self.search_results.clear();
         self.selected_image_index = None;
         self.search_receiver = Some(rx);
+        self.show_search_window = true;
 
         thread::spawn(move || {
             // Query MusicBrainz for releases
@@ -1207,9 +1222,23 @@ impl eframe::App for App {
                 .default_size([500.0, 300.0])
                 .resizable(true)
                 .show(&ctx, |ui| {
-                    if ui.button("Clear").clicked() {
-                        self.log_messages.clear();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Clear").clicked() {
+                            self.log_messages.clear();
+                        }
+                        if ui.button("Copy").clicked() {
+                            let joined = self
+                                .log_messages
+                                .iter()
+                                .map(|m| m.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.ctx().copy_text(joined);
+                        }
+                        if ui.button("Settings").clicked() {
+                            self.show_log_settings = true;
+                        }
+                    });
                     ui.separator();
 
                     egui::ScrollArea::vertical()
@@ -1229,19 +1258,69 @@ impl eframe::App for App {
                 });
         }
 
+        // Log settings dialog
+        if self.show_log_settings {
+            let mut open = self.show_log_settings;
+            let mut new_level: Option<String> = None;
+            egui::Window::new("Log Settings")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("Log level:");
+                    egui::ComboBox::from_id_salt("log_level_combo")
+                        .selected_text(&self.log_level)
+                        .show_ui(ui, |ui| {
+                            for level in ["error", "warn", "info", "debug", "trace", "off"] {
+                                if ui
+                                    .selectable_label(self.log_level == level, level)
+                                    .clicked()
+                                {
+                                    new_level = Some(level.to_string());
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.label("Applies immediately and is saved to config.json.");
+                });
+            self.show_log_settings = open;
+            if let Some(level) = new_level {
+                self.log_level = level.clone();
+                log::set_max_level(crate::logging::ui_logger::parse_level(&level));
+                if let Err(e) = crate::config::save_config_field(
+                    "log_level",
+                    serde_json::Value::String(level),
+                ) {
+                    self.log(LogLevel::Error, format!("Failed to save log level: {e}"));
+                }
+            }
+        }
+
         // Browse window (for filesystem browsing)
         if self.show_browse_window {
             let disc_info_clone = self.disc_info.as_ref().and_then(|r| r.as_ref().ok()).cloned();
 
+            // Draw the window at 75% of the app's content area, and fill its
+            // interior to 95% of that so it reads as a floating window with a
+            // small margin rather than spilling past the app edges.
+            let app_rect = ctx.content_rect().size();
+            let default_w = (app_rect.x * 0.75).max(600.0);
+            let default_h = (app_rect.y * 0.75).max(400.0);
+
             egui::Window::new("Browse Disc Contents")
                 .open(&mut self.show_browse_window)
-                .default_size([900.0, 600.0])
+                .default_size([default_w, default_h])
                 .min_width(600.0)
                 .min_height(400.0)
                 .resizable(true)
                 .show(&ctx, |ui| {
+                    // Fill the interior to 95% of the window height; the inner
+                    // panes use this value directly so they neither collapse nor
+                    // overrun the window.
+                    let content_h = default_h * 0.95;
+                    ui.set_min_height(content_h);
                     if let Some(ref info) = disc_info_clone {
-                        self.browse_view.show(ui, info);
+                        self.browse_view.show(ui, info, content_h);
                     } else {
                         ui.label("No disc loaded");
                     }
@@ -1250,6 +1329,348 @@ impl eframe::App for App {
             // Clear browse view if window was closed
             if !self.show_browse_window {
                 self.browse_view.clear();
+            }
+        }
+
+        // Artwork Search window — opens automatically when a search is started.
+        if self.show_search_window {
+            // Pre-compute values needed by both the window UI and the post-render
+            // handlers, so we don't have to re-borrow `self.disc_info` inside the
+            // window closure (which already mutably borrows other fields of self).
+            let info_for_search: Option<DiscInfo> = self
+                .disc_info
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .cloned();
+            let default_query = info_for_search
+                .as_ref()
+                .map(|info| {
+                    ArtworkSearchQuery::from_disc_info_with_config(info, &self.search_config)
+                        .build_query()
+                })
+                .unwrap_or_default();
+            let use_musicbrainz = info_for_search
+                .as_ref()
+                .map(|i| i.toc.is_some())
+                .unwrap_or(false);
+            let disc_id = info_for_search
+                .as_ref()
+                .and_then(|i| i.toc.as_ref().map(|toc| toc.musicbrainz_id()));
+            let toc_string_for_browser = info_for_search
+                .as_ref()
+                .and_then(|i| i.toc.as_ref().map(|toc| toc.to_toc_string()));
+            let preview_loading = self.preview_loading;
+            let search_in_progress = self.search_in_progress;
+            let has_disc = info_for_search.is_some();
+
+            let mut content_type_changed = false;
+            let mut reset_query_clicked = false;
+            let mut search_clicked = false;
+            let mut browser_clicked = false;
+            let mut manual_preview_clicked = false;
+            let mut start_export_data: Option<(String, String)> = None;
+            let mut selected_idx_change: Option<usize> = None;
+
+            // Draw the window at 75% width / 85% height of the app's content
+            // area — sized so 20 results fill it without much dead space.
+            let app_rect = ctx.content_rect().size();
+            let default_w = (app_rect.x * 0.75).max(600.0);
+            let default_h = (app_rect.y * 0.85).max(500.0);
+
+            egui::Window::new("Artwork Search")
+                .open(&mut self.show_search_window)
+                .default_size([default_w, default_h])
+                .min_width(600.0)
+                .min_height(400.0)
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    // ---- Content type ----
+                    ui.horizontal(|ui| {
+                        ui.label("Content Type:");
+                        egui::ComboBox::new("search_window_content_type", "")
+                            .selected_text(self.search_config.content_type.display_name())
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::Any, "Any").clicked() { content_type_changed = true; }
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::Games, "Games").clicked() { content_type_changed = true; }
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::AppsUtilities, "Apps & Utilities").clicked() { content_type_changed = true; }
+                                if ui.selectable_value(&mut self.search_config.content_type, ContentType::AudioCDs, "Audio CDs").clicked() { content_type_changed = true; }
+                            });
+                    });
+
+                    ui.add_space(6.0);
+
+                    // ---- Search query (textbox + Reset on its own row so
+                    //      the trigger buttons below don't fight for width) ----
+                    ui.horizontal(|ui| {
+                        ui.label("Search:");
+                        let avail = ui.available_width() - 80.0; // Reset button + spacing
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query_text)
+                                .desired_width(avail.max(200.0))
+                                .hint_text("Refine search query..."),
+                        );
+                        if ui.button("Reset").clicked() {
+                            reset_query_clicked = true;
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // ---- Trigger buttons on their own row ----
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(!search_in_progress && has_disc, |ui| {
+                            let label = if use_musicbrainz { "Search MusicBrainz" } else { "Search" };
+                            if ui.button(label).clicked() { search_clicked = true; }
+                            if ui.button("Open in Browser").clicked() { browser_clicked = true; }
+                        });
+                        if search_in_progress {
+                            ui.spinner();
+                            ui.label("Searching...");
+                        }
+                    });
+
+                    ui.add_space(6.0);
+
+                    // ---- Manual URL ----
+                    ui.horizontal(|ui| {
+                        ui.label("Manual URL:");
+                        let avail = ui.available_width() - 95.0; // Preview button + spacing
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.manual_url)
+                                .desired_width(avail.max(160.0))
+                                .hint_text("Paste image URL here..."),
+                        );
+                        let can_preview_manual = !self.manual_url.is_empty() && !preview_loading;
+                        if ui.add_enabled(can_preview_manual, egui::Button::new("Preview")).clicked() {
+                            manual_preview_clicked = true;
+                        }
+                    });
+
+                    ui.separator();
+
+                    // ---- Results + preview pane ----
+                    ui.horizontal_top(|ui| {
+                        // Left: results list
+                        ui.vertical(|ui| {
+                            ui.heading("Search Results");
+                            if self.search_results.is_empty() {
+                                let msg = if search_in_progress { "Searching..." } else { "No results yet." };
+                                ui.colored_label(egui::Color32::GRAY, msg);
+                            } else {
+                                ui.label(format!(
+                                    "{} images - click to preview",
+                                    self.search_results.len()
+                                ));
+                            }
+                            ui.add_space(4.0);
+
+                            let results_height = ui.available_height().max(150.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("search_window_results")
+                                .auto_shrink([false, false])
+                                .max_height(results_height)
+                                .max_width(360.0)
+                                .show(ui, |ui| {
+                                    for (idx, result) in self.search_results.iter().enumerate() {
+                                        let is_selected = self.selected_image_index == Some(idx);
+                                        let truncated_title = if result.title.chars().count() > 40 {
+                                            format!("{}...", result.title.chars().take(40).collect::<String>())
+                                        } else {
+                                            result.title.clone()
+                                        };
+                                        let text = format!(
+                                            "{}. {} ({}x{})",
+                                            idx + 1,
+                                            truncated_title,
+                                            result.width.unwrap_or(0),
+                                            result.height.unwrap_or(0)
+                                        );
+
+                                        let response = ui.selectable_label(is_selected, &text);
+                                        if response.clicked() {
+                                            selected_idx_change = Some(idx);
+                                        }
+                                        let response = response.on_hover_text(&result.image_url);
+                                        response.context_menu(|ui| {
+                                            if ui.button("Copy URL to clipboard").clicked() {
+                                                ui.ctx().copy_text(result.image_url.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button("Open in browser").clicked() {
+                                                let _ = open_in_browser(&result.image_url);
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                });
+                        });
+
+                        ui.separator();
+
+                        // Right: preview
+                        ui.vertical(|ui| {
+                            ui.heading("Preview");
+
+                            if self.preview_loading {
+                                ui.add_space(20.0);
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Loading...");
+                                });
+                            } else if let Some(ref texture) = self.preview_texture {
+                                let size = texture.size_vec2();
+                                let max_size = 280.0;
+                                let scale = (max_size / size.x).min(max_size / size.y).min(1.0);
+                                let display_size = egui::vec2(size.x * scale, size.y * scale);
+
+                                let texture_id = texture.id();
+                                let img_width = size.x as u32;
+                                let img_height = size.y as u32;
+                                let can_download = self.selected_path.is_some()
+                                    && self.preview_url.is_some()
+                                    && !self.export_in_progress;
+                                let export_in_progress = self.export_in_progress;
+                                let output_path = self
+                                    .selected_path
+                                    .as_ref()
+                                    .map(|p| generate_output_path(p));
+                                let preview_url = self.preview_url.clone();
+
+                                ui.image((texture_id, display_size));
+                                ui.label(format!("{}x{}", img_width, img_height));
+                                ui.add_space(8.0);
+
+                                ui.add_enabled_ui(can_download, |ui| {
+                                    let btn_text = if export_in_progress {
+                                        "Downloading..."
+                                    } else {
+                                        "Download & Save"
+                                    };
+                                    if ui.button(btn_text).clicked() {
+                                        if let (Some(url), Some(path)) =
+                                            (preview_url.clone(), output_path.clone())
+                                        {
+                                            start_export_data = Some((url, path));
+                                        }
+                                    }
+                                });
+                                if export_in_progress {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Converting...");
+                                    });
+                                }
+                                if let Some(ref path) = output_path {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new("Save to:")
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(path)
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                            } else if let Some(ref error) = self.preview_error {
+                                ui.add_space(20.0);
+                                ui.colored_label(egui::Color32::RED, error);
+                                ui.add_space(10.0);
+                                ui.label("Tip: Download the image manually and drop it here");
+                                let output_path = self
+                                    .selected_path
+                                    .as_ref()
+                                    .map(|p| generate_output_path(p));
+                                if let Some(ref path) = output_path {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("Will save to: {}", path))
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                            } else {
+                                ui.add_space(20.0);
+                                ui.label("Select an image to preview");
+                            }
+                        });
+                    });
+                });
+
+            // ---- Handlers for the search window ----
+            if content_type_changed {
+                self.save_search_config();
+                self.update_search_query_from_disc();
+            }
+            if reset_query_clicked {
+                self.search_query_text = default_query;
+            }
+            if let Some(idx) = selected_idx_change {
+                self.selected_image_index = Some(idx);
+                let url = self.search_results.get(idx).map(|r| r.image_url.clone());
+                if let Some(url) = url {
+                    self.load_preview(&url);
+                }
+            }
+            if search_clicked {
+                let query_for_search = self.search_query_text.clone();
+                if use_musicbrainz {
+                    if let Some(ref id) = disc_id {
+                        self.log(
+                            LogLevel::Info,
+                            format!("Searching MusicBrainz for disc ID: {}", id),
+                        );
+                        let toc = info_for_search
+                            .as_ref()
+                            .and_then(|i| i.toc.as_ref())
+                            .map(|toc| toc.to_toc_string());
+                        self.start_musicbrainz_search(id, toc, Some(query_for_search.clone()));
+                    }
+                } else {
+                    self.log(LogLevel::Info, format!("Searching: {}", query_for_search));
+                    self.start_search(&query_for_search);
+                }
+            }
+            if browser_clicked {
+                let query_for_search = self.search_query_text.clone();
+                if use_musicbrainz {
+                    if let Some(ref id) = disc_id {
+                        let mut url = format!(
+                            "https://musicbrainz.org/ws/2/discid/{}?fmt=json&inc=artist-credits+release-groups",
+                            id
+                        );
+                        if let Some(ref toc_str) = toc_string_for_browser {
+                            url.push_str(&format!("&toc={}", toc_str));
+                        }
+                        self.log(LogLevel::Info, format!("Opening MusicBrainz: {}", url));
+                        if let Err(e) = open_in_browser(&url) {
+                            self.log(LogLevel::Error, e);
+                        }
+                    }
+                } else {
+                    let encoded = urlencoding::encode(&query_for_search);
+                    let browser_url = format!(
+                        "https://www.google.com/search?tbm=isch&tbs=iar:s&q={}",
+                        encoded
+                    );
+                    self.log(
+                        LogLevel::Info,
+                        format!("Opening browser: {}", query_for_search),
+                    );
+                    if let Err(e) = open_in_browser(&browser_url) {
+                        self.log(LogLevel::Error, e);
+                    }
+                }
+            }
+            if manual_preview_clicked {
+                let url = self.manual_url.clone();
+                if !url.is_empty() {
+                    self.load_preview(&url);
+                }
+            }
+            if let Some((url, path)) = start_export_data {
+                self.start_export(&url, &path);
             }
         }
 
@@ -1372,17 +1793,44 @@ impl eframe::App for App {
 
                 match &self.disc_info {
                     Some(Ok(info)) => {
+                        // Pre-compute scalar/cloned values used by both columns and
+                        // the click handlers below so we don't have to borrow `info`
+                        // (or `self`) inside the column closure.
+                        let search_query = ArtworkSearchQuery::from_disc_info_with_config(info, &self.search_config);
+                        let default_query = search_query.build_query();
+                        if self.search_query_text.is_empty() {
+                            self.search_query_text = default_query.clone();
+                        }
+                        let can_browse = info.filesystem != FilesystemType::Unknown;
+                        let use_musicbrainz = info.toc.is_some();
+                        let disc_id = info.toc.as_ref().map(|toc| toc.musicbrainz_id());
+                        let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
+                        let preview_loading = self.preview_loading;
+                        let search_in_progress = self.search_in_progress;
+
+                        let mut browse_clicked = false;
+                        let mut search_clicked = false;
+                        let mut browser_clicked = false;
+                        let mut manual_preview_clicked = false;
+                        let mut reset_query_clicked = false;
+
+                        // Stretch the value column so the table fills most of the
+                        // panel width instead of shrinking to its content.
+                        let value_col_w = (ui.available_width() - 200.0).max(320.0);
                         egui::Grid::new("disc_info_grid")
                             .num_columns(2)
                             .spacing([40.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.label("Volume Label:");
-                                if let Some(ref label) = info.volume_label {
-                                    ui.strong(label);
-                                } else {
-                                    ui.colored_label(egui::Color32::GRAY, "Not found");
-                                }
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(value_col_w);
+                                    if let Some(ref label) = info.volume_label {
+                                        ui.strong(label);
+                                    } else {
+                                        ui.colored_label(egui::Color32::GRAY, "Not found");
+                                    }
+                                });
                                 ui.end_row();
 
                                 ui.label("Format:");
@@ -1390,7 +1838,19 @@ impl eframe::App for App {
                                 ui.end_row();
 
                                 ui.label("Filesystem:");
-                                ui.label(info.filesystem.display_name());
+                                ui.horizontal(|ui| {
+                                    ui.label(info.filesystem.display_name());
+                                    if can_browse {
+                                        if ui.button("Browse Contents...").clicked() {
+                                            browse_clicked = true;
+                                        }
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::GRAY,
+                                            "(no browser)",
+                                        );
+                                    }
+                                });
                                 ui.end_row();
 
                                 ui.label("Confidence:");
@@ -1449,34 +1909,72 @@ impl eframe::App for App {
                                     if let Some(first) = matches.first() {
                                         let (color, label) = match_styling(first.matched_via);
                                         ui.vertical(|ui| {
-                                            ui.colored_label(
-                                                color,
-                                                format!(
-                                                    "{label}: {} (#{})",
-                                                    first.title, first.redump_id
-                                                ),
-                                            );
-                                            let mut details: Vec<String> = Vec::new();
-                                            if let Some(e) = first.edition.as_ref().filter(|s| !s.is_empty()) {
-                                                details.push(e.clone());
-                                            }
-                                            if let Some(v) = first.version.as_ref().filter(|s| !s.is_empty()) {
-                                                details.push(format!("v{v}"));
-                                            }
-                                            if let Some(m) = first.media.as_ref().filter(|s| !s.is_empty()) {
-                                                details.push(m.clone());
-                                            }
-                                            if !details.is_empty() {
+                                            // Header line: match badge + jump link.
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    color,
+                                                    format!(
+                                                        "{label}: {} (#{})",
+                                                        first.title, first.redump_id
+                                                    ),
+                                                );
+                                                ui.separator();
+                                                ui.hyperlink_to(
+                                                    "View on redump.org",
+                                                    &first.redump_url,
+                                                );
+                                            });
+                                            if let Some(ft) = first.foreign_title.as_ref().filter(|s| !s.is_empty()) {
                                                 ui.label(
-                                                    egui::RichText::new(details.join(" · "))
+                                                    egui::RichText::new(ft)
                                                         .small()
+                                                        .italics()
                                                         .color(egui::Color32::LIGHT_GRAY),
                                                 );
                                             }
-                                            ui.hyperlink_to(
-                                                "View on redump.org",
-                                                &first.redump_url,
-                                            );
+
+                                            // Structured fields, laid out as two
+                                            // key/value pairs per row so they spread
+                                            // horizontally instead of a tall column.
+                                            let present: Vec<(&str, &str)> = [
+                                                ("System", Some(first.system.as_str())),
+                                                ("Media", first.media.as_deref()),
+                                                ("Category", first.category.as_deref()),
+                                                ("Edition", first.edition.as_deref()),
+                                                ("Version", first.version.as_deref()),
+                                            ]
+                                            .into_iter()
+                                            .filter_map(|(k, v)| {
+                                                v.filter(|s| !s.is_empty()).map(|val| (k, val))
+                                            })
+                                            .collect();
+
+                                            if !present.is_empty() {
+                                                ui.add_space(6.0);
+                                                let cell = |ui: &mut egui::Ui, k: &str, v: &str| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!("{k}:"))
+                                                            .color(egui::Color32::GRAY),
+                                                    );
+                                                    ui.label(v);
+                                                };
+                                                egui::Grid::new(format!("redump_sub_{}", first.redump_id))
+                                                    .num_columns(4)
+                                                    .spacing([24.0, 6.0])
+                                                    .show(ui, |ui| {
+                                                        for pair in present.chunks(2) {
+                                                            cell(ui, pair[0].0, pair[0].1);
+                                                            if let Some(second) = pair.get(1) {
+                                                                cell(ui, second.0, second.1);
+                                                            } else {
+                                                                ui.label("");
+                                                                ui.label("");
+                                                            }
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            }
+
                                             if matches.len() > 1 {
                                                 ui.collapsing(
                                                     format!(
@@ -1583,23 +2081,72 @@ impl eframe::App for App {
                                     ui.label(format!("{:.2} GB", free_size as f64 / 1_073_741_824.0));
                                     ui.end_row();
                                 }
-                            });
+                                });
 
-                        ui.add_space(8.0);
+                        ui.add_space(12.0);
 
-                        // Browse contents button (for data discs with known filesystem)
-                        let can_browse = info.filesystem != FilesystemType::Unknown;
-                        let mut browse_clicked = false;
+                        // ---- Search controls (full width) — triggers the Artwork Search window
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(can_browse, egui::Button::new("Browse Contents")).clicked() {
-                                browse_clicked = true;
-                            }
-                            if !can_browse {
-                                ui.colored_label(egui::Color32::GRAY, "(Unknown filesystem)");
+                            ui.label("Search:");
+                            let avail = ui.available_width() - 70.0;
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.search_query_text)
+                                    .desired_width(avail.max(200.0))
+                                    .hint_text("Enter search query..."),
+                            );
+                            if ui.button("Reset").clicked() {
+                                reset_query_clicked = true;
                             }
                         });
 
-                        // Handle browse button - clone info to avoid borrow issues
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!search_in_progress, |ui| {
+                                let search_label = if use_musicbrainz {
+                                    "Search MusicBrainz"
+                                } else {
+                                    "Search"
+                                };
+                                if ui.button(search_label).clicked() {
+                                    search_clicked = true;
+                                }
+                                if ui.button("Open in Browser").clicked() {
+                                    browser_clicked = true;
+                                }
+                            });
+                            if search_in_progress {
+                                ui.spinner();
+                                ui.label("Searching...");
+                            }
+                        });
+
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Manual URL:");
+                            let avail = ui.available_width() - 90.0;
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.manual_url)
+                                    .desired_width(avail.max(200.0))
+                                    .hint_text("Paste image URL here..."),
+                            );
+                            let can_preview_manual =
+                                !self.manual_url.is_empty() && !preview_loading;
+                            if ui
+                                .add_enabled(can_preview_manual, egui::Button::new("Preview"))
+                                .clicked()
+                            {
+                                manual_preview_clicked = true;
+                            }
+                        });
+
+                        // ---- Click handlers (outside ui.columns so &mut self calls
+                        // don't fight with the column closure's field borrows) ----
+                        if reset_query_clicked {
+                            self.search_query_text = default_query.clone();
+                        }
+
                         if browse_clicked {
                             let info_clone = info.clone();
                             self.show_browse_window = true;
@@ -1622,84 +2169,41 @@ impl eframe::App for App {
                             }
                         }
 
-                        ui.add_space(16.0);
-
-                        // Prepare search query from disc info (clone to avoid borrow issues)
-                        let search_query = ArtworkSearchQuery::from_disc_info_with_config(info, &self.search_config);
-                        let default_query = search_query.build_query();
-
-                        // Initialize search query text if empty
-                        if self.search_query_text.is_empty() {
-                            self.search_query_text = default_query.clone();
-                        }
-
-                        // Editable search query
-                        ui.horizontal(|ui| {
-                            ui.label("Search:");
-                            ui.add(egui::TextEdit::singleline(&mut self.search_query_text)
-                                .desired_width(400.0)
-                                .hint_text("Enter search query..."));
-                            if ui.button("Reset").clicked() {
-                                self.search_query_text = default_query.clone();
-                            }
-                        });
-
-                        ui.add_space(8.0);
-
-                        // Action buttons
-                        let mut search_clicked = false;
-                        let mut browser_clicked = false;
-                        let query_for_search = self.search_query_text.clone();
-                        // Use MusicBrainz for any disc with audio tracks
-                        let use_musicbrainz = info.toc.is_some();
-                        let disc_id = info.toc.as_ref().map(|toc| toc.musicbrainz_id());
-                        let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
-
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(!self.search_in_progress, |ui| {
-                                let search_label = if use_musicbrainz {
-                                    "Search MusicBrainz"
-                                } else {
-                                    "Search"
-                                };
-                                
-                                if ui.button(search_label).clicked() {
-                                    search_clicked = true;
-                                }
-                                if ui.button("Open in Browser").clicked() {
-                                    browser_clicked = true;
-                                }
-                            });
-                            if self.search_in_progress {
-                                ui.spinner();
-                                ui.label("Searching...");
-                            }
-                        });
-
                         if search_clicked {
+                            let query_for_search = self.search_query_text.clone();
                             if use_musicbrainz {
                                 if let Some(ref id) = disc_id {
-                                    self.log(LogLevel::Info, format!("Searching MusicBrainz for disc ID: {}", id));
-                                    // Get TOC string if available
-                                    let toc = self.disc_info.as_ref()
+                                    self.log(
+                                        LogLevel::Info,
+                                        format!("Searching MusicBrainz for disc ID: {}", id),
+                                    );
+                                    let toc = self
+                                        .disc_info
+                                        .as_ref()
                                         .and_then(|result| result.as_ref().ok())
                                         .and_then(|info| info.toc.as_ref())
                                         .map(|toc| toc.to_toc_string());
-                                    // Pass fallback query for when MusicBrainz returns no results
-                                    self.start_musicbrainz_search(id, toc, Some(query_for_search.clone()));
+                                    self.start_musicbrainz_search(
+                                        id,
+                                        toc,
+                                        Some(query_for_search.clone()),
+                                    );
                                 } else {
                                     self.log(LogLevel::Error, "No disc ID available");
                                 }
                             } else {
-                                self.log(LogLevel::Info, format!("Searching: {}", query_for_search));
+                                self.log(
+                                    LogLevel::Info,
+                                    format!("Searching: {}", query_for_search),
+                                );
                                 self.start_search(&query_for_search);
                             }
                         }
 
                         if browser_clicked {
+                            let query_for_search = self.search_query_text.clone();
                             if use_musicbrainz {
                                 if let Some(ref id) = disc_id {
-                                    // Use the exact same URL as the API lookup
                                     let mut url = format!(
                                         "https://musicbrainz.org/ws/2/discid/{}?fmt=json&inc=artist-credits+release-groups",
                                         id
@@ -1707,41 +2211,29 @@ impl eframe::App for App {
                                     if let Some(ref toc_str) = toc_string_for_browser {
                                         url.push_str(&format!("&toc={}", toc_str));
                                     }
-                                    self.log(LogLevel::Info, format!("Opening MusicBrainz: {}", url));
+                                    self.log(
+                                        LogLevel::Info,
+                                        format!("Opening MusicBrainz: {}", url),
+                                    );
                                     if let Err(e) = open_in_browser(&url) {
                                         self.log(LogLevel::Error, e);
                                     }
                                 }
                             } else {
-                                // Build browser URL from current query
                                 let encoded = urlencoding::encode(&query_for_search);
-                                let browser_url = format!("https://www.google.com/search?tbm=isch&tbs=iar:s&q={}", encoded);
-                                self.log(LogLevel::Info, format!("Opening browser: {}", query_for_search));
+                                let browser_url = format!(
+                                    "https://www.google.com/search?tbm=isch&tbs=iar:s&q={}",
+                                    encoded
+                                );
+                                self.log(
+                                    LogLevel::Info,
+                                    format!("Opening browser: {}", query_for_search),
+                                );
                                 if let Err(e) = open_in_browser(&browser_url) {
                                     self.log(LogLevel::Error, e);
                                 }
                             }
                         }
-
-                        ui.add_space(8.0);
-
-                        // Manual URL override
-                        let mut manual_preview_clicked = false;
-                        let preview_loading = self.preview_loading;
-
-                        ui.horizontal(|ui| {
-                            ui.label("Manual URL:");
-                            let available_width = ui.available_width() - 80.0; // Reserve space for button
-                            ui.add(egui::TextEdit::singleline(&mut self.manual_url)
-                                .desired_width(available_width.max(200.0))
-                                .hint_text("Paste image URL here..."));
-
-                            let can_preview_manual = !self.manual_url.is_empty() && !preview_loading;
-
-                            if ui.add_enabled(can_preview_manual, egui::Button::new("Preview")).clicked() {
-                                manual_preview_clicked = true;
-                            }
-                        });
 
                         if manual_preview_clicked {
                             let url = self.manual_url.clone();
@@ -1750,9 +2242,7 @@ impl eframe::App for App {
                             }
                         }
 
-                        // Display search results
-                        let has_results = !self.search_results.is_empty();
-                        if has_results {
+                        if !self.search_results.is_empty() {
                             ui.add_space(8.0);
                         }
                     }
@@ -1783,184 +2273,6 @@ impl eframe::App for App {
                 }
             });
 
-            // Search results section - outside the group so it can expand
-            if !self.search_results.is_empty() {
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    // Left side: results list
-                    ui.vertical(|ui| {
-                        ui.heading("Search Results");
-                        ui.label(format!("{} images - click to preview", self.search_results.len()));
-                        ui.add_space(8.0);
-
-                        // Fixed height for ~10 results with scrolling
-                        let results_height = 280.0_f32.min(ui.available_height() - 50.0).max(150.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("search_results")
-                            .auto_shrink([false, false])
-                            .min_scrolled_height(results_height)
-                            .max_height(results_height)
-                            .max_width(420.0)
-                            .show(ui, |ui| {
-                                let mut clicked_idx = None;
-
-                                for (idx, result) in self.search_results.iter().enumerate() {
-                                    let is_selected = self.selected_image_index == Some(idx);
-                                    let truncated_title = if result.title.chars().count() > 50 {
-                                        format!("{}...", result.title.chars().take(50).collect::<String>())
-                                    } else {
-                                        result.title.clone()
-                                    };
-                                    let text = format!(
-                                        "{}. {} ({}x{})",
-                                        idx + 1,
-                                        truncated_title,
-                                        result.width.unwrap_or(0),
-                                        result.height.unwrap_or(0)
-                                    );
-
-                                    let response = ui.selectable_label(is_selected, &text);
-                                    if response.clicked() {
-                                        clicked_idx = Some(idx);
-                                    }
-
-                                    // Add hover text and context menu
-                                    let response = response.on_hover_text(&result.image_url);
-                                    response.context_menu(|ui| {
-                                        if ui.button("Copy URL to clipboard").clicked() {
-                                            ui.ctx().copy_text(result.image_url.clone());
-                                            ui.close();
-                                        }
-                                        if ui.button("Open in browser").clicked() {
-                                            let _ = open_in_browser(&result.image_url);
-                                            ui.close();
-                                        }
-                                    });
-                                }
-
-                                // Handle selection change
-                                if let Some(idx) = clicked_idx {
-                                    self.selected_image_index = Some(idx);
-                                    let url = self.search_results.get(idx).map(|r| r.image_url.clone());
-                                    if let Some(url) = url {
-                                        self.load_preview(&url);
-                                    }
-                                }
-                            });
-                    });
-
-                    ui.add_space(16.0);
-
-                    // Right side: preview
-                    ui.vertical(|ui| {
-                        ui.heading("Preview");
-
-                        if self.preview_loading {
-                            ui.add_space(50.0);
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Loading...");
-                            });
-                        } else if let Some(ref texture) = self.preview_texture {
-                            let size = texture.size_vec2();
-                            // Scale to fit in preview area (max 200x200)
-                            let max_size = 200.0;
-                            let scale = (max_size / size.x).min(max_size / size.y).min(1.0);
-                            let display_size = egui::vec2(size.x * scale, size.y * scale);
-
-                            // Clone data needed for closures before borrowing self
-                            let texture_id = texture.id();
-                            let img_width = size.x as u32;
-                            let img_height = size.y as u32;
-                            let can_download = self.selected_path.is_some()
-                                && self.preview_url.is_some()
-                                && !self.export_in_progress;
-                            let export_in_progress = self.export_in_progress;
-                            let output_path = self.selected_path.as_ref()
-                                .map(|p| generate_output_path(p));
-                            let preview_url = self.preview_url.clone();
-
-                            // Image and download button side by side
-                            let mut start_export_data: Option<(String, String)> = None;
-
-                            ui.horizontal(|ui| {
-                                // Image on the left
-                                ui.vertical(|ui| {
-                                    ui.image((texture_id, display_size));
-                                    // Show dimensions below image
-                                    ui.label(format!("{}x{}", img_width, img_height));
-                                });
-
-                                ui.add_space(16.0);
-
-                                // Download controls on the right
-                                ui.vertical(|ui| {
-                                    ui.add_enabled_ui(can_download, |ui| {
-                                        let btn_text = if export_in_progress {
-                                            "Downloading..."
-                                        } else {
-                                            "Download & Save"
-                                        };
-
-                                        if ui.button(btn_text).clicked() {
-                                            if let (Some(url), Some(path)) = (
-                                                preview_url.clone(),
-                                                output_path.clone(),
-                                            ) {
-                                                start_export_data = Some((url, path));
-                                            }
-                                        }
-                                    });
-
-                                    if export_in_progress {
-                                        ui.horizontal(|ui| {
-                                            ui.spinner();
-                                            ui.label("Converting...");
-                                        });
-                                    }
-
-                                    ui.add_space(8.0);
-
-                                    // Show where it will be saved
-                                    if let Some(ref path) = output_path {
-                                        ui.label(egui::RichText::new("Save to:")
-                                            .small()
-                                            .color(egui::Color32::GRAY));
-                                        ui.label(egui::RichText::new(path)
-                                            .small()
-                                            .color(egui::Color32::GRAY));
-                                    }
-                                });
-                            });
-
-                            // Handle export after closures
-                            if let Some((url, path)) = start_export_data {
-                                self.start_export(&url, &path);
-                            }
-                        } else if let Some(ref error) = self.preview_error {
-                            // Show error message
-                            ui.add_space(20.0);
-                            ui.colored_label(egui::Color32::RED, error);
-                            ui.add_space(10.0);
-                            ui.label("Tip: Download the image manually and drop it here");
-
-                            // Drop zone for manual image
-                            let output_path = self.selected_path.as_ref()
-                                .map(|p| generate_output_path(p));
-                            if let Some(ref path) = output_path {
-                                ui.add_space(10.0);
-                                ui.label(egui::RichText::new(format!("Will save to: {}", path))
-                                    .small()
-                                    .color(egui::Color32::GRAY));
-                            }
-                        } else {
-                            ui.add_space(50.0);
-                            ui.label("Select an image to preview");
-                        }
-                    });
-                });
-            }
         });
 
         // Show drag-and-drop preview

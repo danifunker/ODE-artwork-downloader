@@ -9,5 +9,6 @@ pub mod db;
 pub mod disc;
 pub mod export;
 pub mod gui;
+pub mod logging;
 pub mod search;
 pub mod update;

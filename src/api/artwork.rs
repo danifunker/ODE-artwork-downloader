@@ -2,6 +2,7 @@
 //!
 //! Provides cover art search using web image searches based on parsed filename information.
 
+use crate::config::config_file_path;
 use crate::disc::{DiscInfo, ParsedFilename};
 use std::path::Path;
 use regex::Regex;
@@ -78,8 +79,10 @@ impl ContentType {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        // Try to load from config.json
-        if let Ok(config_str) = std::fs::read_to_string("config.json") {
+        // Try to load from the per-user config.json
+        if let Ok(config_str) = config_file_path()
+            .and_then(|p| std::fs::read_to_string(&p).map_err(|e| e.to_string()))
+        {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
                 if let Some(search) = json.get("search") {
                     return Self {

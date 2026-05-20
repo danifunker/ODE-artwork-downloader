@@ -1,8 +1,8 @@
 //! Update checking functionality
 
+use crate::config::config_file_path;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateConfig {
@@ -52,31 +52,16 @@ impl Default for UpdateConfig {
 }
 
 impl UpdateConfig {
-    /// Load configuration from config.json
+    /// Load configuration from the per-user `config.json`.
     pub fn load() -> Self {
-        // Try to load from current directory first
-        if let Ok(config) = Self::load_from_path("config.json") {
-            return config;
+        let path = match config_file_path() {
+            Ok(p) => p,
+            Err(_) => return Self::default(),
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| Self::default()),
+            Err(_) => Self::default(),
         }
-
-        // Try to load from executable directory
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let config_path = exe_dir.join("config.json");
-                if let Ok(config) = Self::load_from_path(&config_path) {
-                    return config;
-                }
-            }
-        }
-
-        // Return default if no config found
-        Self::default()
-    }
-
-    fn load_from_path(path: impl Into<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = fs::read_to_string(path.into())?;
-        let config: UpdateConfig = serde_json::from_str(&content)?;
-        Ok(config)
     }
 }
 

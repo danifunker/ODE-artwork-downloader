@@ -8,13 +8,13 @@
 
 use eframe::egui;
 
-mod logging;
-
-use ode_artwork_downloader::gui;
+use ode_artwork_downloader::{gui, logging};
 
 fn main() -> eframe::Result<()> {
-    // Initialize the UI logger - logs will be forwarded to the GUI
-    let log_receiver = logging::ui_logger::UiLogger::init()
+    // Initialize the UI logger using the configured level (defaults to "info").
+    let initial_level =
+        logging::ui_logger::parse_level(&ode_artwork_downloader::config::get_config().log_level);
+    let log_receiver = logging::ui_logger::UiLogger::init(initial_level)
         .expect("Failed to initialize logger");
 
     // Store the receiver so the App can take it during initialization
@@ -37,8 +37,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([640.0, 480.0])
+            .with_inner_size([1000.0, 720.0])
+            .with_min_inner_size([720.0, 540.0])
             .with_drag_and_drop(true)
             .with_icon(icon_data),
         ..Default::default()

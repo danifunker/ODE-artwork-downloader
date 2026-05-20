@@ -1,41 +1,35 @@
 use log::{Log, Metadata, Record, SetLoggerError, LevelFilter};
-use std::sync::mpsc::{self, Sender, Receiver};
 use std::str::FromStr;
+use std::sync::mpsc::{self, Receiver, Sender};
+
+/// Parse a `LevelFilter` from a config string, falling back to `Info` for
+/// anything we don't recognize.
+pub fn parse_level(s: &str) -> LevelFilter {
+    LevelFilter::from_str(s).unwrap_or(LevelFilter::Info)
+}
 
 /// Simple logger that forwards formatted log lines into an mpsc channel.
+/// The active filter is controlled by `log::set_max_level`, so it can be
+/// updated at runtime without reinstalling the logger.
 pub struct UiLogger {
     sender: Sender<String>,
-    max_level: LevelFilter,
 }
 
 impl UiLogger {
-    /// Install the UI logger and return the receiver to read log lines from.
-    /// If `RUST_LOG` is not set this will set it to `debug` so the UI shows verbose logs.
-    pub fn init() -> Result<Receiver<String>, SetLoggerError> {
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "debug");
-        }
-
-        let max_level = std::env::var("RUST_LOG")
-            .ok()
-            .and_then(|s| LevelFilter::from_str(&s).ok())
-            .unwrap_or(LevelFilter::Debug);
-
+    /// Install the UI logger with the given initial max level and return the
+    /// receiver to read log lines from.
+    pub fn init(initial_level: LevelFilter) -> Result<Receiver<String>, SetLoggerError> {
         let (tx, rx) = mpsc::channel();
-        let logger = UiLogger {
-            sender: tx,
-            max_level,
-        };
-
+        let logger = UiLogger { sender: tx };
         log::set_boxed_logger(Box::new(logger))?;
-        log::set_max_level(max_level);
+        log::set_max_level(initial_level);
         Ok(rx)
     }
 }
 
 impl Log for UiLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.max_level
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
