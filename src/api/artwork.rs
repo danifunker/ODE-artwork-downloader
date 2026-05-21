@@ -436,15 +436,11 @@ impl ArtworkSearchQuery {
         });
 
         // Title selection. When a redump match is the source, it's
-        // authoritative — push the filename title to alt so the searcher can
-        // OR them. Otherwise keep the old Mac/volume preference logic.
+        // authoritative — use it alone and let the user tweak the search
+        // bar if MobyGames doesn't find it. Otherwise fall back to the
+        // old Mac/volume preference logic.
         let (title, alt_title) = if redump_title.is_some() {
-            let alt = if filename_title.eq_ignore_ascii_case(&processed_primary) {
-                None
-            } else {
-                Some(filename_title.clone())
-            };
-            (processed_primary, alt)
+            (processed_primary, None)
         } else {
             match (is_mac_game, &processed_volume) {
                 (true, Some(vol)) if vol.to_lowercase() != processed_primary.to_lowercase() => {
