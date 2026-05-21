@@ -12,6 +12,7 @@ pub mod hasher;
 mod identifier;
 pub mod layout;
 mod reader;
+pub mod set_membership;
 
 // Re-exports from opticaldiscs
 pub use opticaldiscs::formats::{supported_extensions, DiscFormat, FilesystemType};

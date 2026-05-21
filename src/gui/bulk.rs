@@ -196,6 +196,21 @@ impl BulkQueue {
         self.append_done(&entry)
     }
 
+    /// Mark an item by index (used when sibling auto-apply lands on queue
+    /// entries other than the active cursor). Caller is responsible for
+    /// constructing the entry.
+    pub fn record_at(
+        &mut self,
+        index: usize,
+        entry: DoneEntry,
+        status: ItemStatus,
+    ) -> std::io::Result<()> {
+        if let Some(slot) = self.statuses.get_mut(index) {
+            *slot = status;
+        }
+        self.append_done(&entry)
+    }
+
     fn append_done(&mut self, entry: &DoneEntry) -> std::io::Result<()> {
         if self.done_log.is_none() {
             let f = OpenOptions::new()

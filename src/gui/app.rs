@@ -7,7 +7,10 @@ use std::thread;
 
 use crate::api::{open_in_browser, ArtworkSearchQuery, SearchConfig, ContentType};
 use crate::disc::{supported_extensions, parse_filename, ConfidenceLevel, DiscInfo, DiscReader, DiscFormat, FilesystemType};
-use crate::export::{export_artwork, export_artwork_from_url, generate_output_path, ExportResult, ExportSettings};
+use crate::export::{
+    export_artwork, export_artwork_from_url_with_disc, generate_output_path, ExportResult,
+    ExportSettings,
+};
 use crate::search::ImageResult;
 use crate::update::{UpdateConfig, UpdateInfo};
 
@@ -1538,7 +1541,8 @@ impl App {
         }
     }
 
-    /// Start exporting artwork
+    /// Start exporting artwork. Reads the current disc's `disc_number` from
+    /// the parsed filename so discs 2+ pick up the "Disc N" overlay badge.
     fn start_export(&mut self, image_url: &str, output_path: &str) {
         let url = image_url.to_string();
         let path = output_path.to_string();
@@ -1548,13 +1552,168 @@ impl App {
         self.export_receiver = Some(rx);
         self.pending_export_url = Some(url.clone());
 
+        let (disc_number, disc_total) = self.current_disc_marker();
+
         self.log(LogLevel::Info, format!("Downloading and converting to {}", path));
 
         thread::spawn(move || {
             let settings = ExportSettings::default();
-            let result = export_artwork_from_url(&url, &path, &settings);
+            let result = export_artwork_from_url_with_disc(
+                &url, &path, &settings, disc_number, disc_total,
+            );
             let _ = tx.send(result);
         });
+    }
+
+    /// After a successful save, re-export the same image URL to every
+    /// multi-disc sibling of the current disc — same source, but each one
+    /// stamped with its own disc-number badge. In bulk mode, also marks
+    /// those siblings as `saved` in the queue + done log so we don't
+    /// prompt for them again. In single-disc mode this is "auto-fill the
+    /// rest of the set" after one user choice.
+    ///
+    /// Synchronous: this runs on the UI thread after the main download has
+    /// already cached the image. Each sibling re-fetches the same URL — a
+    /// minor inefficiency we accept rather than refactoring the export
+    /// pipeline to take pre-fetched bytes.
+    fn apply_to_siblings(&mut self, image_url: &str) {
+        let Some(selected) = self.selected_path.clone() else {
+            return;
+        };
+
+        // Build the sibling work-list from whichever source applies:
+        //   1. In bulk mode, the queue's same-set neighbors that haven't
+        //      been processed yet.
+        //   2. In single-disc mode, a directory scan.
+        let siblings: Vec<(std::path::PathBuf, u32)> = if self.bulk_queue.is_some() {
+            self.queue_siblings_for(&selected)
+        } else {
+            crate::disc::set_membership::siblings_in_dir(&selected)
+                .into_iter()
+                .map(|s| (s.path, s.disc_number))
+                .collect()
+        };
+
+        if siblings.is_empty() {
+            return;
+        }
+
+        let total = self.disc_info.as_ref().and_then(|r| r.as_ref().ok()).and_then(
+            |info| {
+                info.redump_matches
+                    .as_ref()
+                    .and_then(|ms| ms.first())
+                    .and_then(|m| crate::disc::set_membership::parse_disc_total(&m.title))
+            },
+        );
+
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Applying same artwork to {} multi-disc sibling(s) with per-disc badges",
+                siblings.len()
+            ),
+        );
+
+        let settings = ExportSettings::default();
+        for (sib_path, sib_num) in &siblings {
+            let out_path = generate_output_path(sib_path);
+            match export_artwork_from_url_with_disc(
+                image_url,
+                &out_path,
+                &settings,
+                Some(*sib_num),
+                total,
+            ) {
+                Ok(_) => self.log(
+                    LogLevel::Success,
+                    format!("  sibling Disc {sib_num}: saved to {out_path}"),
+                ),
+                Err(e) => self.log(
+                    LogLevel::Warning,
+                    format!("  sibling Disc {sib_num}: failed ({e})"),
+                ),
+            }
+        }
+
+        // For bulk mode, mark these sibling queue items as done so the
+        // user doesn't have to re-pick artwork for each.
+        if let Some(queue) = self.bulk_queue.as_mut() {
+            let now = super::bulk::now_iso8601();
+            for (sib_path, _) in &siblings {
+                let sib_file = sib_path.to_string_lossy().to_string();
+                let Some(idx) = queue.items.iter().position(|it| it.file == sib_file) else {
+                    continue;
+                };
+                let entry = super::bulk::DoneEntry {
+                    file: sib_file,
+                    status: "saved".to_string(),
+                    queue_redump_id: queue.items[idx].best.redump_id,
+                    hash_redump_id: None,
+                    image_url: Some(image_url.to_string()),
+                    ts: now.clone(),
+                };
+                if let Err(e) =
+                    queue.record_at(idx, entry, super::bulk::ItemStatus::Saved)
+                {
+                    log::warn!("sibling done-log write failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Find unfinished queue items whose disc file shares a set key with
+    /// `selected`. Returns (path, disc_number) pairs ready for export.
+    fn queue_siblings_for(
+        &self,
+        selected: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, u32)> {
+        let Some(queue) = self.bulk_queue.as_ref() else {
+            return Vec::new();
+        };
+        let Some(my_stem) = selected.file_stem().and_then(|s| s.to_str()) else {
+            return Vec::new();
+        };
+        let my_key = crate::disc::set_membership::set_key(my_stem);
+        let mut out = Vec::new();
+        for (idx, item) in queue.items.iter().enumerate() {
+            if queue.statuses[idx] != super::bulk::ItemStatus::Pending {
+                continue;
+            }
+            let path = std::path::PathBuf::from(&item.file);
+            if path == selected {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if crate::disc::set_membership::set_key(stem) != my_key {
+                continue;
+            }
+            let Some(num) = crate::disc::set_membership::disc_number_from_stem(stem)
+                .or_else(|| crate::disc::set_membership::disc_number_from_stem(&item.best.title))
+            else {
+                continue;
+            };
+            out.push((path, num));
+        }
+        out
+    }
+
+    /// Snapshot the current disc's `(Disc N)` marker for export-time badging.
+    /// Returns `(number, total)`. `total` is unknown unless the redump title
+    /// includes "Disc N of M" — common enough on multi-disc sets that we try.
+    fn current_disc_marker(&self) -> (Option<u32>, Option<u32>) {
+        let Some(Ok(info)) = self.disc_info.as_ref() else {
+            return (None, None);
+        };
+        let n = info.parsed_filename.disc_number;
+        let total = info
+            .redump_matches
+            .as_ref()
+            .and_then(|ms| ms.first())
+            .and_then(|m| crate::disc::set_membership::parse_disc_total(&m.title));
+        (n, total)
     }
 
     /// Convert a local image file (for drag-and-drop artwork)
@@ -1606,6 +1765,14 @@ impl App {
                         )
                     };
                     self.log(LogLevel::Success, msg);
+
+                    // Multi-disc siblings get the same image with their own
+                    // disc-number badge. Done before bulk-advance so the
+                    // queue cursor doesn't move past siblings we still need
+                    // to process.
+                    if let Some(url) = saved_url.clone() {
+                        self.apply_to_siblings(&url);
+                    }
 
                     // If we're in bulk mode, record the save and advance.
                     if self.bulk_queue.is_some() {

@@ -6,6 +6,9 @@
 use image::{DynamicImage, RgbImage};
 use std::path::Path;
 
+mod badge;
+pub use badge::format_label as format_disc_label;
+
 /// Target size for USBODE artwork
 pub const TARGET_SIZE: u32 = 240;
 
@@ -55,6 +58,19 @@ pub fn export_artwork<P: AsRef<Path>>(
     output_path: P,
     settings: &ExportSettings,
 ) -> Result<ExportResult, String> {
+    export_artwork_with_disc(image_data, output_path, settings, None, None)
+}
+
+/// Like `export_artwork`, but stamps a "Disc N" badge in the corner when
+/// `disc_number > 1`. Disc 1 (or unset) is left clean to match the
+/// historical "shared box art, numbered disc face" convention.
+pub fn export_artwork_with_disc<P: AsRef<Path>>(
+    image_data: &[u8],
+    output_path: P,
+    settings: &ExportSettings,
+    disc_number: Option<u32>,
+    disc_total: Option<u32>,
+) -> Result<ExportResult, String> {
     // Load the image
     let img = image::load_from_memory(image_data)
         .map_err(|e| format!("Failed to load image: {}", e))?;
@@ -71,8 +87,14 @@ pub fn export_artwork<P: AsRef<Path>>(
         image::imageops::FilterType::Lanczos3,
     );
 
+    // Apply disc-number badge for discs 2+. Disc 1 stays clean.
+    let stamped = match disc_number {
+        Some(n) if n > 1 => badge::apply_disc_badge(resized, n, disc_total),
+        _ => resized,
+    };
+
     // Convert to RGB
-    let rgb_image = resized.to_rgb8();
+    let rgb_image = stamped.to_rgb8();
 
     // Encode as baseline JPEG with specific settings
     let jpeg_data = encode_baseline_jpeg(&rgb_image, settings.quality)?;
@@ -96,11 +118,20 @@ pub fn export_artwork_from_url<P: AsRef<Path>>(
     output_path: P,
     settings: &ExportSettings,
 ) -> Result<ExportResult, String> {
-    // Fetch the image
-    let image_data = fetch_image(url)?;
+    export_artwork_from_url_with_disc(url, output_path, settings, None, None)
+}
 
-    // Export it
-    export_artwork(&image_data, output_path, settings)
+/// Like `export_artwork_from_url`, but stamps a disc-number badge when
+/// `disc_number > 1`.
+pub fn export_artwork_from_url_with_disc<P: AsRef<Path>>(
+    url: &str,
+    output_path: P,
+    settings: &ExportSettings,
+    disc_number: Option<u32>,
+    disc_total: Option<u32>,
+) -> Result<ExportResult, String> {
+    let image_data = fetch_image(url)?;
+    export_artwork_with_disc(&image_data, output_path, settings, disc_number, disc_total)
 }
 
 /// Fetch image data from a URL
