@@ -276,8 +276,15 @@ jobs:
             codesign --force --deep --sign - "${BUNDLE_NAME}"
           fi
 
+          # Stage DMG contents with an /Applications symlink for easy install
+          DMG_STAGE="dmg-stage"
+          rm -rf "${DMG_STAGE}"
+          mkdir -p "${DMG_STAGE}"
+          cp -R "${BUNDLE_NAME}" "${DMG_STAGE}/"
+          ln -s /Applications "${DMG_STAGE}/Applications"
+
           # Create DMG
-          hdiutil create -volname "${APP_NAME}" -srcfolder "${BUNDLE_NAME}" -ov -format UDZO "OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGE}" -ov -format UDZO "OAD-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
 
           # Sign the DMG as well if certificate is available
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
