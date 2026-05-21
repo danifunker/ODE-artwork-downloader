@@ -89,6 +89,21 @@ pub struct App {
     hash_receiver: Option<Receiver<Result<crate::disc::hasher::TrackHashes, String>>>,
     /// Rolling rate/ETA estimator for the active hashing job
     hash_rate_tracker: super::progress::RateTracker,
+    /// Active bulk-processing queue, or `None` when not in bulk mode.
+    bulk_queue: Option<super::bulk::BulkQueue>,
+    /// In-flight loader dialog state for "Open Bulk Job…".
+    bulk_loader: Option<BulkLoaderDialog>,
+}
+
+/// Modal state for the bulk-job loader: pending file the user picked, plus
+/// the "reprocess existing art" toggle and any parse error to surface.
+struct BulkLoaderDialog {
+    path: PathBuf,
+    item_count: usize,
+    /// Items already present in the sidecar `.done.jsonl` log.
+    resumed_count: usize,
+    reprocess_existing: bool,
+    error: Option<String>,
 }
 
 /// A log message with severity level
@@ -146,6 +161,8 @@ impl Default for App {
             hash_progress: None,
             hash_receiver: None,
             hash_rate_tracker: super::progress::RateTracker::default(),
+            bulk_queue: None,
+            bulk_loader: None,
         }
     }
 }
@@ -567,6 +584,180 @@ impl App {
         // displayed; when hashing finishes we'll re-run the cascade with the
         // hash tier active and refresh `redump_matches`.
         self.start_hashing();
+    }
+
+    /// Prompt the user for a `fuzzy_scan --queue` JSON file and stage it in
+    /// the loader dialog. The actual queue activation happens when they
+    /// click "Start" in the dialog.
+    fn open_bulk_job_picker(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Queue JSON", &["json"])
+            .add_filter("All Files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        // Cheap pre-parse to surface item count and parse errors in the
+        // dialog before the user commits.
+        let (items, error) = match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<Vec<super::bulk::QueueItem>>(&raw) {
+                Ok(items) => (items, None),
+                Err(e) => (Vec::new(), Some(format!("parse error: {e}"))),
+            },
+            Err(e) => (Vec::new(), Some(format!("read error: {e}"))),
+        };
+
+        // Count items already in the sidecar log so the dialog can show
+        // "X of N already done" before the user commits.
+        let resumed_count = count_resumed(&path, &items);
+
+        self.bulk_loader = Some(BulkLoaderDialog {
+            path,
+            item_count: items.len(),
+            resumed_count,
+            reprocess_existing: false,
+            error,
+        });
+    }
+
+    /// Activate the queue using the staged loader dialog. Closes the dialog.
+    fn start_bulk_job(&mut self) {
+        let Some(dialog) = self.bulk_loader.take() else {
+            return;
+        };
+        match super::bulk::BulkQueue::load(dialog.path.clone(), dialog.reprocess_existing) {
+            Ok(queue) => {
+                self.log(
+                    LogLevel::Success,
+                    format!(
+                        "Bulk job loaded: {} item(s), {} already done",
+                        queue.total(),
+                        queue.finished_count()
+                    ),
+                );
+                self.bulk_queue = Some(queue);
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, format!("Bulk job load failed: {e}"));
+            }
+        }
+    }
+
+    /// Exit bulk mode without affecting the sidecar log.
+    fn close_bulk_job(&mut self) {
+        if self.bulk_queue.is_some() {
+            self.log(LogLevel::Info, "Bulk job closed".to_string());
+        }
+        self.bulk_queue = None;
+    }
+
+    /// Render the bulk loader modal when one is staged. Returns whether the
+    /// user committed (so callers can chain `start_bulk_job`).
+    fn render_bulk_loader(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.bulk_loader.as_mut() else {
+            return;
+        };
+        let mut start_clicked = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("Open Bulk Job")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("File: {}", dialog.path.display()));
+                ui.add_space(6.0);
+                if let Some(err) = &dialog.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                } else {
+                    ui.label(format!("Items: {}", dialog.item_count));
+                    if dialog.resumed_count > 0 {
+                        ui.label(format!(
+                            "Already done (will skip): {}",
+                            dialog.resumed_count
+                        ));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut dialog.reprocess_existing,
+                    "Reprocess discs that already have artwork",
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let can_start = dialog.error.is_none() && dialog.item_count > 0;
+                    if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
+                        start_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if start_clicked {
+            self.start_bulk_job();
+        } else if cancel_clicked {
+            self.bulk_loader = None;
+        }
+    }
+
+    /// Inline top banner shown above the central panel content when bulk
+    /// mode is active. The per-item drive (auto-load, auto-search,
+    /// save/skip/back) lands in a later phase; this banner is the visual
+    /// hook for it.
+    fn render_bulk_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(queue) = self.bulk_queue.as_ref() else {
+            return;
+        };
+        let total = queue.total();
+        let done = queue.finished_count();
+        let current = queue.current().map(|it| it.file.clone());
+        let title = queue
+            .current()
+            .map(|it| it.best.title.clone())
+            .unwrap_or_default();
+        let cursor = queue.cursor;
+        let complete = queue.is_complete();
+
+        let mut exit_clicked = false;
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(if complete {
+                        "Bulk job — complete"
+                    } else {
+                        "Bulk mode"
+                    });
+                    ui.separator();
+                    ui.label(format!("{done} / {total} done"));
+                    ui.separator();
+                    if let Some(file) = current {
+                        let stem = std::path::Path::new(&file)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&file);
+                        ui.label(format!("[{}] {}", cursor + 1, stem));
+                        if !title.is_empty() {
+                            ui.weak("→");
+                            ui.label(title);
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Exit bulk").clicked() {
+                            exit_clicked = true;
+                        }
+                    });
+                });
+            });
+
+        ui.add_space(4.0);
+
+        if exit_clicked {
+            self.close_bulk_job();
+        }
     }
 
     /// Open file picker dialog
@@ -1150,6 +1341,34 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Failed to read image bytes: {}", e))
 }
 
+/// Count how many of `items` are already present in the sidecar `.done.jsonl`
+/// next to `job_path`. Used by the bulk loader dialog to show resume info.
+fn count_resumed(job_path: &std::path::Path, items: &[super::bulk::QueueItem]) -> usize {
+    use std::io::{BufRead, BufReader};
+    let mut sidecar = job_path.to_path_buf();
+    let name = job_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| format!("{s}.done.jsonl"))
+        .unwrap_or_else(|| "queue.done.jsonl".to_string());
+    sidecar.set_file_name(name);
+
+    let Ok(file) = std::fs::File::open(&sidecar) else {
+        return 0;
+    };
+    let mut done_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<super::bulk::DoneEntry>(trimmed) {
+            done_files.insert(entry.file);
+        }
+    }
+    items.iter().filter(|it| done_files.contains(&it.file)).count()
+}
+
 /// Load image from bytes into egui ColorImage
 fn load_image_from_bytes(bytes: &[u8]) -> Result<egui::ColorImage, String> {
     let image = image::load_from_memory(bytes)
@@ -1189,6 +1408,13 @@ impl eframe::App for App {
 
         // Poll the track-hashing worker
         self.poll_hash();
+
+        // Bulk-job loader modal (rendered as a centered Window). Independent
+        // of the central-panel ui, so render through the context.
+        self.render_bulk_loader(&ctx);
+
+        // Top-of-central banner when bulk mode is active.
+        self.render_bulk_banner(ui);
 
         // Request repaint while loading
         if self.search_in_progress || self.preview_loading || self.export_in_progress || self.user_agent_capture_in_progress || self.hash_progress.is_some() {
@@ -1721,9 +1947,14 @@ impl eframe::App for App {
                     ui.heading("File Selection");
                     ui.add_space(8.0);
 
-                    if ui.button("Browse...").clicked() {
-                        self.open_file_picker();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Browse...").clicked() {
+                            self.open_file_picker();
+                        }
+                        if ui.button("Bulk Job...").clicked() {
+                            self.open_bulk_job_picker();
+                        }
+                    });
 
                     ui.add_space(8.0);
 
