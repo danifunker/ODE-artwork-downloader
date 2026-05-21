@@ -395,7 +395,17 @@ impl ArtworkSearchQuery {
 
     /// Create a search query from disc info with custom config
     pub fn from_disc_info_with_config(info: &DiscInfo, config: &SearchConfig) -> Self {
+        // Prefer the matched redump title when one is available — it's the
+        // canonical, normalized name ("Star Trek: Judgment Rites") whereas
+        // the filename can be a scene-style code ("STJRCOLLD1"). Falls
+        // back to the parsed filename title for unmatched discs.
+        let redump_title = info
+            .redump_matches
+            .as_ref()
+            .and_then(|ms| ms.first())
+            .map(|m| clean_redump_title(&m.title));
         let filename_title = info.parsed_filename.title.clone();
+        let primary_title = redump_title.clone().unwrap_or_else(|| filename_title.clone());
 
         // Detect if this is a Mac game based on:
         // 1. Filesystem type (HFS or HFS+)
@@ -415,8 +425,9 @@ impl ArtworkSearchQuery {
             }
         });
 
-        // Process the filename title
-        let (processed_filename, publisher_from_filename) = Self::process_title(&filename_title, config);
+        // Process the primary title (redump-matched if available, else filename).
+        let (processed_primary, publisher_from_primary) =
+            Self::process_title(&primary_title, config);
 
         // Process the volume title if available
         let processed_volume = volume_title.as_ref().map(|vol| {
@@ -424,20 +435,27 @@ impl ArtworkSearchQuery {
             processed
         });
 
-        // For Mac games, prefer volume label over filename (if available)
-        // For other games, use filename as primary, volume label as alt
-        let (title, alt_title) = match (is_mac_game, &processed_volume) {
-            // Mac game with volume label: use volume label as primary
-            (true, Some(vol)) if vol.to_lowercase() != processed_filename.to_lowercase() => {
-                (vol.clone(), Some(processed_filename.clone()))
+        // Title selection. When a redump match is the source, it's
+        // authoritative — push the filename title to alt so the searcher can
+        // OR them. Otherwise keep the old Mac/volume preference logic.
+        let (title, alt_title) = if redump_title.is_some() {
+            let alt = if filename_title.eq_ignore_ascii_case(&processed_primary) {
+                None
+            } else {
+                Some(filename_title.clone())
+            };
+            (processed_primary, alt)
+        } else {
+            match (is_mac_game, &processed_volume) {
+                (true, Some(vol)) if vol.to_lowercase() != processed_primary.to_lowercase() => {
+                    (vol.clone(), Some(processed_primary.clone()))
+                }
+                (_, Some(vol)) if vol.to_lowercase() != processed_primary.to_lowercase() => {
+                    (processed_primary.clone(), Some(vol.clone()))
+                }
+                (_, Some(vol)) => (vol.clone(), None),
+                (_, None) => (processed_primary, None),
             }
-            // Non-Mac or same title: use filename as primary, volume as alt if different
-            (_, Some(vol)) if vol.to_lowercase() != processed_filename.to_lowercase() => {
-                (processed_filename.clone(), Some(vol.clone()))
-            }
-            // Same title or no volume: just use one
-            (_, Some(vol)) => (vol.clone(), None),
-            (_, None) => (processed_filename, None),
         };
 
         // Detect platform from file path
@@ -450,7 +468,7 @@ impl ArtworkSearchQuery {
             platform,
             year: info.parsed_filename.year,
             search_suffix: Self::build_default_suffix(config, Some(&info.parsed_filename.original)),
-            publisher: publisher_from_filename,
+            publisher: publisher_from_primary,
             original_filename: Some(info.parsed_filename.original.clone()),
             is_mac_game,
             content_type: config.content_type,
@@ -528,6 +546,21 @@ impl ArtworkSearchQuery {
 /// Detect platform from file path
 ///
 /// Looks for platform indicators in the directory path.
+/// Strip trailing parenthetical and bracket tags from a redump-style title
+/// so it works as a search string. "Star Trek: Judgment Rites (Disc 1)" →
+/// "Star Trek: Judgment Rites". Preserves colons and other in-title
+/// punctuation; only repeated `( ... )` / `[ ... ]` groups are dropped.
+fn clean_redump_title(title: &str) -> String {
+    static PAREN_TAGS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\s*\([^)]*\)|\s*\[[^\]]*\]").unwrap()
+        });
+    PAREN_TAGS
+        .replace_all(title, "")
+        .trim()
+        .to_string()
+}
+
 fn detect_platform_from_path(path: &Path) -> Option<String> {
     let path_str = path.to_string_lossy().to_lowercase();
 

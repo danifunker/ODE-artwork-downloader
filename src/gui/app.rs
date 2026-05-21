@@ -2291,10 +2291,10 @@ impl eframe::App for App {
                 })
                 .unwrap_or_default();
             // Only treat the disc as a MusicBrainz target when it looks like
-            // a pure audio CD: a TOC is present, but no data filesystem was
-            // detected (no PVD, no HFS/HFS+). A BIN/CUE or CHD of a data
-            // game has a TOC too, and we shouldn't make the user click
-            // through a useless MB lookup for that.
+            // a pure audio CD: a TOC is present, no data filesystem was
+            // detected (no PVD, no HFS/HFS+), AND no redump match was found
+            // (redump's PC/Mac catalog is data-only, so a hit there is
+            // strong evidence this isn't an audio CD).
             let use_musicbrainz = info_for_search
                 .as_ref()
                 .map(|i| {
@@ -2302,6 +2302,10 @@ impl eframe::App for App {
                         && i.pvd.is_none()
                         && i.hfs_mdb.is_none()
                         && i.hfsplus_header.is_none()
+                        && i.redump_matches
+                            .as_ref()
+                            .map(|ms| ms.is_empty())
+                            .unwrap_or(true)
                 })
                 .unwrap_or(false);
             let disc_id = info_for_search
@@ -2771,7 +2775,12 @@ impl eframe::App for App {
                         let use_musicbrainz = info.toc.is_some()
                             && info.pvd.is_none()
                             && info.hfs_mdb.is_none()
-                            && info.hfsplus_header.is_none();
+                            && info.hfsplus_header.is_none()
+                            && info
+                                .redump_matches
+                                .as_ref()
+                                .map(|ms| ms.is_empty())
+                                .unwrap_or(true);
                         let disc_id = info.toc.as_ref().map(|toc| toc.musicbrainz_id());
                         let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
                         let preview_loading = self.preview_loading;
