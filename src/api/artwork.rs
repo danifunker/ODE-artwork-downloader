@@ -429,6 +429,14 @@ impl ArtworkSearchQuery {
         let (processed_primary, publisher_from_primary) =
             Self::process_title(&primary_title, config);
 
+        // Also probe the filename title for a publisher — redump-matched titles
+        // (e.g. "Star Trek: Generations") don't carry the publisher, but the
+        // scene filename usually does ("…(MicroProse)…"). When we have both,
+        // prefer the redump-source publisher (which came from the
+        // authoritative title); fall back to the filename one.
+        let (_, publisher_from_filename) = Self::process_title(&filename_title, config);
+        let publisher = publisher_from_primary.or(publisher_from_filename);
+
         // Process the volume title if available
         let processed_volume = volume_title.as_ref().map(|vol| {
             let (processed, _) = Self::process_title(vol, config);
@@ -464,7 +472,7 @@ impl ArtworkSearchQuery {
             platform,
             year: info.parsed_filename.year,
             search_suffix: Self::build_default_suffix(config, Some(&info.parsed_filename.original)),
-            publisher: publisher_from_primary,
+            publisher,
             original_filename: Some(info.parsed_filename.original.clone()),
             is_mac_game,
             content_type: config.content_type,
@@ -491,10 +499,31 @@ impl ArtworkSearchQuery {
 
     /// Build the full search query string
     pub fn build_query(&self) -> String {
-        // For Games content type, use a simpler query format
+        // For Games content type, keep the query compact but include the
+        // metadata we parsed from the filename — year, publisher, region —
+        // when available. The redump-matched title is the canonical name
+        // but doesn't carry that context, and the filename almost always
+        // does. Adding it helps MobyGames disambiguate sequels / re-releases.
         if self.content_type == ContentType::Games {
             let platform = if self.is_mac_game { "mac" } else { "pc" };
-            return format!("\"{}\" case {} site:mobygames.com", self.title, platform);
+            let mut q = format!("\"{}\"", self.title);
+            if let Some(ref publisher) = self.publisher {
+                q.push_str(&format!(" \"{publisher}\""));
+            }
+            if let Some(year) = self.year {
+                q.push_str(&format!(" {year}"));
+            }
+            if let Some(ref region) = self.region {
+                let region_term = match region.to_uppercase().as_str() {
+                    "USA" | "NTSC-U" => "USA",
+                    "EUROPE" | "PAL" | "PAL-E" => "Europe",
+                    "JAPAN" | "NTSC-J" => "Japan",
+                    _ => region.as_str(),
+                };
+                q.push_str(&format!(" {region_term}"));
+            }
+            q.push_str(&format!(" case {platform} site:mobygames.com"));
+            return q;
         }
 
         // For other content types, use the full query format
