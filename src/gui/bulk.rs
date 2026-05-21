@@ -8,6 +8,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use std::cmp::Ordering;
+
 use serde::{Deserialize, Serialize};
 
 /// Mirrors `fuzzy_scan::Record`. Kept independent so the GUI doesn't depend on
@@ -76,13 +78,17 @@ pub struct BulkQueue {
 }
 
 impl BulkQueue {
-    /// Read the job JSON and a sibling `<job>.done.jsonl` if present.
-    /// `reprocess_existing` is set at load time and is fixed for the session.
-    pub fn load(job_path: PathBuf, reprocess_existing: bool) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(&job_path)
-            .map_err(|e| format!("read {}: {e}", job_path.display()))?;
-        let items: Vec<QueueItem> = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", job_path.display()))?;
+    /// Read the job file and a sibling `<job>.done.jsonl` if present. Accepts
+    /// either the native queue JSON (a `Vec<QueueItem>`) or the flat-CSV
+    /// fuzzy_scan output, which is grouped into QueueItems on the fly.
+    /// `reprocess_existing` and `filter` are set at load time and are fixed
+    /// for the session.
+    pub fn load(
+        job_path: PathBuf,
+        reprocess_existing: bool,
+        filter: &QueueFilter,
+    ) -> Result<Self, String> {
+        let items = parse_queue_file(&job_path, filter)?;
         if items.is_empty() {
             return Err("queue file contains zero items".to_string());
         }
@@ -205,6 +211,317 @@ impl BulkQueue {
         }
         Ok(())
     }
+}
+
+/// Filter knobs applied when parsing/reading a queue source. The bulk loader
+/// dialog populates this from its checkboxes/sliders, so the user can broaden
+/// or tighten the queue before committing.
+#[derive(Clone, Debug)]
+pub struct QueueFilter {
+    /// When false (default), drop any item whose chosen best record has
+    /// `match_type == "fuzzy"`. Exact and musicbrainz tiers are always kept.
+    pub include_fuzzy: bool,
+    /// When `include_fuzzy` is true, drop fuzzy records below this score.
+    /// Ignored when `include_fuzzy` is false.
+    pub fuzzy_min_score: f64,
+}
+
+impl Default for QueueFilter {
+    fn default() -> Self {
+        Self {
+            include_fuzzy: false,
+            fuzzy_min_score: 0.85,
+        }
+    }
+}
+
+/// Read either a native `--queue` JSON file or a flat `fuzzy_scan` CSV
+/// (the default output mode), returning the grouped queue. CSV grouping
+/// mirrors fuzzy_scan::group_into_queue so both paths produce identical
+/// QueueItems for the same set of records.
+///
+/// `filter` is applied *after* grouping: items whose best record fails the
+/// filter (e.g. a low-confidence fuzzy with `include_fuzzy = false`) are
+/// dropped. Alternates are also filtered so the user doesn't see junk when
+/// flipping to a different candidate.
+pub fn parse_queue_file(path: &Path, filter: &QueueFilter) -> Result<Vec<QueueItem>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let is_csv = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("csv"))
+        .unwrap_or(false);
+    let mut items = if is_csv {
+        let records = parse_fuzzy_scan_csv(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        group_records(records)
+    } else if let Ok(items) = serde_json::from_str::<Vec<QueueItem>>(&raw) {
+        items
+    } else {
+        let records: Vec<Record> = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        group_records(records)
+    };
+
+    apply_filter(&mut items, filter);
+    Ok(items)
+}
+
+fn record_passes(r: &Record, filter: &QueueFilter) -> bool {
+    match r.match_type.as_str() {
+        "exact" | "musicbrainz" => true,
+        "fuzzy" => {
+            filter.include_fuzzy
+                && r.score
+                    .map(|s| s >= filter.fuzzy_min_score)
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn apply_filter(items: &mut Vec<QueueItem>, filter: &QueueFilter) {
+    items.retain_mut(|it| {
+        it.alternates.retain(|r| record_passes(r, filter));
+        if record_passes(&it.best, filter) {
+            return true;
+        }
+        // The best failed the filter — promote the strongest surviving
+        // alternate (if any) so the item stays in the queue.
+        if let Some(promoted) = it.alternates.first().cloned() {
+            it.best = promoted;
+            it.alternates.remove(0);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn rank_record(r: &Record) -> u8 {
+    match r.match_type.as_str() {
+        "exact" => 0,
+        "musicbrainz" => 1,
+        "fuzzy" => 2,
+        _ => 3,
+    }
+}
+
+/// Same grouping/ranking as fuzzy_scan's --queue writer: order preserved by
+/// first appearance of each `file`, intra-file rows sorted exact > MB >
+/// fuzzy-by-score-desc, files with no usable records dropped.
+fn group_records(records: Vec<Record>) -> Vec<QueueItem> {
+    let mut groups: Vec<(String, Vec<Record>)> = Vec::new();
+    for r in records {
+        if let Some(last) = groups.last_mut() {
+            if last.0 == r.file {
+                last.1.push(r);
+                continue;
+            }
+        }
+        groups.push((r.file.clone(), vec![r]));
+    }
+
+    let mut items = Vec::new();
+    for (file, mut recs) in groups {
+        recs.retain(|r| r.status == "ok" && r.match_type != "none");
+        if recs.is_empty() {
+            continue;
+        }
+        recs.sort_by(|a, b| {
+            rank_record(a).cmp(&rank_record(b)).then_with(|| {
+                b.score
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.score.unwrap_or(0.0))
+                    .unwrap_or(Ordering::Equal)
+            })
+        });
+        let has_existing_art = has_sidecar_art(Path::new(&file));
+        let best = recs.remove(0);
+        items.push(QueueItem {
+            file,
+            best,
+            alternates: recs,
+            has_existing_art,
+        });
+    }
+    items
+}
+
+fn has_sidecar_art(disc_path: &Path) -> bool {
+    let Some(stem) = disc_path.file_stem() else { return false; };
+    let Some(dir) = disc_path.parent() else { return false; };
+    for ext in ["jpg", "jpeg", "png"] {
+        let candidate = dir.join(format!("{}.{}", stem.to_string_lossy(), ext));
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Minimal CSV reader for fuzzy_scan's exact 12-column output. Handles
+/// "double-quoted, embedded-quote-escape-via-"", and "" cells. We don't pull
+/// in a CSV crate because the format we're consuming is fully controlled by
+/// fuzzy_scan::write_csv next door.
+///
+/// Column order (must match write_csv):
+///   file,status,match_type,redump_id,title,system,score,sources,
+///   inferred_version,size_ratio,reason,redump_url
+fn parse_fuzzy_scan_csv(raw: &str) -> Result<Vec<Record>, String> {
+    let rows = parse_csv_rows(raw)?;
+    let mut iter = rows.into_iter();
+    let header = iter
+        .next()
+        .ok_or_else(|| "csv is empty (no header row)".to_string())?;
+    if header.first().map(|s| s.as_str()) != Some("file") {
+        return Err(format!(
+            "csv header doesn't look like fuzzy_scan output (first column = {:?})",
+            header.first()
+        ));
+    }
+    let expected = [
+        "file",
+        "status",
+        "match_type",
+        "redump_id",
+        "title",
+        "system",
+        "score",
+        "sources",
+        "inferred_version",
+        "size_ratio",
+        "reason",
+        "redump_url",
+    ];
+    if header.len() != expected.len() {
+        return Err(format!(
+            "csv has {} columns, expected {}",
+            header.len(),
+            expected.len()
+        ));
+    }
+    for (i, (got, want)) in header.iter().zip(expected.iter()).enumerate() {
+        if got != want {
+            return Err(format!(
+                "csv column {i} is {got:?}, expected {want:?}"
+            ));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (line_no, row) in iter.enumerate() {
+        if row.iter().all(|c| c.is_empty()) {
+            continue;
+        }
+        if row.len() != expected.len() {
+            return Err(format!(
+                "csv row {} has {} columns, expected {}",
+                line_no + 2,
+                row.len(),
+                expected.len()
+            ));
+        }
+        let parse_opt_i64 = |s: &str| -> Result<Option<i64>, String> {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                s.parse::<i64>()
+                    .map(Some)
+                    .map_err(|e| format!("redump_id parse: {e}"))
+            }
+        };
+        let parse_opt_f64 = |s: &str| -> Result<Option<f64>, String> {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                s.parse::<f64>()
+                    .map(Some)
+                    .map_err(|e| format!("float parse: {e}"))
+            }
+        };
+        out.push(Record {
+            file: row[0].clone(),
+            status: row[1].clone(),
+            match_type: row[2].clone(),
+            redump_id: parse_opt_i64(&row[3])?,
+            title: row[4].clone(),
+            system: row[5].clone(),
+            score: parse_opt_f64(&row[6])?,
+            sources: row[7].clone(),
+            inferred_version: row[8].clone(),
+            size_ratio: parse_opt_f64(&row[9])?,
+            reason: row[10].clone(),
+            redump_url: row[11].clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Split a CSV blob into rows of cells. Honors RFC 4180-style double-quoted
+/// fields with `""` as an embedded quote and CR/LF inside quoted cells.
+fn parse_csv_rows(raw: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut cell = String::new();
+    let mut in_quotes = false;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quotes {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    cell.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_quotes = false;
+                i += 1;
+            } else {
+                cell.push(b as char);
+                i += 1;
+            }
+        } else {
+            match b {
+                b'"' => {
+                    in_quotes = true;
+                    i += 1;
+                }
+                b',' => {
+                    row.push(std::mem::take(&mut cell));
+                    i += 1;
+                }
+                b'\n' => {
+                    row.push(std::mem::take(&mut cell));
+                    rows.push(std::mem::take(&mut row));
+                    i += 1;
+                }
+                b'\r' => {
+                    // Treat \r\n as one separator; bare \r as a row break.
+                    row.push(std::mem::take(&mut cell));
+                    rows.push(std::mem::take(&mut row));
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    cell.push(b as char);
+                    i += 1;
+                }
+            }
+        }
+    }
+    if in_quotes {
+        return Err("csv ended inside a quoted field".to_string());
+    }
+    if !cell.is_empty() || !row.is_empty() {
+        row.push(cell);
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 fn sidecar_done_path(job_path: &Path) -> PathBuf {

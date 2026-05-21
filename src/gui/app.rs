@@ -109,13 +109,18 @@ pub struct App {
 }
 
 /// Modal state for the bulk-job loader: pending file the user picked, plus
-/// the "reprocess existing art" toggle and any parse error to surface.
+/// the load-time toggles (reprocess existing art, include fuzzy with a
+/// minimum confidence) and any parse error to surface.
 struct BulkLoaderDialog {
     path: PathBuf,
     item_count: usize,
     /// Items already present in the sidecar `.done.jsonl` log.
     resumed_count: usize,
     reprocess_existing: bool,
+    filter: super::bulk::QueueFilter,
+    /// Last filter we re-parsed under, so we don't re-read the file on every
+    /// frame the dialog is open.
+    last_filter: super::bulk::QueueFilter,
     error: Option<String>,
 }
 
@@ -634,25 +639,20 @@ impl App {
     /// click "Start" in the dialog.
     fn open_bulk_job_picker(&mut self) {
         let Some(path) = rfd::FileDialog::new()
+            .add_filter("Queue (JSON or CSV)", &["json", "csv"])
             .add_filter("Queue JSON", &["json"])
+            .add_filter("fuzzy_scan CSV", &["csv"])
             .add_filter("All Files", &["*"])
             .pick_file()
         else {
             return;
         };
 
-        // Cheap pre-parse to surface item count and parse errors in the
-        // dialog before the user commits.
-        let (items, error) = match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<Vec<super::bulk::QueueItem>>(&raw) {
-                Ok(items) => (items, None),
-                Err(e) => (Vec::new(), Some(format!("parse error: {e}"))),
-            },
-            Err(e) => (Vec::new(), Some(format!("read error: {e}"))),
+        let filter = super::bulk::QueueFilter::default();
+        let (items, error) = match super::bulk::parse_queue_file(&path, &filter) {
+            Ok(items) => (items, None),
+            Err(e) => (Vec::new(), Some(e)),
         };
-
-        // Count items already in the sidecar log so the dialog can show
-        // "X of N already done" before the user commits.
         let resumed_count = count_resumed(&path, &items);
 
         self.bulk_loader = Some(BulkLoaderDialog {
@@ -660,8 +660,36 @@ impl App {
             item_count: items.len(),
             resumed_count,
             reprocess_existing: false,
+            filter: filter.clone(),
+            last_filter: filter,
             error,
         });
+    }
+
+    /// Re-parse the staged queue file under the dialog's current filter
+    /// settings so the displayed item count reflects what the user will get
+    /// when they click Start. Called when the include-fuzzy toggle or the
+    /// confidence slider changes value.
+    fn refresh_bulk_loader_counts(&mut self) {
+        let Some(dialog) = self.bulk_loader.as_mut() else {
+            return;
+        };
+        if filters_eq(&dialog.filter, &dialog.last_filter) {
+            return;
+        }
+        match super::bulk::parse_queue_file(&dialog.path, &dialog.filter) {
+            Ok(items) => {
+                dialog.item_count = items.len();
+                dialog.resumed_count = count_resumed(&dialog.path, &items);
+                dialog.error = None;
+            }
+            Err(e) => {
+                dialog.item_count = 0;
+                dialog.resumed_count = 0;
+                dialog.error = Some(e);
+            }
+        }
+        dialog.last_filter = dialog.filter.clone();
     }
 
     /// Activate the queue using the staged loader dialog. Closes the dialog.
@@ -669,7 +697,11 @@ impl App {
         let Some(dialog) = self.bulk_loader.take() else {
             return;
         };
-        match super::bulk::BulkQueue::load(dialog.path.clone(), dialog.reprocess_existing) {
+        match super::bulk::BulkQueue::load(
+            dialog.path.clone(),
+            dialog.reprocess_existing,
+            &dialog.filter,
+        ) {
             Ok(queue) => {
                 self.log(
                     LogLevel::Success,
@@ -919,50 +951,91 @@ impl App {
         self.pending_hash_redump_id = None;
     }
 
-    /// Render the bulk loader modal when one is staged. Returns whether the
-    /// user committed (so callers can chain `start_bulk_job`).
+    /// Render the bulk loader modal when one is staged.
     fn render_bulk_loader(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.bulk_loader.as_mut() else {
-            return;
-        };
         let mut start_clicked = false;
         let mut cancel_clicked = false;
+        let mut filter_changed = false;
 
-        egui::Window::new("Open Bulk Job")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!("File: {}", dialog.path.display()));
-                ui.add_space(6.0);
-                if let Some(err) = &dialog.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, err);
-                } else {
-                    ui.label(format!("Items: {}", dialog.item_count));
-                    if dialog.resumed_count > 0 {
-                        ui.label(format!(
-                            "Already done (will skip): {}",
-                            dialog.resumed_count
-                        ));
+        if let Some(dialog) = self.bulk_loader.as_mut() {
+            egui::Window::new("Open Bulk Job")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("File: {}", dialog.path.display()));
+                    ui.add_space(6.0);
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    } else {
+                        ui.label(format!("Items: {}", dialog.item_count));
+                        if dialog.resumed_count > 0 {
+                            ui.label(format!(
+                                "Already done (will skip): {}",
+                                dialog.resumed_count
+                            ));
+                        }
                     }
-                }
-                ui.add_space(8.0);
-                ui.checkbox(
-                    &mut dialog.reprocess_existing,
-                    "Reprocess discs that already have artwork",
-                );
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let can_start = dialog.error.is_none() && dialog.item_count > 0;
-                    if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
-                        start_clicked = true;
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut dialog.reprocess_existing,
+                        "Reprocess discs that already have artwork",
+                    );
+
+                    ui.add_space(4.0);
+                    let prev_include = dialog.filter.include_fuzzy;
+                    if ui
+                        .checkbox(
+                            &mut dialog.filter.include_fuzzy,
+                            "Include partially-matched discs (fuzzy)",
+                        )
+                        .changed()
+                    {
+                        filter_changed = true;
                     }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
+                    if dialog.filter.include_fuzzy {
+                        ui.horizontal(|ui| {
+                            ui.label("Minimum confidence:");
+                            let resp = ui.add(
+                                egui::Slider::new(
+                                    &mut dialog.filter.fuzzy_min_score,
+                                    0.60..=0.95,
+                                )
+                                .fixed_decimals(2)
+                                .step_by(0.01),
+                            );
+                            if resp.drag_stopped() || resp.lost_focus() {
+                                filter_changed = true;
+                            }
+                        });
+                        ui.weak(
+                            "0.60 = fuzzy floor (noisy). 0.85 is selective without rejecting \
+                             genuine matches. 0.90+ is exact-like confidence.",
+                        );
                     }
+                    if !prev_include && dialog.filter.include_fuzzy {
+                        filter_changed = true;
+                    }
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let can_start = dialog.error.is_none() && dialog.item_count > 0;
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("Start"))
+                            .clicked()
+                        {
+                            start_clicked = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
                 });
-            });
+        }
 
+        if filter_changed {
+            self.refresh_bulk_loader_counts();
+        }
         if start_clicked {
             self.start_bulk_job();
         } else if cancel_clicked {
@@ -1695,6 +1768,11 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         .bytes()
         .map(|b| b.to_vec())
         .map_err(|e| format!("Failed to read image bytes: {}", e))
+}
+
+fn filters_eq(a: &super::bulk::QueueFilter, b: &super::bulk::QueueFilter) -> bool {
+    a.include_fuzzy == b.include_fuzzy
+        && (a.fuzzy_min_score - b.fuzzy_min_score).abs() < 1e-9
 }
 
 /// Count how many of `items` are already present in the sidecar `.done.jsonl`
