@@ -786,9 +786,18 @@ impl App {
         self.bulk_suppress_cascade = false;
 
         // Inject the queue's chosen match in place of whatever the disc-read
-        // path would have produced.
+        // path would have produced. We pass the queue's best Record as a
+        // fallback so a missing entry in the local DB (e.g. CSV built
+        // against a different snapshot) still seeds redump_matches with
+        // the title — otherwise the search query would silently revert to
+        // the filename.
+        let queue_best = self
+            .bulk_queue
+            .as_ref()
+            .and_then(|q| q.current())
+            .map(|it| it.best.clone());
         if let Some(rid) = redump_id {
-            self.inject_bulk_match(rid, &display_title);
+            self.inject_bulk_match(rid, &display_title, queue_best.as_ref());
         }
 
         // For exact matches the queue is trusted enough to auto-trigger the
@@ -805,8 +814,16 @@ impl App {
 
     /// Replace `disc_info.redump_matches` with a single RedumpMatch fetched
     /// by `redump_id`, so the UI reflects the queue's pre-decided answer
-    /// without re-running the cascade.
-    fn inject_bulk_match(&mut self, redump_id: i64, fallback_title: &str) {
+    /// without re-running the cascade. If the local DB doesn't have the
+    /// id (e.g. it's older than the snapshot the CSV was built against),
+    /// synthesize a minimal match from `queue_best` so the search query
+    /// still uses the correct title.
+    fn inject_bulk_match(
+        &mut self,
+        redump_id: i64,
+        fallback_title: &str,
+        queue_best: Option<&super::bulk::Record>,
+    ) {
         let result = (|| -> Result<Option<crate::db::RedumpMatch>, String> {
             let mgr =
                 crate::db::DatabaseManager::new().map_err(|e| e.to_string())?;
@@ -820,18 +837,20 @@ impl App {
                 self.log(
                     LogLevel::Warning,
                     format!(
-                        "Bulk: redump #{redump_id} ({fallback_title}) not found in DB; \
-                         disc info shown without redump match"
+                        "Bulk: redump #{redump_id} ({fallback_title}) not found in local DB; \
+                         using queue's title for search"
                     ),
                 );
-                return;
+                let Some(rec) = queue_best else { return };
+                synth_match_from_record(rec)
             }
             Err(e) => {
                 self.log(
                     LogLevel::Warning,
                     format!("Bulk: failed to fetch redump #{redump_id}: {e}"),
                 );
-                return;
+                let Some(rec) = queue_best else { return };
+                synth_match_from_record(rec)
             }
         };
 
@@ -2007,6 +2026,30 @@ fn marquee_label(ui: &mut egui::Ui, text: &str, max_width: f32) {
     // Keep the frame ticking while the marquee is on screen.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// Build a minimal RedumpMatch from a queue Record when the local DB
+/// doesn't have the matching redump entry. The reduced-field match is
+/// enough to drive the search query (which only reads title) and the
+/// UI's "matched via …" chip; the disc-detail grid will simply show
+/// fewer fields.
+fn synth_match_from_record(rec: &super::bulk::Record) -> crate::db::RedumpMatch {
+    crate::db::RedumpMatch {
+        redump_id: rec.redump_id.unwrap_or(0),
+        system: rec.system.clone(),
+        title: rec.title.clone(),
+        foreign_title: None,
+        edition: None,
+        version: None,
+        category: None,
+        media: None,
+        barcode: None,
+        catalog: None,
+        pvd_volume_id: None,
+        pvd_creation_date: None,
+        redump_url: rec.redump_url.clone(),
+        matched_via: crate::db::MatchSource::PvdVolumeId,
+    }
 }
 
 fn filters_eq(a: &super::bulk::QueueFilter, b: &super::bulk::QueueFilter) -> bool {
