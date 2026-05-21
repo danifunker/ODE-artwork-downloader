@@ -793,9 +793,17 @@ impl App {
         let redump_id = item.best.redump_id;
         let match_type = item.best.match_type.clone();
         let display_title = item.best.title.clone();
+        let already_resolved = queue
+            .statuses
+            .get(cursor)
+            .map(|s| *s != super::bulk::ItemStatus::Pending)
+            .unwrap_or(false);
 
-        // Existing-art auto-skip path.
-        if has_existing && !reprocess {
+        // Existing-art auto-skip — but only for items that haven't been
+        // resolved yet. If the user explicitly went Back to a Saved /
+        // Skipped / existing-art item, load it so they can redo the
+        // choice; otherwise Back is useless on those items.
+        if has_existing && !reprocess && !already_resolved {
             self.log(
                 LogLevel::Info,
                 format!("Bulk: skipping (existing art): {}", path.display()),
@@ -804,6 +812,16 @@ impl App {
             // Don't mark this cursor as loaded; let advance kick us to the
             // next pending item on the next tick.
             return;
+        }
+
+        if already_resolved {
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "Bulk: reopening previously-resolved item {} for re-processing",
+                    path.display()
+                ),
+            );
         }
 
         // Reset per-item transient state before kicking off the load.
