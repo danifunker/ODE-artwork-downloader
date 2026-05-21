@@ -103,6 +103,9 @@ pub struct App {
     /// log when the user resolves the item. None when hashing hasn't finished
     /// or no hash hit was returned.
     pending_hash_redump_id: Option<i64>,
+    /// URL of the artwork the user is currently saving. Read by poll_export
+    /// on success so a bulk-mode save can record the chosen URL.
+    pending_export_url: Option<String>,
 }
 
 /// Modal state for the bulk-job loader: pending file the user picked, plus
@@ -176,6 +179,7 @@ impl Default for App {
             bulk_loaded_cursor: None,
             bulk_suppress_cascade: false,
             pending_hash_redump_id: None,
+            pending_export_url: None,
         }
     }
 }
@@ -802,6 +806,52 @@ impl App {
         self.log(LogLevel::Success, log_line);
     }
 
+    /// Bulk-mode keyboard shortcuts:
+    ///   Enter — save the currently focused image (or re-trigger the save
+    ///           button) — handled by the existing Save button path.
+    ///   S     — skip the current item (record as 'skipped', advance).
+    ///   B     — go back to the previous item (no log entry; cursor only).
+    ///   Esc   — exit bulk mode entirely.
+    /// Hotkeys are no-ops outside bulk mode and when the loader dialog is
+    /// open. We also skip keys consumed by a focused text input so the
+    /// search-query field stays editable.
+    fn handle_bulk_hotkeys(&mut self, ctx: &egui::Context) {
+        if self.bulk_queue.is_none() {
+            return;
+        }
+        if self.bulk_loader.is_some() {
+            return;
+        }
+        let text_focused = ctx.memory(|m| m.focused().is_some());
+        if text_focused {
+            return;
+        }
+
+        let (skip, back, exit) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::B),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+
+        if exit {
+            self.close_bulk_job();
+            return;
+        }
+        if skip {
+            self.log(LogLevel::Info, "Bulk: skipped");
+            self.record_bulk_done("skipped", None);
+        }
+        if back {
+            if let Some(queue) = self.bulk_queue.as_mut() {
+                queue.back();
+            }
+            self.bulk_loaded_cursor = None;
+            self.pending_hash_redump_id = None;
+        }
+    }
+
     /// Append a done-log entry for the current bulk item and advance the
     /// cursor. Caller chooses the status string (saved/skipped/existing-art).
     fn record_bulk_done(&mut self, status: &str, image_url: Option<String>) {
@@ -916,6 +966,8 @@ impl App {
         let complete = queue.is_complete();
 
         let mut exit_clicked = false;
+        let mut skip_clicked = false;
+        let mut back_clicked = false;
         egui::Frame::group(ui.style())
             .fill(ui.visuals().faint_bg_color)
             .show(ui, |ui| {
@@ -940,8 +992,26 @@ impl App {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Exit bulk").clicked() {
+                        if ui
+                            .button("Exit bulk")
+                            .on_hover_text("Esc")
+                            .clicked()
+                        {
                             exit_clicked = true;
+                        }
+                        if ui
+                            .add_enabled(!complete, egui::Button::new("Skip"))
+                            .on_hover_text("S — record as skipped and advance")
+                            .clicked()
+                        {
+                            skip_clicked = true;
+                        }
+                        if ui
+                            .add_enabled(cursor > 0, egui::Button::new("Back"))
+                            .on_hover_text("B — return to previous item")
+                            .clicked()
+                        {
+                            back_clicked = true;
                         }
                     });
                 });
@@ -951,6 +1021,17 @@ impl App {
 
         if exit_clicked {
             self.close_bulk_job();
+        }
+        if skip_clicked {
+            self.log(LogLevel::Info, "Bulk: skipped");
+            self.record_bulk_done("skipped", None);
+        }
+        if back_clicked {
+            if let Some(queue) = self.bulk_queue.as_mut() {
+                queue.back();
+            }
+            self.bulk_loaded_cursor = None;
+            self.pending_hash_redump_id = None;
         }
     }
 
@@ -1320,6 +1401,7 @@ impl App {
 
         self.export_in_progress = true;
         self.export_receiver = Some(rx);
+        self.pending_export_url = Some(url.clone());
 
         self.log(LogLevel::Info, format!("Downloading and converting to {}", path));
 
@@ -1360,6 +1442,7 @@ impl App {
                 Ok(Ok(result)) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    let saved_url = self.pending_export_url.take();
                     let msg = if result.was_cropped {
                         format!(
                             "Saved to {} (cropped from {}x{} to {}x{})",
@@ -1378,10 +1461,16 @@ impl App {
                         )
                     };
                     self.log(LogLevel::Success, msg);
+
+                    // If we're in bulk mode, record the save and advance.
+                    if self.bulk_queue.is_some() {
+                        self.record_bulk_done("saved", saved_url);
+                    }
                 }
                 Ok(Err(e)) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    self.pending_export_url = None;
                     self.log(LogLevel::Error, format!("Export failed: {}", e));
                 }
                 Err(TryRecvError::Empty) => {
@@ -1390,6 +1479,7 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    self.pending_export_url = None;
                     self.log(LogLevel::Error, "Export thread terminated unexpectedly");
                 }
             }
@@ -1606,6 +1696,9 @@ impl eframe::App for App {
         // Bulk-job loader modal (rendered as a centered Window). Independent
         // of the central-panel ui, so render through the context.
         self.render_bulk_loader(&ctx);
+
+        // Bulk-mode keyboard shortcuts.
+        self.handle_bulk_hotkeys(&ctx);
 
         // Drive the bulk queue: load next item if cursor advanced.
         self.tick_bulk();
