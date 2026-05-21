@@ -109,6 +109,10 @@ pub struct App {
     /// URL of the artwork the user is currently saving. Read by poll_export
     /// on success so a bulk-mode save can record the chosen URL.
     pending_export_url: Option<String>,
+    /// Bottom Y coordinate of the most recently rendered bulk banner.
+    /// Used to pick the default position of the Artwork Search window
+    /// so it opens directly below the controls in bulk mode.
+    bulk_banner_bottom_y: Option<f32>,
 }
 
 /// Modal state for the bulk-job loader: pending file the user picked, plus
@@ -188,6 +192,7 @@ impl Default for App {
             bulk_suppress_cascade: false,
             pending_hash_redump_id: None,
             pending_export_url: None,
+            bulk_banner_bottom_y: None,
         }
     }
 }
@@ -1051,6 +1056,7 @@ impl App {
     /// of upcoming items, and the action buttons (Skip / Back / Exit).
     fn render_bulk_banner(&mut self, ui: &mut egui::Ui) {
         let Some(queue) = self.bulk_queue.as_ref() else {
+            self.bulk_banner_bottom_y = None;
             return;
         };
         let total = queue.total();
@@ -1084,13 +1090,14 @@ impl App {
         let mut exit_clicked = false;
         let mut skip_clicked = false;
         let mut back_clicked = false;
-        egui::Frame::group(ui.style())
+        let frame_resp = egui::Frame::group(ui.style())
             .fill(ui.visuals().faint_bg_color)
             .show(ui, |ui| {
-                // Row 1: status + current item. Long filenames are allowed
-                // to wrap or truncate here without shoving the controls
-                // off-screen, because the controls live on row 2.
-                ui.horizontal_wrapped(|ui| {
+                // Row 1: status + current item. The current item gets a
+                // marquee so a long filename doesn't fight the layout —
+                // it scrolls inside a fixed-width region instead of
+                // wrapping or being clipped.
+                ui.horizontal(|ui| {
                     ui.heading(if complete {
                         "Bulk job — complete"
                     } else {
@@ -1104,11 +1111,13 @@ impl App {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or(&file);
-                        ui.label(format!("[{}] {}", cursor + 1, stem));
-                        if !title.is_empty() {
-                            ui.weak("→");
-                            ui.label(title);
-                        }
+                        let line = if title.is_empty() {
+                            format!("[{}] {}", cursor + 1, stem)
+                        } else {
+                            format!("[{}] {}  →  {}", cursor + 1, stem, title)
+                        };
+                        let available = ui.available_width().max(120.0);
+                        marquee_label(ui, &line, available);
                     }
                 });
 
@@ -1174,6 +1183,8 @@ impl App {
                     );
                 }
             });
+
+        self.bulk_banner_bottom_y = Some(frame_resp.response.rect.bottom());
 
         ui.add_space(4.0);
 
@@ -1947,6 +1958,63 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Failed to read image bytes: {}", e))
 }
 
+/// Single-line scrolling text. If `text` fits in `max_width`, renders as a
+/// plain label; otherwise the text slides continuously to the left, with a
+/// duplicate trailing copy so the loop is seamless. Hovering the strip shows
+/// the full text in a tooltip for users who'd rather read than wait.
+fn marquee_label(ui: &mut egui::Ui, text: &str, max_width: f32) {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, color);
+    let natural_w = galley.size().x;
+    let h = galley.size().y;
+    let visible_w = max_width.min(natural_w.max(1.0));
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(visible_w.max(40.0), h),
+        egui::Sense::hover(),
+    );
+
+    if natural_w <= visible_w {
+        ui.painter()
+            .galley(rect.left_top(), galley, color);
+        return;
+    }
+
+    // Clip drawing to the allocated rect so the looping copy doesn't bleed
+    // into neighboring widgets.
+    let painter = ui.painter_at(rect);
+
+    // 30 px gap between the trailing edge of one copy and the leading edge
+    // of the next; tuned to feel airy on Roboto-like fonts without leaving
+    // a long blank gap.
+    let gap = 30.0_f32;
+    let cycle = natural_w + gap;
+    // 40 px/sec is slow enough to read a 40-char title in ~10s, fast enough
+    // that you don't feel stuck behind it.
+    let speed = 40.0_f32;
+    let t = ui.ctx().input(|i| i.time) as f32;
+    let offset = (t * speed).rem_euclid(cycle);
+
+    painter.galley(
+        rect.left_top() - egui::vec2(offset, 0.0),
+        galley.clone(),
+        color,
+    );
+    painter.galley(
+        rect.left_top() + egui::vec2(cycle - offset, 0.0),
+        galley,
+        color,
+    );
+
+    resp.on_hover_text(text);
+
+    // Keep the frame ticking while the marquee is on screen.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+}
+
 fn filters_eq(a: &super::bulk::QueueFilter, b: &super::bulk::QueueFilter) -> bool {
     a.include_fuzzy == b.include_fuzzy
         && (a.fuzzy_min_score - b.fuzzy_min_score).abs() < 1e-9
@@ -2266,13 +2334,23 @@ impl eframe::App for App {
             let default_w = (app_rect.x * 0.75).max(600.0);
             let default_h = (app_rect.y * 0.85).max(500.0);
 
-            egui::Window::new("Artwork Search")
+            // In bulk mode, default-position the window directly below the
+            // banner so the controls remain visible. Outside bulk mode, fall
+            // through to egui's default placement.
+            let default_pos = self.bulk_banner_bottom_y.map(|y| {
+                let content = ctx.content_rect();
+                egui::pos2(content.left() + 12.0, y + 8.0)
+            });
+            let mut window = egui::Window::new("Artwork Search")
                 .open(&mut self.show_search_window)
                 .default_size([default_w, default_h])
                 .min_width(600.0)
                 .min_height(400.0)
-                .resizable(true)
-                .show(&ctx, |ui| {
+                .resizable(true);
+            if let Some(pos) = default_pos {
+                window = window.default_pos(pos);
+            }
+            window.show(&ctx, |ui| {
                     // ---- Content type ----
                     ui.horizontal(|ui| {
                         ui.label("Content Type:");
