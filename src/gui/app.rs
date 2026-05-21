@@ -827,11 +827,12 @@ impl App {
             return;
         }
 
-        let (skip, back, exit) = ctx.input(|i| {
+        let (skip, back, exit, enter) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::S),
                 i.key_pressed(egui::Key::B),
                 i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
             )
         });
 
@@ -842,6 +843,7 @@ impl App {
         if skip {
             self.log(LogLevel::Info, "Bulk: skipped");
             self.record_bulk_done("skipped", None);
+            return;
         }
         if back {
             if let Some(queue) = self.bulk_queue.as_mut() {
@@ -849,6 +851,27 @@ impl App {
             }
             self.bulk_loaded_cursor = None;
             self.pending_hash_redump_id = None;
+            return;
+        }
+        if enter {
+            // Save currently-previewed image, if any. The bulk advance
+            // happens inside poll_export on success.
+            if self.export_in_progress {
+                return;
+            }
+            let url = self.preview_url.clone();
+            let path = self
+                .selected_path
+                .as_ref()
+                .map(|p| generate_output_path(p));
+            if let (Some(url), Some(path)) = (url, path) {
+                self.start_export(&url, &path);
+            } else {
+                self.log(
+                    LogLevel::Info,
+                    "Bulk: Enter pressed but no image is selected for preview",
+                );
+            }
         }
     }
 
@@ -948,9 +971,8 @@ impl App {
     }
 
     /// Inline top banner shown above the central panel content when bulk
-    /// mode is active. The per-item drive (auto-load, auto-search,
-    /// save/skip/back) lands in a later phase; this banner is the visual
-    /// hook for it.
+    /// mode is active. Shows progress, the current item, a short preview
+    /// of upcoming items, and the action buttons (Skip / Back / Exit).
     fn render_bulk_banner(&mut self, ui: &mut egui::Ui) {
         let Some(queue) = self.bulk_queue.as_ref() else {
             return;
@@ -964,6 +986,24 @@ impl App {
             .unwrap_or_default();
         let cursor = queue.cursor;
         let complete = queue.is_complete();
+
+        // Snapshot the next ~5 pending items for the "Up next" strip.
+        let upcoming: Vec<(usize, String, String)> = queue
+            .items
+            .iter()
+            .enumerate()
+            .skip(cursor + 1)
+            .filter(|(idx, _)| queue.statuses[*idx] == super::bulk::ItemStatus::Pending)
+            .take(5)
+            .map(|(idx, it)| {
+                let stem = std::path::Path::new(&it.file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&it.file)
+                    .to_string();
+                (idx, stem, it.best.title.clone())
+            })
+            .collect();
 
         let mut exit_clicked = false;
         let mut skip_clicked = false;
@@ -1015,6 +1055,38 @@ impl App {
                         }
                     });
                 });
+
+                // Upcoming-items strip: small, single-line, greyed.
+                if !upcoming.is_empty() {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.weak("Up next:");
+                        for (_, stem, title) in &upcoming {
+                            let label = if title.is_empty() {
+                                stem.clone()
+                            } else {
+                                format!("{stem} → {title}")
+                            };
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                            ui.weak("·");
+                        }
+                    });
+                } else if !complete {
+                    ui.add_space(2.0);
+                    ui.weak("Last item in queue.");
+                }
+
+                if complete {
+                    ui.add_space(2.0);
+                    ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        "All items processed — click Exit bulk to return to single-disc mode.",
+                    );
+                }
             });
 
         ui.add_space(4.0);
