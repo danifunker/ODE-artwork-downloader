@@ -46,6 +46,8 @@ struct Args {
     no_hash: bool,
     no_musicbrainz: bool,
     no_deep_fs: bool,
+    only_matched: bool,
+    queue: bool,
     paths: Vec<PathBuf>,
 }
 
@@ -56,6 +58,8 @@ fn parse_args() -> Result<Args, String> {
     let mut no_hash = false;
     let mut no_musicbrainz = false;
     let mut no_deep_fs = false;
+    let mut only_matched = false;
+    let mut queue = false;
     let mut paths = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -100,6 +104,12 @@ fn parse_args() -> Result<Args, String> {
             "--no-deep-filesystem-search" | "--no-deep" => {
                 no_deep_fs = true;
             }
+            "--only-matched" => {
+                only_matched = true;
+            }
+            "--queue" => {
+                queue = true;
+            }
             "-h" | "--help" => {
                 return Err("help".to_string());
             }
@@ -110,13 +120,18 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    // Infer format from output extension when not given explicitly.
-    let format = format.unwrap_or_else(|| {
-        match out.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str()) {
-            Some("json") => Format::Json,
-            _ => Format::Csv,
-        }
-    });
+    // Infer format from output extension when not given explicitly. Queue
+    // mode always emits JSON regardless of the .csv extension on --out.
+    let format = if queue {
+        Format::Json
+    } else {
+        format.unwrap_or_else(|| {
+            match out.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str()) {
+                Some("json") => Format::Json,
+                _ => Format::Csv,
+            }
+        })
+    };
 
     // No positional paths → read them from stdin (the `find | scan` case).
     if paths.is_empty() {
@@ -130,12 +145,22 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    Ok(Args { out, format, top, no_hash, no_musicbrainz, no_deep_fs, paths })
+    Ok(Args {
+        out,
+        format,
+        top,
+        no_hash,
+        no_musicbrainz,
+        no_deep_fs,
+        only_matched,
+        queue,
+        paths,
+    })
 }
 
 /// One output record per (file, hit). A file with no hits still produces one
 /// record so the scan is a complete accounting of the input list.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Record {
     file: String,
     status: String, // ok | read_error
@@ -254,6 +279,93 @@ fn write_csv(w: &mut dyn Write, records: &[Record]) -> std::io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// One queue entry per file: the chosen best match plus any alternates the
+/// user can swap to during bulk processing. `has_existing_art` is set when a
+/// sidecar image (same dir, same basename, .jpg/.jpeg/.png) is already on disk.
+#[derive(Serialize, Deserialize)]
+struct QueueItem {
+    file: String,
+    best: Record,
+    alternates: Vec<Record>,
+    has_existing_art: bool,
+}
+
+/// Sidecar artwork heuristic: same directory as the disc file, same basename,
+/// one of the common image extensions. Matches the bulk-mode skip check.
+fn has_sidecar_art(disc_path: &std::path::Path) -> bool {
+    let Some(stem) = disc_path.file_stem() else { return false; };
+    let Some(dir) = disc_path.parent() else { return false; };
+    for ext in ["jpg", "jpeg", "png"] {
+        let candidate = dir.join(format!("{}.{}", stem.to_string_lossy(), ext));
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop unscorable records (status != ok, or match_type == none).
+fn keep_matched(records: Vec<Record>) -> Vec<Record> {
+    records
+        .into_iter()
+        .filter(|r| r.status == "ok" && r.match_type != "none")
+        .collect()
+}
+
+/// Group records by file (preserving input order) and pick a best + alternates
+/// per group. Files with no usable records are dropped. Ranking order:
+///   1. exact      (cascade hit — most trusted)
+///   2. musicbrainz (audio TOC hit)
+///   3. fuzzy      (rank by score desc)
+fn group_into_queue(records: Vec<Record>) -> Vec<QueueItem> {
+    let mut groups: Vec<(String, Vec<Record>)> = Vec::new();
+    for r in records {
+        if let Some(last) = groups.last_mut() {
+            if last.0 == r.file {
+                last.1.push(r);
+                continue;
+            }
+        }
+        groups.push((r.file.clone(), vec![r]));
+    }
+
+    let rank = |r: &Record| match r.match_type.as_str() {
+        "exact" => 0,
+        "musicbrainz" => 1,
+        "fuzzy" => 2,
+        _ => 3,
+    };
+
+    let mut items = Vec::new();
+    for (file, mut recs) in groups {
+        recs.retain(|r| r.status == "ok" && r.match_type != "none");
+        if recs.is_empty() {
+            continue;
+        }
+        recs.sort_by(|a, b| {
+            rank(a).cmp(&rank(b)).then_with(|| {
+                let sa = b.score.unwrap_or(0.0);
+                let sb = a.score.unwrap_or(0.0);
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        let has_existing_art = has_sidecar_art(std::path::Path::new(&file));
+        let best = recs.remove(0);
+        items.push(QueueItem {
+            file,
+            best,
+            alternates: recs,
+            has_existing_art,
+        });
+    }
+    items
+}
+
+fn write_queue_json(w: &mut dyn Write, items: &[QueueItem]) -> std::io::Result<()> {
+    let s = serde_json::to_string_pretty(items).expect("serialize");
+    writeln!(w, "{s}")
 }
 
 fn write_json(w: &mut dyn Write, records: &[Record]) -> std::io::Result<()> {
@@ -540,13 +652,18 @@ fn main() -> ExitCode {
             if e == "help" {
                 eprintln!(
                     "Usage: fuzzy_scan [--out FILE] [--format csv|json] [--top N] [--list FILE]\n\
-                     \x20              [--no-hash] [--no-musicbrainz] [--no-deep-filesystem-search] [PATHS...]\n\
+                     \x20              [--no-hash] [--no-musicbrainz] [--no-deep-filesystem-search]\n\
+                     \x20              [--only-matched] [--queue] [PATHS...]\n\
                      Reads paths from --list FILE, positional args, or stdin (in that order of availability).\n\
                      Hashing runs only on raw (2352-byte) images; cooked ISOs skip it automatically.\n\
                      Order: MusicBrainz (audio TOC) -> exact (serial/PVD/hash) -> fuzzy -> deep filesystem dig.\n\
                      --no-hash disables hashing; --no-musicbrainz (--no-mb) disables the MB network lookup;\n\
                      --no-deep-filesystem-search (--no-deep) skips the fuzzy stage's disc walk (faster,\n\
-                     but won't enrich titles from on-disc filenames or verify candidates against contents)."
+                     but won't enrich titles from on-disc filenames or verify candidates against contents).\n\
+                     --only-matched drops files with no usable hit (match_type=none or read_error).\n\
+                     --queue emits a per-file JSON document suitable for the GUI bulk-processing mode:\n\
+                     one QueueItem per file with the chosen best match plus alternates and a sidecar\n\
+                     artwork flag. Implies --only-matched and forces --format json."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -583,15 +700,35 @@ fn main() -> ExitCode {
         ));
     }
 
+    // Apply --only-matched filter (--queue implies it).
+    let records = if args.only_matched || args.queue {
+        keep_matched(records)
+    } else {
+        records
+    };
+
+    let queue_items: Option<Vec<QueueItem>> = if args.queue {
+        Some(group_into_queue(records.clone()))
+    } else {
+        None
+    };
+
+    let write_one = |w: &mut dyn Write| -> std::io::Result<()> {
+        if let Some(ref items) = queue_items {
+            write_queue_json(w, items)
+        } else {
+            match args.format {
+                Format::Csv => write_csv(w, &records),
+                Format::Json => write_json(w, &records),
+            }
+        }
+    };
+
     let write_result = match args.out {
         Some(ref p) => match std::fs::File::create(p) {
             Ok(f) => {
                 let mut w = std::io::BufWriter::new(f);
-                let r = match args.format {
-                    Format::Csv => write_csv(&mut w, &records),
-                    Format::Json => write_json(&mut w, &records),
-                };
-                r.and_then(|_| w.flush())
+                write_one(&mut w).and_then(|_| w.flush())
             }
             Err(e) => {
                 eprintln!("could not create {}: {e}", p.display());
@@ -601,10 +738,7 @@ fn main() -> ExitCode {
         None => {
             let stdout = std::io::stdout();
             let mut w = stdout.lock();
-            match args.format {
-                Format::Csv => write_csv(&mut w, &records),
-                Format::Json => write_json(&mut w, &records),
-            }
+            write_one(&mut w)
         }
     };
 
@@ -613,10 +747,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let count_label = match &queue_items {
+        Some(items) => format!("{} queue item(s)", items.len()),
+        None => format!("{} record(s)", records.len()),
+    };
     eprintln!(
-        "done: {} input(s), {} record(s){}",
+        "done: {} input(s), {}{}",
         total,
-        records.len(),
+        count_label,
         args.out
             .as_ref()
             .map(|p| format!(" → {}", p.display()))
