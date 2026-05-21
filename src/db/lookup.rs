@@ -18,6 +18,7 @@ pub struct RedumpMatch {
     pub category: Option<String>,
     pub media: Option<String>,
     pub barcode: Option<String>,
+    pub catalog: Option<String>,
     pub pvd_volume_id: Option<String>,
     pub pvd_creation_date: Option<String>,
     pub redump_url: String,
@@ -37,7 +38,7 @@ pub enum MatchSource {
 }
 
 const SELECT_DISCS_COLS: &str = "redump_id, system, title, foreign_title, edition, \
-    version, category, media, barcode, pvd_volume_id, pvd_creation_date, redump_url";
+    version, category, media, barcode, catalog, pvd_volume_id, pvd_creation_date, redump_url";
 
 fn row_to_match(row: &Row<'_>, matched_via: MatchSource) -> rusqlite::Result<RedumpMatch> {
     Ok(RedumpMatch {
@@ -50,9 +51,10 @@ fn row_to_match(row: &Row<'_>, matched_via: MatchSource) -> rusqlite::Result<Red
         category: row.get(6)?,
         media: row.get(7)?,
         barcode: row.get(8)?,
-        pvd_volume_id: row.get(9)?,
-        pvd_creation_date: row.get(10)?,
-        redump_url: row.get(11)?,
+        catalog: row.get(9)?,
+        pvd_volume_id: row.get(10)?,
+        pvd_creation_date: row.get(11)?,
+        redump_url: row.get(12)?,
         matched_via,
     })
 }

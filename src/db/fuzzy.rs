@@ -391,10 +391,9 @@ struct TrackSummary {
     total_bytes: u64,
 }
 
-/// CD frame = one 2352-byte raw sector. Redump `size_bytes` is cooked
-/// (2048 for Mode-1 data, 2352 for audio), so convert by track kind.
-/// INTERIM: once the re-seed lands a real `sectors` column, read it directly
-/// and delete this derivation (see docs/fuzzy_match_against_redump.md).
+/// Fallback when `tracks.sectors` is NULL (pre-v2 rows). Redump `size_bytes`
+/// is cooked (2048 for Mode-1 data, 2352 for audio), so we divide by the
+/// per-sector payload to approximate the frame count.
 fn bytes_to_frames(kind: &str, size_bytes: u64) -> u32 {
     let per = if kind.eq_ignore_ascii_case("audio") { 2352 } else { 2048 };
     (size_bytes / per) as u32
@@ -402,19 +401,24 @@ fn bytes_to_frames(kind: &str, size_bytes: u64) -> u32 {
 
 fn track_summary(conn: &Connection, redump_id: i64) -> rusqlite::Result<TrackSummary> {
     let mut stmt = conn.prepare(
-        "SELECT kind, size_bytes FROM tracks WHERE redump_id = ?1 ORDER BY number",
+        "SELECT kind, sectors, size_bytes FROM tracks WHERE redump_id = ?1 ORDER BY number",
     )?;
     let rows = stmt.query_map([redump_id], |row| {
         let kind: Option<String> = row.get(0)?;
-        let size: Option<i64> = row.get(1)?;
-        Ok((kind.unwrap_or_default(), size.unwrap_or(0).max(0) as u64))
+        let sectors: Option<i64> = row.get(1)?;
+        let size: Option<i64> = row.get(2)?;
+        Ok((
+            kind.unwrap_or_default(),
+            sectors.map(|s| s.max(0) as u32),
+            size.unwrap_or(0).max(0) as u64,
+        ))
     })?;
     let mut frames = Vec::new();
     let mut total_bytes = 0u64;
     for r in rows {
-        let (kind, size) = r?;
+        let (kind, sectors, size) = r?;
         total_bytes += size;
-        frames.push(bytes_to_frames(&kind, size));
+        frames.push(sectors.unwrap_or_else(|| bytes_to_frames(&kind, size)));
     }
     Ok(TrackSummary { frames, total_bytes })
 }

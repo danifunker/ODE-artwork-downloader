@@ -397,6 +397,9 @@ impl App {
         };
         if let Some(Ok(info)) = self.disc_info.as_mut() {
             info.redump_matches = Some(matches);
+            // Hash hit beats any fuzzy candidates from the earlier pass —
+            // drop the stale list so the UI doesn't show both.
+            info.fuzzy_matches = None;
         }
         self.log(LogLevel::Success, head_summary);
     }
@@ -1975,6 +1978,7 @@ impl eframe::App for App {
                                                 ("Category", first.category.as_deref()),
                                                 ("Edition", first.edition.as_deref()),
                                                 ("Version", first.version.as_deref()),
+                                                ("Catalog", first.catalog.as_deref()),
                                             ]
                                             .into_iter()
                                             .filter_map(|(k, v)| {

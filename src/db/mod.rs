@@ -20,7 +20,7 @@ pub use lookup::{
 pub use manager::{DatabaseManager, UpdateOutcome};
 
 /// Schema version this build of the app understands.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
 
 /// Base URL for the `latest` release tag on the DB repo.
 pub const LATEST_RELEASE_BASE: &str =

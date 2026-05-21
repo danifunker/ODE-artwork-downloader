@@ -46,7 +46,7 @@ fn updates_and_opens_real_release() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("meta query");
-    assert_eq!(schema_version, 1);
+    assert_eq!(schema_version, 2);
     assert!(row_count > 0);
 
     let discs: i64 = conn

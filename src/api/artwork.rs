@@ -815,7 +815,12 @@ mod tests {
 
     #[test]
     fn test_remove_publishers() {
-        let config = SearchConfig::default();
+        let mut config = SearchConfig::default();
+        config.known_publishers = vec![
+            "Westwood".to_string(),
+            "Sierra".to_string(),
+            "EA".to_string(),
+        ];
 
         let (title, publisher) = ArtworkSearchQuery::remove_publishers("Command & Conquer Westwood", &config);
         assert_eq!(title, "Command & Conquer");
@@ -837,7 +842,8 @@ mod tests {
 
     #[test]
     fn test_process_title() {
-        let config = SearchConfig::default();
+        let mut config = SearchConfig::default();
+        config.known_publishers = vec!["Westwood".to_string()];
 
         // Test CamelCase splitting
         let (title, _) = ArtworkSearchQuery::process_title("FinalFantasyVII", &config);
