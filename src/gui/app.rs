@@ -2218,9 +2218,19 @@ impl eframe::App for App {
                         .build_query()
                 })
                 .unwrap_or_default();
+            // Only treat the disc as a MusicBrainz target when it looks like
+            // a pure audio CD: a TOC is present, but no data filesystem was
+            // detected (no PVD, no HFS/HFS+). A BIN/CUE or CHD of a data
+            // game has a TOC too, and we shouldn't make the user click
+            // through a useless MB lookup for that.
             let use_musicbrainz = info_for_search
                 .as_ref()
-                .map(|i| i.toc.is_some())
+                .map(|i| {
+                    i.toc.is_some()
+                        && i.pvd.is_none()
+                        && i.hfs_mdb.is_none()
+                        && i.hfsplus_header.is_none()
+                })
                 .unwrap_or(false);
             let disc_id = info_for_search
                 .as_ref()
@@ -2676,7 +2686,10 @@ impl eframe::App for App {
                             self.search_query_text = default_query.clone();
                         }
                         let can_browse = info.filesystem != FilesystemType::Unknown;
-                        let use_musicbrainz = info.toc.is_some();
+                        let use_musicbrainz = info.toc.is_some()
+                            && info.pvd.is_none()
+                            && info.hfs_mdb.is_none()
+                            && info.hfsplus_header.is_none();
                         let disc_id = info.toc.as_ref().map(|toc| toc.musicbrainz_id());
                         let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
                         let preview_loading = self.preview_loading;
