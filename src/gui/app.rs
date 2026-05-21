@@ -93,6 +93,16 @@ pub struct App {
     bulk_queue: Option<super::bulk::BulkQueue>,
     /// In-flight loader dialog state for "Open Bulk Job…".
     bulk_loader: Option<BulkLoaderDialog>,
+    /// Cursor index of the last bulk item we loaded into the central panel.
+    /// Used by tick_bulk to detect "queue advanced, load next" transitions.
+    bulk_loaded_cursor: Option<usize>,
+    /// While true, `process_file` will skip the normal redump cascade/fuzzy
+    /// auto-runs. Set by tick_bulk before triggering a bulk-driven load.
+    bulk_suppress_cascade: bool,
+    /// Hash cascade result for the current bulk item — written to the done
+    /// log when the user resolves the item. None when hashing hasn't finished
+    /// or no hash hit was returned.
+    pending_hash_redump_id: Option<i64>,
 }
 
 /// Modal state for the bulk-job loader: pending file the user picked, plus
@@ -163,6 +173,9 @@ impl Default for App {
             hash_rate_tracker: super::progress::RateTracker::default(),
             bulk_queue: None,
             bulk_loader: None,
+            bulk_loaded_cursor: None,
+            bulk_suppress_cascade: false,
+            pending_hash_redump_id: None,
         }
     }
 }
@@ -207,6 +220,11 @@ impl App {
     /// (missing DB, query error) are logged at debug level and treated as
     /// "no match" — the rest of the flow continues unchanged.
     fn enrich_with_redump(&mut self, info: &mut DiscInfo) {
+        // Bulk mode commits to the queue's pre-decided match — don't let the
+        // exact/fuzzy cascade overwrite it.
+        if self.bulk_suppress_cascade {
+            return;
+        }
         let mgr = match crate::db::DatabaseManager::new() {
             Ok(m) => m,
             Err(e) => {
@@ -405,13 +423,34 @@ impl App {
             }
         };
 
-        let head_summary = {
-            let head = &matches[0];
-            format!(
-                "Redump hash match: {} [#{}] via {:?}",
-                head.title, head.redump_id, head.matched_via
-            )
-        };
+        let head = matches[0].clone();
+        let head_summary = format!(
+            "Redump hash match: {} [#{}] via {:?}",
+            head.title, head.redump_id, head.matched_via
+        );
+
+        // In bulk mode the queue's match is authoritative. Record the
+        // disagreement (if any) on the active queue item so it lands in the
+        // done log when the user saves/skips, but don't disturb the UI.
+        if let Some(queue) = self.bulk_queue.as_mut() {
+            if let Some(item) = queue.current() {
+                let queue_id = item.best.redump_id;
+                if queue_id != Some(head.redump_id) {
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "Bulk: hash points to #{} (queue locked to #{:?}); recorded as disagreement",
+                            head.redump_id, queue_id
+                        ),
+                    );
+                } else {
+                    self.log(LogLevel::Info, "Bulk: hash confirms queue match");
+                }
+            }
+            self.pending_hash_redump_id = Some(head.redump_id);
+            return;
+        }
+
         if let Some(Ok(info)) = self.disc_info.as_mut() {
             info.redump_matches = Some(matches);
             // Hash hit beats any fuzzy candidates from the earlier pass —
@@ -650,6 +689,161 @@ impl App {
             self.log(LogLevel::Info, "Bulk job closed".to_string());
         }
         self.bulk_queue = None;
+        self.bulk_loaded_cursor = None;
+        self.bulk_suppress_cascade = false;
+        self.pending_hash_redump_id = None;
+    }
+
+    /// Per-frame driver for bulk mode. If the cursor advanced to a new item,
+    /// either auto-skip it (existing art + reprocess off) or load the disc
+    /// and inject the queue's chosen match. After loading, the artwork
+    /// search is auto-triggered for exact matches.
+    fn tick_bulk(&mut self) {
+        let Some(queue) = self.bulk_queue.as_ref() else {
+            return;
+        };
+        if queue.is_complete() {
+            return;
+        }
+        let cursor = queue.cursor;
+        if Some(cursor) == self.bulk_loaded_cursor {
+            return;
+        }
+
+        // Snapshot what we need; later mutating self requires releasing the
+        // queue borrow.
+        let Some(item) = queue.current() else {
+            return;
+        };
+        let path = std::path::PathBuf::from(&item.file);
+        let has_existing = item.has_existing_art;
+        let reprocess = queue.reprocess_existing;
+        let redump_id = item.best.redump_id;
+        let match_type = item.best.match_type.clone();
+        let display_title = item.best.title.clone();
+
+        // Existing-art auto-skip path.
+        if has_existing && !reprocess {
+            self.log(
+                LogLevel::Info,
+                format!("Bulk: skipping (existing art): {}", path.display()),
+            );
+            self.record_bulk_done("existing-art", None);
+            // Don't mark this cursor as loaded; let advance kick us to the
+            // next pending item on the next tick.
+            return;
+        }
+
+        // Reset per-item transient state before kicking off the load.
+        self.pending_hash_redump_id = None;
+        self.bulk_loaded_cursor = Some(cursor);
+        self.bulk_suppress_cascade = true;
+        self.process_file(path.clone());
+        self.bulk_suppress_cascade = false;
+
+        // Inject the queue's chosen match in place of whatever the disc-read
+        // path would have produced.
+        if let Some(rid) = redump_id {
+            self.inject_bulk_match(rid, &display_title);
+        }
+
+        // For exact matches the queue is trusted enough to auto-trigger the
+        // artwork search. Fuzzy matches go through a confirm step in the
+        // next phase (Phase 4); for now they also auto-search so the flow
+        // is exercisable.
+        self.update_search_query_from_disc();
+        if !self.search_query_text.is_empty() {
+            let q = self.search_query_text.clone();
+            self.start_search(&q);
+        }
+        let _ = match_type; // reserved for the fuzzy-confirm step in Phase 4.
+    }
+
+    /// Replace `disc_info.redump_matches` with a single RedumpMatch fetched
+    /// by `redump_id`, so the UI reflects the queue's pre-decided answer
+    /// without re-running the cascade.
+    fn inject_bulk_match(&mut self, redump_id: i64, fallback_title: &str) {
+        let result = (|| -> Result<Option<crate::db::RedumpMatch>, String> {
+            let mgr =
+                crate::db::DatabaseManager::new().map_err(|e| e.to_string())?;
+            let conn = mgr.open().map_err(|e| e.to_string())?;
+            crate::db::by_redump_id(&conn, redump_id).map_err(|e| e.to_string())
+        })();
+
+        let m = match result {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                self.log(
+                    LogLevel::Warning,
+                    format!(
+                        "Bulk: redump #{redump_id} ({fallback_title}) not found in DB; \
+                         disc info shown without redump match"
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                self.log(
+                    LogLevel::Warning,
+                    format!("Bulk: failed to fetch redump #{redump_id}: {e}"),
+                );
+                return;
+            }
+        };
+
+        let log_line = format!(
+            "Bulk: locked match {} [#{}] via {:?}",
+            m.title, m.redump_id, m.matched_via
+        );
+        if let Some(Ok(info)) = self.disc_info.as_mut() {
+            info.redump_matches = Some(vec![m]);
+            info.fuzzy_matches = None;
+        }
+        self.log(LogLevel::Success, log_line);
+    }
+
+    /// Append a done-log entry for the current bulk item and advance the
+    /// cursor. Caller chooses the status string (saved/skipped/existing-art).
+    fn record_bulk_done(&mut self, status: &str, image_url: Option<String>) {
+        // Build the entry while holding the queue borrow; release it before
+        // we touch self.log.
+        let (write_err, item_status_for_advance) = {
+            let Some(queue) = self.bulk_queue.as_mut() else {
+                return;
+            };
+            let Some(item) = queue.current() else {
+                return;
+            };
+            let queue_redump_id = item.best.redump_id;
+            let file = item.file.clone();
+            let hash_redump_id = self
+                .pending_hash_redump_id
+                .filter(|h| Some(*h) != queue_redump_id);
+            let entry = super::bulk::DoneEntry {
+                file,
+                status: status.to_string(),
+                queue_redump_id,
+                hash_redump_id,
+                image_url,
+                ts: super::bulk::now_iso8601(),
+            };
+            let item_status = match status {
+                "saved" => super::bulk::ItemStatus::Saved,
+                "skipped" => super::bulk::ItemStatus::Skipped,
+                "existing-art" => super::bulk::ItemStatus::ExistingArt,
+                _ => super::bulk::ItemStatus::Skipped,
+            };
+            let err = queue.record(entry, item_status).err();
+            queue.advance();
+            (err, item_status)
+        };
+
+        if let Some(e) = write_err {
+            self.log(LogLevel::Error, format!("Bulk: done-log write failed: {e}"));
+        }
+        let _ = item_status_for_advance;
+        self.bulk_loaded_cursor = None;
+        self.pending_hash_redump_id = None;
     }
 
     /// Render the bulk loader modal when one is staged. Returns whether the
@@ -1412,6 +1606,9 @@ impl eframe::App for App {
         // Bulk-job loader modal (rendered as a centered Window). Independent
         // of the central-panel ui, so render through the context.
         self.render_bulk_loader(&ctx);
+
+        // Drive the bulk queue: load next item if cursor advanced.
+        self.tick_bulk();
 
         // Top-of-central banner when bulk mode is active.
         self.render_bulk_banner(ui);

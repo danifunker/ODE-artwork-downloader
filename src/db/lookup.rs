@@ -382,7 +382,6 @@ pub fn fuzzy_from_disc(
 }
 
 /// Lookup a single disc by its `redump_id`. Returns `None` if not present.
-#[allow(dead_code)]
 pub fn by_redump_id(conn: &Connection, redump_id: i64) -> rusqlite::Result<Option<RedumpMatch>> {
     let sql = format!("SELECT {SELECT_DISCS_COLS} FROM discs WHERE redump_id = ?1");
     conn.query_row(&sql, [redump_id], |row| {

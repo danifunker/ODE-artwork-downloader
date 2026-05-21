@@ -15,7 +15,8 @@ pub mod verify;
 pub use fuzzy::{fuzzy_search, FuzzyCandidate, FuzzyInputs, ScoreSource};
 pub use verify::{classify as classify_one, gather_evidence, verify as verify_candidates, DiscEvidence, Verdict};
 pub use lookup::{
-    cascade, cascade_from_disc, fuzzy_from_disc, CascadeInputs, MatchSource, RedumpMatch,
+    by_redump_id, cascade, cascade_from_disc, fuzzy_from_disc, CascadeInputs, MatchSource,
+    RedumpMatch,
 };
 pub use manager::{DatabaseManager, UpdateOutcome};
 
