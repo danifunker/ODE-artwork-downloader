@@ -738,6 +738,26 @@ impl App {
         self.pending_hash_redump_id = None;
     }
 
+    /// Clear all per-disc state so the central panel returns to the
+    /// "no file selected" view. Used when bulk mode finishes the last
+    /// item — the prior disc shouldn't stay loaded as if the user picked
+    /// it manually. Also cancels any in-flight hashing/search/preview.
+    fn unload_disc(&mut self) {
+        self.cancel_hashing();
+        self.selected_path = None;
+        self.disc_info = None;
+        self.search_query_text.clear();
+        self.manual_url.clear();
+        self.search_results.clear();
+        self.selected_image_index = None;
+        self.preview_texture = None;
+        self.preview_url = None;
+        self.preview_error = None;
+        self.show_search_window = false;
+        self.browse_view.clear();
+        self.show_browse_window = false;
+    }
+
     /// Per-frame driver for bulk mode. If the cursor advanced to a new item,
     /// either auto-skip it (existing art + reprocess off) or load the disc
     /// and inject the queue's chosen match. After loading, the artwork
@@ -747,6 +767,14 @@ impl App {
             return;
         };
         if queue.is_complete() {
+            // First tick after the final item resolved: unload the disc so
+            // the central panel doesn't keep showing the last-processed
+            // file. The banner stays up (with the green "complete" notice)
+            // until the user clicks Exit bulk.
+            if self.bulk_loaded_cursor.is_some() {
+                self.unload_disc();
+                self.bulk_loaded_cursor = None;
+            }
             return;
         }
         let cursor = queue.cursor;
@@ -1780,6 +1808,7 @@ impl App {
                 Ok(Ok(result)) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    self.show_search_window = false;
                     let saved_url = self.pending_export_url.take();
                     let msg = if result.was_cropped {
                         format!(
