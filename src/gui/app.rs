@@ -1063,14 +1063,14 @@ impl App {
         let cursor = queue.cursor;
         let complete = queue.is_complete();
 
-        // Snapshot the next ~5 pending items for the "Up next" strip.
+        // Snapshot the next ~3 pending items for the "Up next" strip.
         let upcoming: Vec<(usize, String, String)> = queue
             .items
             .iter()
             .enumerate()
             .skip(cursor + 1)
             .filter(|(idx, _)| queue.statuses[*idx] == super::bulk::ItemStatus::Pending)
-            .take(5)
+            .take(3)
             .map(|(idx, it)| {
                 let stem = std::path::Path::new(&it.file)
                     .file_name()
@@ -1087,7 +1087,10 @@ impl App {
         egui::Frame::group(ui.style())
             .fill(ui.visuals().faint_bg_color)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // Row 1: status + current item. Long filenames are allowed
+                // to wrap or truncate here without shoving the controls
+                // off-screen, because the controls live on row 2.
+                ui.horizontal_wrapped(|ui| {
                     ui.heading(if complete {
                         "Bulk job — complete"
                     } else {
@@ -1107,37 +1110,42 @@ impl App {
                             ui.label(title);
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("Exit bulk")
-                            .on_hover_text("Esc")
-                            .clicked()
-                        {
-                            exit_clicked = true;
-                        }
-                        if ui
-                            .add_enabled(!complete, egui::Button::new("Skip"))
-                            .on_hover_text("S — record as skipped and advance")
-                            .clicked()
-                        {
-                            skip_clicked = true;
-                        }
-                        if ui
-                            .add_enabled(cursor > 0, egui::Button::new("Back"))
-                            .on_hover_text("B — return to previous item")
-                            .clicked()
-                        {
-                            back_clicked = true;
-                        }
-                    });
                 });
 
-                // Upcoming-items strip: small, single-line, greyed.
+                ui.add_space(2.0);
+
+                // Row 2: controls. Always reachable regardless of how long
+                // the current filename is.
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(cursor > 0, egui::Button::new("Back"))
+                        .on_hover_text("B — return to previous item")
+                        .clicked()
+                    {
+                        back_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(!complete, egui::Button::new("Skip"))
+                        .on_hover_text("S — record as skipped and advance")
+                        .clicked()
+                    {
+                        skip_clicked = true;
+                    }
+                    if ui
+                        .button("Exit bulk")
+                        .on_hover_text("Esc")
+                        .clicked()
+                    {
+                        exit_clicked = true;
+                    }
+                });
+
+                // Row 3: upcoming items (max 3) — directly below the controls.
                 if !upcoming.is_empty() {
                     ui.add_space(2.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.weak("Up next:");
-                        for (_, stem, title) in &upcoming {
+                        for (i, (_, stem, title)) in upcoming.iter().enumerate() {
                             let label = if title.is_empty() {
                                 stem.clone()
                             } else {
@@ -1148,7 +1156,9 @@ impl App {
                                     .small()
                                     .color(egui::Color32::GRAY),
                             );
-                            ui.weak("·");
+                            if i + 1 < upcoming.len() {
+                                ui.weak("·");
+                            }
                         }
                     });
                 } else if !complete {
