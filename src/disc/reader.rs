@@ -114,6 +114,10 @@ pub struct DiscInfo {
     /// read. `None` means no lookup was attempted; `Some(vec![])` means it was
     /// attempted and found nothing.
     pub redump_matches: Option<Vec<crate::db::RedumpMatch>>,
+    /// Ranked fuzzy candidates, populated only when the exact cascade misses.
+    /// `None` = not attempted; `Some(vec![])` = attempted, nothing cleared the
+    /// floor.
+    pub fuzzy_matches: Option<Vec<crate::db::FuzzyCandidate>>,
 }
 
 impl DiscInfo {
@@ -174,6 +178,7 @@ impl DiscReader {
                     hfs_mdb: info.hfs_mdb,
                     hfsplus_header: info.hfsplus_header,
                     redump_matches: None,
+                    fuzzy_matches: None,
                 })
             }
             Err(opticaldiscs::error::OpticaldiscsError::UnsupportedFormat(fmt)) => {
@@ -206,6 +211,7 @@ impl DiscReader {
                     hfs_mdb: None,
                     hfsplus_header: None,
                     redump_matches: None,
+                    fuzzy_matches: None,
                 })
             }
         }

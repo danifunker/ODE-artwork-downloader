@@ -179,12 +179,10 @@ pub fn cascade(
             return Ok(Some(hits));
         }
     }
-    if let Some(crc32) = inputs.track_crc32 {
-        let hits = by_track_crc32(conn, crc32)?;
-        if !hits.is_empty() {
-            return Ok(Some(hits));
-        }
-    }
+    // NOTE: CRC32 is intentionally NOT an exact tier. It is only 32 bits and
+    // collides — a scan found unrelated Windows/Visual Studio ISOs all matching
+    // one redump entry by CRC32 alone. Any genuine match already hits via SHA1
+    // or MD5 above, so CRC32 adds nothing but false positives here.
     if let Some(serial) = inputs.serial {
         let hits = by_serial(conn, serial)?;
         if !hits.is_empty() {
@@ -244,6 +242,141 @@ pub fn cascade_from_disc(
     };
 
     Ok(cascade(conn, &inputs)?.unwrap_or_default())
+}
+
+/// Build fuzzy-match inputs from a disc and run the fuzzy search. Called by
+/// the UI only after the exact cascade misses. Returns ranked candidates.
+pub fn fuzzy_from_disc(
+    conn: &Connection,
+    info: &crate::disc::DiscInfo,
+    cfg: &crate::config::FuzzyMatchConfig,
+    deep_dig: bool,
+) -> rusqlite::Result<Vec<crate::db::FuzzyCandidate>> {
+    // Title candidates in priority order, de-duplicated, non-empty. For each
+    // raw source string we also include label_variants (letter↔digit split,
+    // CamelCase split, version-suffix strip) so labels like `QUAKE106` reach
+    // `Quake` and `MortalKombat3` reaches `Mortal Kombat 3`.
+    let mut titles: Vec<String> = Vec::new();
+    let mut push_title = |s: &str| {
+        let t = s.trim();
+        if !t.is_empty() && !titles.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+            titles.push(t.to_string());
+        }
+    };
+    let mut push_with_variants = |s: &str| {
+        for v in crate::db::fuzzy::label_variants(s) {
+            push_title(&v);
+        }
+    };
+    if let Some(label) = info.volume_label.as_deref() {
+        push_with_variants(label);
+    }
+    push_with_variants(&info.parsed_filename.title);
+    push_with_variants(&info.parsed_filename.original);
+    push_with_variants(&info.title);
+
+    let pvd_volume_id = info
+        .pvd
+        .as_ref()
+        .map(|p| p.volume_id.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Per-track durations in CD frames from the absolute TOC offsets.
+    let disc_track_frames = info
+        .toc
+        .as_ref()
+        .map(|toc| {
+            let offsets = &toc.track_offsets;
+            let mut frames = Vec::with_capacity(offsets.len());
+            for i in 0..offsets.len() {
+                let end = offsets.get(i + 1).copied().unwrap_or(toc.lead_out);
+                frames.push(end.saturating_sub(offsets[i]));
+            }
+            frames
+        })
+        .unwrap_or_default();
+
+    // Total disc payload for the size-sanity source. On a mixed-mode disc the
+    // PVD `volume_space_size` counts only the ISO data track, but redump's
+    // total includes the audio tracks — comparing those directly makes a real
+    // game look 5–10× too small and Source D wrongly drops it. When a TOC is
+    // present use the lead-out (total frames × 2352 = whole-disc bytes), which
+    // is comparable to redump's per-track byte sum. Fall back to the PVD size
+    // for pure-data ISOs with no TOC.
+    let disc_payload_bytes = info
+        .toc
+        .as_ref()
+        .map(|toc| toc.lead_out as u64 * 2352)
+        .or_else(|| {
+            info.pvd
+                .as_ref()
+                .map(|p| p.volume_space_size as u64 * p.logical_block_size.max(2048) as u64)
+        });
+
+    let mut inputs = crate::db::FuzzyInputs {
+        title_candidates: titles,
+        pvd_volume_id,
+        pvd_creation_date: None,
+        disc_track_frames,
+        disc_payload_bytes,
+    };
+
+    // First (shallow) pass: volume label + filename derivations only — no
+    // filesystem walk.
+    let mut candidates = crate::db::fuzzy_search(conn, &inputs, cfg)?;
+
+    let strong = |cands: &[crate::db::FuzzyCandidate]| {
+        cands.iter().filter(|c| c.score >= cfg.strong_score).count()
+    };
+
+    // Decide whether we need to read the disc. Two triggers:
+    //   - zero candidates       → dig for more (cryptic labels like TR1)
+    //   - many strong candidates → dig to disambiguate / rule out
+    let need_dig = candidates.is_empty() || strong(&candidates) >= cfg.min_strong_for_verify;
+    if !need_dig {
+        return Ok(candidates);
+    }
+    // Caller (e.g. CLI `--no-deep-filesystem-search`) opted out of the disc
+    // walk. Return the shallow-pass candidates as-is, without enrichment or
+    // content-based verification.
+    if !deep_dig {
+        return Ok(candidates);
+    }
+
+    // Walk the disc once; reuse the result for both candidate enrichment and
+    // verification.
+    let content = crate::disc::read_content(info);
+    log::debug!(
+        "deep-dig: files_seen={} bytes_read={} phrases={} tokens={} date={:?}",
+        content.files_seen,
+        content.bytes_read,
+        content.phrase_candidates.len(),
+        content.tokens.len(),
+        content.creation_date,
+    );
+
+    // If the shallow pass found nothing, enrich candidates with on-disc phrase
+    // hints (directory names, exe stems, autorun/readme labels) and re-run.
+    if candidates.is_empty() && !content.phrase_candidates.is_empty() {
+        let mut seen: Vec<String> = inputs.title_candidates.clone();
+        for phrase in &content.phrase_candidates {
+            for v in crate::db::fuzzy::label_variants(phrase) {
+                if !seen.iter().any(|e| e.eq_ignore_ascii_case(&v)) {
+                    seen.push(v);
+                }
+            }
+        }
+        inputs.title_candidates = seen;
+        candidates = crate::db::fuzzy_search(conn, &inputs, cfg)?;
+    }
+
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+
+    // Verify against the disc evidence we already gathered.
+    let evidence: crate::db::DiscEvidence = content.into();
+    Ok(crate::db::verify_candidates(candidates, &evidence))
 }
 
 /// Lookup a single disc by its `redump_id`. Returns `None` if not present.

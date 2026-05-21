@@ -76,6 +76,111 @@ pub struct AppConfig {
     /// UI log verbosity. One of: error, warn, info, debug, trace, off.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default)]
+    pub fuzzy_match: FuzzyMatchConfig,
+}
+
+/// Tunable knobs for fuzzy redump matching (see
+/// `docs/fuzzy_match_against_redump.md`). Defaults are deliberately loose for
+/// the initial data-collection phase; tighten once real candidate
+/// distributions are known.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FuzzyMatchConfig {
+    /// Minimum per-source similarity for a candidate to be considered.
+    #[serde(default = "default_fuzzy_source_threshold")]
+    pub source_threshold: f64,
+    /// Minimum merged score for a candidate to be returned.
+    #[serde(default = "default_fuzzy_floor")]
+    pub merged_floor: f64,
+    /// Maximum number of ranked candidates returned.
+    #[serde(default = "default_fuzzy_candidate_cap")]
+    pub candidate_cap: usize,
+    /// Half-window (days) for the relaxed PVD creation-date match.
+    #[serde(default = "default_fuzzy_date_window_days")]
+    pub date_window_days: i64,
+    /// Per-track duration tolerance in CD frames (~75 frames = 1s).
+    #[serde(default = "default_fuzzy_track_frame_tolerance")]
+    pub track_frame_tolerance: u32,
+    /// Minimum disc track count before the track-signature source runs. Low
+    /// counts (1–2 tracks) are too generic and produce false positives.
+    #[serde(default = "default_fuzzy_min_tracks_for_signature")]
+    pub min_tracks_for_signature: usize,
+    /// Score threshold above which we count a candidate as "strong" for
+    /// the verification trigger.
+    #[serde(default = "default_fuzzy_strong_score")]
+    pub strong_score: f64,
+    /// Minimum number of strong candidates before content-inspection
+    /// verification runs. With one obvious answer we skip the disc walk.
+    #[serde(default = "default_fuzzy_min_strong_for_verify")]
+    pub min_strong_for_verify: usize,
+    /// Bonus added per additional source that agrees on a candidate.
+    #[serde(default = "default_fuzzy_agreement_bonus")]
+    pub agreement_bonus: f64,
+    /// Payload-size ratio at/above which no size penalty applies.
+    #[serde(default = "default_fuzzy_size_ok_ratio")]
+    pub size_ok_ratio: f64,
+    /// Payload-size ratio below which a candidate is dropped entirely.
+    #[serde(default = "default_fuzzy_size_drop_ratio")]
+    pub size_drop_ratio: f64,
+    /// Score multiplier applied in the mid size-ratio band.
+    #[serde(default = "default_fuzzy_size_penalty")]
+    pub size_penalty: f64,
+}
+
+fn default_fuzzy_source_threshold() -> f64 {
+    0.70
+}
+fn default_fuzzy_floor() -> f64 {
+    0.60
+}
+fn default_fuzzy_candidate_cap() -> usize {
+    20
+}
+fn default_fuzzy_date_window_days() -> i64 {
+    30
+}
+fn default_fuzzy_track_frame_tolerance() -> u32 {
+    150
+}
+fn default_fuzzy_min_tracks_for_signature() -> usize {
+    3
+}
+fn default_fuzzy_strong_score() -> f64 {
+    0.90
+}
+fn default_fuzzy_min_strong_for_verify() -> usize {
+    1
+}
+fn default_fuzzy_agreement_bonus() -> f64 {
+    0.05
+}
+fn default_fuzzy_size_ok_ratio() -> f64 {
+    0.80
+}
+fn default_fuzzy_size_drop_ratio() -> f64 {
+    0.50
+}
+fn default_fuzzy_size_penalty() -> f64 {
+    0.85
+}
+
+impl Default for FuzzyMatchConfig {
+    fn default() -> Self {
+        Self {
+            source_threshold: default_fuzzy_source_threshold(),
+            merged_floor: default_fuzzy_floor(),
+            candidate_cap: default_fuzzy_candidate_cap(),
+            date_window_days: default_fuzzy_date_window_days(),
+            track_frame_tolerance: default_fuzzy_track_frame_tolerance(),
+            min_tracks_for_signature: default_fuzzy_min_tracks_for_signature(),
+            strong_score: default_fuzzy_strong_score(),
+            min_strong_for_verify: default_fuzzy_min_strong_for_verify(),
+            agreement_bonus: default_fuzzy_agreement_bonus(),
+            size_ok_ratio: default_fuzzy_size_ok_ratio(),
+            size_drop_ratio: default_fuzzy_size_drop_ratio(),
+            size_penalty: default_fuzzy_size_penalty(),
+        }
+    }
 }
 
 fn default_log_level() -> String {
@@ -217,6 +322,7 @@ impl Default for AppConfig {
             update_check: UpdateCheckConfig::default(),
             discogs: DiscogsConfig::default(),
             log_level: default_log_level(),
+            fuzzy_match: FuzzyMatchConfig::default(),
         }
     }
 }

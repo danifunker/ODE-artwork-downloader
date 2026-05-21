@@ -211,7 +211,8 @@ impl App {
         match crate::db::cascade_from_disc(&conn, info) {
             Ok(matches) => {
                 if matches.is_empty() {
-                    self.log(LogLevel::Info, "Redump: no match");
+                    self.log(LogLevel::Info, "Redump: no exact match, trying fuzzy");
+                    self.run_fuzzy(&conn, info);
                 } else {
                     let head = &matches[0];
                     let more = matches.len().saturating_sub(1);
@@ -232,6 +233,37 @@ impl App {
             }
             Err(e) => {
                 log::warn!("Redump cascade failed: {e}");
+            }
+        }
+    }
+
+    /// Run fuzzy matching after the exact cascade missed. Attaches a ranked
+    /// candidate list in-place and logs a one-line summary. During the initial
+    /// data-collection phase the full list is surfaced regardless of score.
+    fn run_fuzzy(&mut self, conn: &rusqlite::Connection, info: &mut DiscInfo) {
+        let cfg = &crate::config::get_config().fuzzy_match;
+        match crate::db::fuzzy_from_disc(conn, info, cfg, true) {
+            Ok(candidates) => {
+                if candidates.is_empty() {
+                    self.log(LogLevel::Info, "Fuzzy: no candidates above floor");
+                } else {
+                    let top = &candidates[0];
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "Fuzzy: {} candidate(s); top {} [#{}] {:.2} ({})",
+                            candidates.len(),
+                            top.title,
+                            top.redump_id,
+                            top.score,
+                            top.match_reason,
+                        ),
+                    );
+                }
+                info.fuzzy_matches = Some(candidates);
+            }
+            Err(e) => {
+                log::warn!("Fuzzy search failed: {e}");
             }
         }
     }
@@ -512,6 +544,7 @@ impl App {
                         hfs_mdb: None,
                         hfsplus_header: None,
                         redump_matches: None,
+                        fuzzy_matches: None,
                     };
 
                     let mut fallback_info = fallback_info;
@@ -2014,6 +2047,38 @@ impl eframe::App for App {
                                         "Searching… (waiting on hash)",
                                     );
                                     ui.end_row();
+                                }
+
+                                // Fuzzy candidates (only when exact match missed)
+                                if let Some(fuzzy) = &info.fuzzy_matches {
+                                    if !fuzzy.is_empty() {
+                                        ui.label("Possible matches:");
+                                        ui.vertical(|ui| {
+                                            for c in fuzzy {
+                                                ui.horizontal(|ui| {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(220, 180, 80),
+                                                        format!("{:.0}%", c.score * 100.0),
+                                                    );
+                                                    let mut title = format!(
+                                                        "{} (#{})",
+                                                        c.title, c.redump_id
+                                                    );
+                                                    if let Some(v) = &c.inferred_version {
+                                                        title.push_str(&format!(" v{v}"));
+                                                    }
+                                                    ui.label(title);
+                                                    ui.hyperlink_to("↗", &c.redump_url);
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(&c.match_reason)
+                                                        .small()
+                                                        .color(egui::Color32::GRAY),
+                                                );
+                                            }
+                                        });
+                                        ui.end_row();
+                                    }
                                 }
 
                                 // Cover art status
