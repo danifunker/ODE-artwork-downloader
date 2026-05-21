@@ -1123,8 +1123,9 @@ impl App {
 
                 ui.add_space(2.0);
 
-                // Row 2: controls. Always reachable regardless of how long
-                // the current filename is.
+                // Row 2: controls + upcoming on the same line. Controls go
+                // first so they're always reachable; the upcoming list
+                // takes whatever space is left and marquees if too long.
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(cursor > 0, egui::Button::new("Back"))
@@ -1147,41 +1148,34 @@ impl App {
                     {
                         exit_clicked = true;
                     }
-                });
 
-                // Row 3: upcoming items (max 3) — directly below the controls.
-                if !upcoming.is_empty() {
-                    ui.add_space(2.0);
-                    ui.horizontal_wrapped(|ui| {
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    if !upcoming.is_empty() {
                         ui.weak("Up next:");
-                        for (i, (_, stem, title)) in upcoming.iter().enumerate() {
-                            let label = if title.is_empty() {
-                                stem.clone()
-                            } else {
-                                format!("{stem} → {title}")
-                            };
-                            ui.label(
-                                egui::RichText::new(label)
-                                    .small()
-                                    .color(egui::Color32::GRAY),
-                            );
-                            if i + 1 < upcoming.len() {
-                                ui.weak("·");
-                            }
-                        }
-                    });
-                } else if !complete {
-                    ui.add_space(2.0);
-                    ui.weak("Last item in queue.");
-                }
-
-                if complete {
-                    ui.add_space(2.0);
-                    ui.colored_label(
-                        egui::Color32::LIGHT_GREEN,
-                        "All items processed — click Exit bulk to return to single-disc mode.",
-                    );
-                }
+                        let line = upcoming
+                            .iter()
+                            .map(|(_, stem, t)| {
+                                if t.is_empty() {
+                                    stem.clone()
+                                } else {
+                                    format!("{stem} → {t}")
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ·  ");
+                        let avail = ui.available_width().max(120.0);
+                        marquee_label(ui, &line, avail);
+                    } else if !complete {
+                        ui.weak("Last item in queue.");
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_GREEN,
+                            "All items processed — click Exit bulk to return to single-disc mode.",
+                        );
+                    }
+                });
             });
 
         self.bulk_banner_bottom_y = Some(frame_resp.response.rect.bottom());
