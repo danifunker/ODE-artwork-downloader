@@ -29,6 +29,13 @@ pub fn apply_disc_badge(img: DynamicImage, n: u32, total: Option<u32>) -> Dynami
     apply_badge_text(img, &label)
 }
 
+/// Like `apply_disc_badge` but with a caller-supplied label string. Used for
+/// role-marked discs ("Install", "Game", "Bonus") where the format doesn't
+/// match the numbered `"Disc N"` convention.
+pub fn apply_label_badge(img: DynamicImage, label: &str) -> DynamicImage {
+    apply_badge_text(img, label)
+}
+
 fn apply_badge_text(img: DynamicImage, text: &str) -> DynamicImage {
     let font = match FontVec::try_from_vec(FONT_BYTES.to_vec()) {
         Ok(f) => f,

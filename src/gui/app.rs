@@ -8,8 +8,8 @@ use std::thread;
 use crate::api::{open_in_browser, ArtworkSearchQuery, SearchConfig, ContentType};
 use crate::disc::{supported_extensions, parse_filename, ConfidenceLevel, DiscInfo, DiscReader, DiscFormat, FilesystemType};
 use crate::export::{
-    export_artwork, export_artwork_from_url_with_disc, generate_output_path, ExportResult,
-    ExportSettings,
+    export_artwork, export_artwork_from_url_with_disc, export_artwork_from_url_with_label,
+    generate_output_path, ExportResult, ExportSettings,
 };
 use crate::search::ImageResult;
 use crate::update::{UpdateConfig, UpdateInfo};
@@ -1871,27 +1871,30 @@ impl App {
         //   1. In bulk mode, the queue's same-set neighbors that haven't
         //      been processed yet.
         //   2. In single-disc mode, a directory scan.
-        let siblings: Vec<(std::path::PathBuf, u32)> = if self.bulk_queue.is_some() {
-            self.queue_siblings_for(&selected)
-        } else {
-            crate::disc::set_membership::siblings_in_dir(&selected)
-                .into_iter()
-                .map(|s| (s.path, s.disc_number))
-                .collect()
-        };
+        let siblings: Vec<(std::path::PathBuf, crate::disc::set_membership::DiscMarker)> =
+            if self.bulk_queue.is_some() {
+                self.queue_siblings_for(&selected)
+            } else {
+                crate::disc::set_membership::siblings_in_dir(&selected)
+                    .into_iter()
+                    .map(|s| (s.path, s.marker))
+                    .collect()
+            };
 
         if siblings.is_empty() {
             return;
         }
 
-        let total = self.disc_info.as_ref().and_then(|r| r.as_ref().ok()).and_then(
-            |info| {
+        let total_from_match = self
+            .disc_info
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|info| {
                 info.redump_matches
                     .as_ref()
                     .and_then(|ms| ms.first())
                     .and_then(|m| crate::disc::set_membership::parse_disc_total(&m.title))
-            },
-        );
+            });
 
         self.log(
             LogLevel::Info,
@@ -1902,22 +1905,35 @@ impl App {
         );
 
         let settings = ExportSettings::default();
-        for (sib_path, sib_num) in &siblings {
+        for (sib_path, sib_marker) in &siblings {
+            // For numbered markers, swap in the total hint we got from the
+            // redump title (if any) so "Disc 2" becomes "Disc 2/3".
+            let badge_marker = match sib_marker {
+                crate::disc::set_membership::DiscMarker::Numbered { number, total } => {
+                    crate::disc::set_membership::DiscMarker::Numbered {
+                        number: *number,
+                        total: total.or(total_from_match),
+                    }
+                }
+                role @ crate::disc::set_membership::DiscMarker::Role(_) => role.clone(),
+            };
+            let label = badge_marker.badge_label();
             let out_path = generate_output_path(sib_path);
-            match export_artwork_from_url_with_disc(
+            let result = export_artwork_from_url_with_label(
                 image_url,
                 &out_path,
                 &settings,
-                Some(*sib_num),
-                total,
-            ) {
+                label.as_deref(),
+            );
+            let pretty = label.clone().unwrap_or_else(|| "(unbadged)".into());
+            match result {
                 Ok(_) => self.log(
                     LogLevel::Success,
-                    format!("  sibling Disc {sib_num}: saved to {out_path}"),
+                    format!("  sibling {pretty}: saved to {out_path}"),
                 ),
                 Err(e) => self.log(
                     LogLevel::Warning,
-                    format!("  sibling Disc {sib_num}: failed ({e})"),
+                    format!("  sibling {pretty}: failed ({e})"),
                 ),
             }
         }
@@ -1949,11 +1965,12 @@ impl App {
     }
 
     /// Find unfinished queue items whose disc file shares a set key with
-    /// `selected`. Returns (path, disc_number) pairs ready for export.
+    /// `selected`. Returns (path, marker) pairs ready for export — the
+    /// marker decides what label (if any) lands on the badge.
     fn queue_siblings_for(
         &self,
         selected: &std::path::Path,
-    ) -> Vec<(std::path::PathBuf, u32)> {
+    ) -> Vec<(std::path::PathBuf, crate::disc::set_membership::DiscMarker)> {
         let Some(queue) = self.bulk_queue.as_ref() else {
             return Vec::new();
         };
@@ -1976,12 +1993,12 @@ impl App {
             if crate::disc::set_membership::set_key(stem) != my_key {
                 continue;
             }
-            let Some(num) = crate::disc::set_membership::disc_number_from_stem(stem)
-                .or_else(|| crate::disc::set_membership::disc_number_from_stem(&item.best.title))
+            let Some(marker) = crate::disc::set_membership::disc_marker_from_stem(stem)
+                .or_else(|| crate::disc::set_membership::disc_marker_from_stem(&item.best.title))
             else {
                 continue;
             };
-            out.push((path, num));
+            out.push((path, marker));
         }
         out
     }

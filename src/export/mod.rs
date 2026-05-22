@@ -134,6 +134,42 @@ pub fn export_artwork_from_url_with_disc<P: AsRef<Path>>(
     export_artwork_with_disc(&image_data, output_path, settings, disc_number, disc_total)
 }
 
+/// Like `export_artwork_from_url`, but stamps an arbitrary label badge.
+/// Used by the sibling auto-apply path for role-marked discs ("Install",
+/// "Game", "Bonus") that don't have a number to use in `Disc N`.
+pub fn export_artwork_from_url_with_label<P: AsRef<Path>>(
+    url: &str,
+    output_path: P,
+    settings: &ExportSettings,
+    badge_label: Option<&str>,
+) -> Result<ExportResult, String> {
+    let image_data = fetch_image(url)?;
+    let img = image::load_from_memory(&image_data)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+    let original_size = (img.width(), img.height());
+    let (cropped_img, was_cropped) = crop_to_square(img);
+    let resized = cropped_img.resize_exact(
+        settings.target_size,
+        settings.target_size,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let stamped = match badge_label {
+        Some(label) if !label.is_empty() => badge::apply_label_badge(resized, label),
+        _ => resized,
+    };
+    let rgb_image = stamped.to_rgb8();
+    let jpeg_data = encode_baseline_jpeg(&rgb_image, settings.quality)?;
+    let output_path = output_path.as_ref();
+    std::fs::write(output_path, &jpeg_data)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+    Ok(ExportResult {
+        output_path: output_path.display().to_string(),
+        original_size,
+        final_size: (settings.target_size, settings.target_size),
+        was_cropped,
+    })
+}
+
 /// Fetch image data from a URL
 fn fetch_image(url: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
