@@ -406,6 +406,16 @@ impl ArtworkSearchQuery {
             .map(|m| clean_redump_title(&m.title));
         let filename_title = info.parsed_filename.title.clone();
         let primary_title = redump_title.clone().unwrap_or_else(|| filename_title.clone());
+        log::debug!(
+            "search: build_query inputs file_stem={:?} parsed_title={:?} redump_title={:?} \
+             primary_title={:?} year={:?} region={:?}",
+            info.parsed_filename.original,
+            filename_title,
+            redump_title,
+            primary_title,
+            info.parsed_filename.year,
+            info.parsed_filename.region,
+        );
 
         // Detect if this is a Mac game based on:
         // 1. Filesystem type (HFS or HFS+)
@@ -523,6 +533,7 @@ impl ArtworkSearchQuery {
                 q.push_str(&format!(" {region_term}"));
             }
             q.push_str(&format!(" case {platform} site:mobygames.com"));
+            log::debug!("search: Games query: {q}");
             return q;
         }
 
@@ -564,7 +575,9 @@ impl ArtworkSearchQuery {
 
         parts.push(self.search_suffix.clone());
 
-        parts.join(" ")
+        let q = parts.join(" ");
+        log::debug!("search: query: {q}");
+        q
     }
 }
 

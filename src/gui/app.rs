@@ -793,11 +793,19 @@ impl App {
         let redump_id = item.best.redump_id;
         let match_type = item.best.match_type.clone();
         let display_title = item.best.title.clone();
+        let best_score = item.best.score;
+        let alt_count = item.alternates.len();
         let already_resolved = queue
             .statuses
             .get(cursor)
             .map(|s| *s != super::bulk::ItemStatus::Pending)
             .unwrap_or(false);
+        log::debug!(
+            "bulk: tick advance cursor={} file={} best=#{:?} \"{}\" ({}, score={:?}) alts={} \
+             has_existing_art={} reprocess_existing={} already_resolved={}",
+            cursor, path.display(), redump_id, display_title, match_type, best_score,
+            alt_count, has_existing, reprocess, already_resolved,
+        );
 
         // Existing-art auto-skip — but only for items that haven't been
         // resolved yet. If the user explicitly went Back to a Saved /
@@ -878,7 +886,13 @@ impl App {
         })();
 
         let m = match result {
-            Ok(Some(m)) => m,
+            Ok(Some(m)) => {
+                log::debug!(
+                    "bulk: inject local DB hit #{} \"{}\" matched_via={:?}",
+                    m.redump_id, m.title, m.matched_via
+                );
+                m
+            }
             Ok(None) => {
                 self.log(
                     LogLevel::Warning,
@@ -888,6 +902,10 @@ impl App {
                     ),
                 );
                 let Some(rec) = queue_best else { return };
+                log::debug!(
+                    "bulk: inject synthesized from queue Record #{:?} \"{}\"",
+                    rec.redump_id, rec.title
+                );
                 synth_match_from_record(rec)
             }
             Err(e) => {
@@ -896,6 +914,10 @@ impl App {
                     format!("Bulk: failed to fetch redump #{redump_id}: {e}"),
                 );
                 let Some(rec) = queue_best else { return };
+                log::debug!(
+                    "bulk: inject synthesized after DB error from queue Record #{:?} \"{}\"",
+                    rec.redump_id, rec.title
+                );
                 synth_match_from_record(rec)
             }
         };

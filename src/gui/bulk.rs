@@ -260,6 +260,12 @@ impl Default for QueueFilter {
 /// dropped. Alternates are also filtered so the user doesn't see junk when
 /// flipping to a different candidate.
 pub fn parse_queue_file(path: &Path, filter: &QueueFilter) -> Result<Vec<QueueItem>, String> {
+    log::debug!(
+        "bulk: parse_queue_file path={} filter.include_fuzzy={} filter.min_score={:.2}",
+        path.display(),
+        filter.include_fuzzy,
+        filter.fuzzy_min_score
+    );
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     let is_csv = path
@@ -270,16 +276,25 @@ pub fn parse_queue_file(path: &Path, filter: &QueueFilter) -> Result<Vec<QueueIt
     let mut items = if is_csv {
         let records = parse_fuzzy_scan_csv(&raw)
             .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        log::debug!("bulk: parsed {} CSV records", records.len());
         group_records(records)
     } else if let Ok(items) = serde_json::from_str::<Vec<QueueItem>>(&raw) {
+        log::debug!("bulk: parsed {} native queue items from JSON", items.len());
         items
     } else {
         let records: Vec<Record> = serde_json::from_str(&raw)
             .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        log::debug!("bulk: parsed {} flat records from JSON", records.len());
         group_records(records)
     };
 
+    let pre_filter = items.len();
     apply_filter(&mut items, filter);
+    log::debug!(
+        "bulk: filter dropped {} items, {} remain",
+        pre_filter.saturating_sub(items.len()),
+        items.len()
+    );
     Ok(items)
 }
 
@@ -344,16 +359,36 @@ fn group_records(records: Vec<Record>) -> Vec<QueueItem> {
         if recs.is_empty() {
             continue;
         }
+        // Sort by tier first (exact > musicbrainz > fuzzy), then by score
+        // desc, then by title length desc as a tie-breaker. The length tie-
+        // break is what fixes the "Star Trek" winning over "Star Trek:
+        // Generations" when token-set returns 1.0 for both: the longer,
+        // more specific title is almost always the right one.
         recs.sort_by(|a, b| {
             rank_record(a).cmp(&rank_record(b)).then_with(|| {
                 b.score
                     .unwrap_or(0.0)
                     .partial_cmp(&a.score.unwrap_or(0.0))
                     .unwrap_or(Ordering::Equal)
-            })
+            }).then_with(|| b.title.chars().count().cmp(&a.title.chars().count()))
         });
         let has_existing_art = has_sidecar_art(Path::new(&file));
         let best = recs.remove(0);
+        if recs.len() >= 1 {
+            log::debug!(
+                "bulk: group {} → best #{:?} \"{}\" ({}, score={:?}), {} alt(s): {}",
+                file,
+                best.redump_id,
+                best.title,
+                best.match_type,
+                best.score,
+                recs.len(),
+                recs.iter()
+                    .map(|r| format!("#{:?}:\"{}\"({:?})", r.redump_id, r.title, r.score))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
         items.push(QueueItem {
             file,
             best,
