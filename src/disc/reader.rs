@@ -67,6 +67,21 @@ pub enum DiscError {
 
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    /// CUE references one or more BIN/data files that aren't on disk.
+    /// We surface this separately from `IoError` so callers can act on it
+    /// (prompt the user to delete the orphaned cue, skip from a bulk scan,
+    /// show a targeted UI message) without pattern-matching on free-text
+    /// inside a generic error.
+    #[error("CUE references {} missing data file(s): {} (cue: {})", missing.len(), missing.join(", "), cue.display())]
+    BrokenCueReference {
+        cue: PathBuf,
+        missing: Vec<String>,
+        /// Total FILE directives in the cue, regardless of resolved-or-not.
+        /// `missing.len() == total_refs` means the cue is fully orphaned;
+        /// `missing.len() < total_refs` means it's partially broken.
+        total_refs: usize,
+    },
 }
 
 impl From<opticaldiscs::error::OpticaldiscsError> for DiscError {
@@ -140,6 +155,28 @@ impl DiscReader {
     pub fn read(path: &Path) -> Result<DiscInfo, DiscError> {
         if !path.exists() {
             return Err(DiscError::FileNotFound(path.to_path_buf()));
+        }
+
+        // Pre-flight: CUE files reference one or more external BIN/data
+        // files. If any of those aren't on disk, the rest of the reader
+        // pipeline can't do anything useful — no PVD, no TOC, no hashing.
+        // Fail fast with a clear error rather than silently fall back to
+        // filename-only and let downstream stages each emit their own
+        // confusing error.
+        let is_cue = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("cue"))
+            .unwrap_or(false);
+        if is_cue {
+            let scan = scan_cue_references(path);
+            if !scan.missing.is_empty() {
+                return Err(DiscError::BrokenCueReference {
+                    cue: path.to_path_buf(),
+                    missing: scan.missing,
+                    total_refs: scan.total_refs,
+                });
+            }
         }
 
         let parsed_filename = parse_filename(path);
@@ -216,6 +253,53 @@ impl DiscReader {
             }
         }
     }
+}
+
+/// Summary of a cue's FILE directives — total count and which referenced
+/// files don't currently exist on disk. Cheaper than going through the real
+/// cue parser; only does string scanning.
+#[derive(Debug, Clone, Default)]
+pub struct CueReferenceScan {
+    pub total_refs: usize,
+    pub missing: Vec<String>,
+}
+
+/// Walk every FILE directive in a cue sheet and record which named files
+/// don't exist next to the cue. Used by the broken-cue pre-flight in
+/// `DiscReader::read` and by the UI prompt that offers to delete the cue.
+pub fn scan_cue_references(cue_path: &Path) -> CueReferenceScan {
+    let mut out = CueReferenceScan::default();
+    let Ok(content) = std::fs::read_to_string(cue_path) else {
+        return out;
+    };
+    let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.to_ascii_uppercase().starts_with("FILE") {
+            continue;
+        }
+        // FILE "name with spaces.bin" BINARY
+        // FILE 'singlequoted.bin'    BINARY
+        // FILE bare.bin              BINARY    (rare but legal)
+        let after = &trimmed[4..].trim_start();
+        let name = if let Some(rest) = after.strip_prefix('"') {
+            rest.split_once('"').map(|(n, _)| n.to_string())
+        } else if let Some(rest) = after.strip_prefix('\'') {
+            rest.split_once('\'').map(|(n, _)| n.to_string())
+        } else {
+            after.split_whitespace().next().map(|s| s.to_string())
+        };
+        let Some(name) = name else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        out.total_refs += 1;
+        let resolved = cue_dir.join(&name);
+        if !resolved.exists() && !out.missing.iter().any(|n| n == &name) {
+            out.missing.push(name);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

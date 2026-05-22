@@ -25,4 +25,7 @@ pub use opticaldiscs::toc::{DiscTOC, TrackInfo};
 pub use identifier::{normalize_volume_label, parse_filename, ConfidenceLevel, ParsedFilename};
 pub use content::{read_content, DiscContent};
 pub use layout::{detect_sector_layout, SectorLayout};
-pub use reader::{clear_log_callback, set_log_callback, DiscError, DiscInfo, DiscReader};
+pub use reader::{
+    clear_log_callback, scan_cue_references, set_log_callback, CueReferenceScan,
+    DiscError, DiscInfo, DiscReader,
+};

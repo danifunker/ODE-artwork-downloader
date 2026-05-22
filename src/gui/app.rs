@@ -113,7 +113,26 @@ pub struct App {
     /// Used to pick the default position of the Artwork Search window
     /// so it opens directly below the controls in bulk mode.
     bulk_banner_bottom_y: Option<f32>,
+    /// Active "broken cue — delete?" prompt. Blocks the loading flow until
+    /// the user clicks Delete / Keep, or (in bulk mode) the auto-skip
+    /// timeout elapses.
+    broken_cue_prompt: Option<BrokenCuePrompt>,
 }
+
+/// Pending decision for a cue file whose referenced BIN(s) don't exist.
+struct BrokenCuePrompt {
+    cue_path: PathBuf,
+    missing: Vec<String>,
+    total_refs: usize,
+    /// True when the cue came up through bulk-mode processing. Drives the
+    /// auto-skip countdown and the queue-advance side-effect on Keep.
+    in_bulk: bool,
+    /// Wall-clock when the prompt was opened. The bulk countdown reads this
+    /// and dismisses with Keep after `BULK_AUTO_SKIP_SECS`.
+    opened_at: std::time::Instant,
+}
+
+const BULK_AUTO_SKIP_SECS: u64 = 10;
 
 /// Modal state for the bulk-job loader: pending file the user picked, plus
 /// the load-time toggles (reprocess existing art, include fuzzy with a
@@ -193,6 +212,7 @@ impl Default for App {
             pending_hash_redump_id: None,
             pending_export_url: None,
             bulk_banner_bottom_y: None,
+            broken_cue_prompt: None,
         }
     }
 }
@@ -537,6 +557,35 @@ impl App {
 
     /// Process a selected file
     fn process_file(&mut self, path: PathBuf) {
+        // Pre-flight: detect cue files whose BINs are missing and surface a
+        // "delete cue?" prompt before any of the rest of the load runs. The
+        // prompt is modal — the disc isn't loaded until the user resolves
+        // it (or, in bulk mode, the auto-skip timeout fires).
+        let scan = crate::disc::scan_cue_references(&path);
+        if !scan.missing.is_empty()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false)
+        {
+            self.broken_cue_prompt = Some(BrokenCuePrompt {
+                cue_path: path.clone(),
+                missing: scan.missing,
+                total_refs: scan.total_refs,
+                in_bulk: self.bulk_queue.is_some(),
+                opened_at: std::time::Instant::now(),
+            });
+            self.log(
+                LogLevel::Warning,
+                format!(
+                    "Broken cue detected: {} (missing data file(s))",
+                    path.display()
+                ),
+            );
+            return;
+        }
+
         self.log(LogLevel::Info, format!("Processing: {}", path.display()));
         self.selected_path = Some(path.clone());
 
@@ -1044,6 +1093,120 @@ impl App {
         let _ = item_status_for_advance;
         self.bulk_loaded_cursor = None;
         self.pending_hash_redump_id = None;
+    }
+
+    /// Render the broken-cue confirmation modal when one is staged. In bulk
+    /// mode shows a countdown that auto-dismisses with "Keep" after
+    /// `BULK_AUTO_SKIP_SECS` so a long-running queue isn't stuck behind a
+    /// prompt the user isn't around to answer.
+    fn render_broken_cue_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.broken_cue_prompt.as_ref() else {
+            return;
+        };
+        let cue = prompt.cue_path.clone();
+        let missing = prompt.missing.clone();
+        let total = prompt.total_refs;
+        let in_bulk = prompt.in_bulk;
+        let elapsed = prompt.opened_at.elapsed().as_secs();
+        let remaining = BULK_AUTO_SKIP_SECS.saturating_sub(elapsed);
+
+        let mut delete_clicked = false;
+        let mut keep_clicked = false;
+
+        egui::Window::new("Broken CUE file")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(cue.display().to_string()).strong());
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "{} of {} referenced data file(s) cannot be found:",
+                    missing.len(),
+                    total,
+                ));
+                ui.add_space(4.0);
+                for name in &missing {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!("  · {name}"),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label("Delete the cue file? (The cue can't be used without its data.)");
+
+                if in_bulk {
+                    ui.add_space(4.0);
+                    ui.weak(format!(
+                        "Auto-skipping (keep, don't delete) in {remaining}s …"
+                    ));
+                    // Pump the frame so the countdown ticks.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Delete cue").color(egui::Color32::LIGHT_RED),
+                        ))
+                        .clicked()
+                    {
+                        delete_clicked = true;
+                    }
+                    if ui.button("Keep (skip)").clicked() {
+                        keep_clicked = true;
+                    }
+                });
+            });
+
+        // Bulk-mode auto-skip after the timeout. Conservative default:
+        // never auto-delete — only auto-keep.
+        if in_bulk && remaining == 0 {
+            keep_clicked = true;
+        }
+
+        if delete_clicked {
+            self.resolve_broken_cue(true);
+        } else if keep_clicked {
+            self.resolve_broken_cue(false);
+        }
+    }
+
+    /// Apply the user's decision for the active broken-cue prompt. `delete`
+    /// removes the cue file from disk and logs the result; `false` keeps it.
+    /// In bulk mode also records the queue item as `skipped` (with a
+    /// distinct reason in the log) and advances the cursor.
+    fn resolve_broken_cue(&mut self, delete: bool) {
+        let Some(prompt) = self.broken_cue_prompt.take() else {
+            return;
+        };
+        let in_bulk = prompt.in_bulk;
+        let cue = prompt.cue_path;
+
+        if delete {
+            match std::fs::remove_file(&cue) {
+                Ok(()) => self.log(
+                    LogLevel::Success,
+                    format!("Deleted broken cue: {}", cue.display()),
+                ),
+                Err(e) => self.log(
+                    LogLevel::Error,
+                    format!("Could not delete {}: {e}", cue.display()),
+                ),
+            }
+        } else {
+            self.log(
+                LogLevel::Info,
+                format!("Kept broken cue (skipped): {}", cue.display()),
+            );
+        }
+
+        if in_bulk {
+            // Either path skips this queue item — record + advance so the
+            // bulk run keeps moving.
+            self.record_bulk_done("skipped", None);
+        }
     }
 
     /// Render the bulk loader modal when one is staged.
@@ -2198,11 +2361,19 @@ impl eframe::App for App {
         // of the central-panel ui, so render through the context.
         self.render_bulk_loader(&ctx);
 
+        // Broken-cue prompt — blocks tick_bulk from advancing until the
+        // user (or the bulk-mode timeout) resolves it.
+        self.render_broken_cue_prompt(&ctx);
+
         // Bulk-mode keyboard shortcuts.
         self.handle_bulk_hotkeys(&ctx);
 
-        // Drive the bulk queue: load next item if cursor advanced.
-        self.tick_bulk();
+        // Drive the bulk queue: load next item if cursor advanced. The
+        // broken-cue prompt is a blocker — don't try to load anything else
+        // until it resolves.
+        if self.broken_cue_prompt.is_none() {
+            self.tick_bulk();
+        }
 
         // Top-of-central banner when bulk mode is active.
         self.render_bulk_banner(ui);
