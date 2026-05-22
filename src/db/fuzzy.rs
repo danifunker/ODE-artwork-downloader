@@ -359,7 +359,7 @@ fn select_disc_rows(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql
 fn all_disc_rows(conn: &Connection) -> rusqlite::Result<Vec<DiscRow>> {
     select_disc_rows(
         conn,
-        "SELECT redump_id, system, title, redump_url, pvd_creation_date FROM discs",
+        "SELECT redump_id, system, title, redump_url, pvd_creation_date FROM redump_disc",
         &[],
     )
 }
@@ -378,8 +378,8 @@ fn fts_candidates(conn: &Connection, query: &str, limit: i64) -> rusqlite::Resul
     }
     let fts_query = tokens.join(" OR ");
     let sql = "SELECT d.redump_id, d.system, d.title, d.redump_url, d.pvd_creation_date \
-               FROM discs_fts JOIN discs d ON d.redump_id = discs_fts.rowid \
-               WHERE discs_fts MATCH ?1 ORDER BY bm25(discs_fts) LIMIT ?2";
+               FROM redump_disc_fts JOIN redump_disc d ON d.redump_id = redump_disc_fts.rowid \
+               WHERE redump_disc_fts MATCH ?1 ORDER BY bm25(redump_disc_fts) LIMIT ?2";
     select_disc_rows(conn, sql, &[&fts_query, &limit])
 }
 
@@ -401,7 +401,7 @@ fn bytes_to_frames(kind: &str, size_bytes: u64) -> u32 {
 
 fn track_summary(conn: &Connection, redump_id: i64) -> rusqlite::Result<TrackSummary> {
     let mut stmt = conn.prepare(
-        "SELECT kind, sectors, size_bytes FROM tracks WHERE redump_id = ?1 ORDER BY number",
+        "SELECT kind, sectors, size_bytes FROM redump_track WHERE redump_id = ?1 ORDER BY number",
     )?;
     let rows = stmt.query_map([redump_id], |row| {
         let kind: Option<String> = row.get(0)?;
@@ -555,13 +555,13 @@ fn source_pvd(
     // ~0 rows; bounded and cheap. Revisit if the re-seed makes this large.
     let rows = select_disc_rows(
         conn,
-        "SELECT redump_id, system, title, redump_url, pvd_creation_date FROM discs \
+        "SELECT redump_id, system, title, redump_url, pvd_creation_date FROM redump_disc \
          WHERE pvd_volume_id IS NOT NULL AND pvd_volume_id <> ''",
         &[],
     )?;
     // We also need each candidate's own volume label to compare against.
     let mut stmt = conn.prepare(
-        "SELECT pvd_volume_id FROM discs WHERE redump_id = ?1",
+        "SELECT pvd_volume_id FROM redump_disc WHERE redump_id = ?1",
     )?;
 
     for row in rows {
@@ -603,8 +603,8 @@ fn source_tracks(
     // Only consider discs whose track count is within ±1.
     let rows = select_disc_rows(
         conn,
-        "SELECT d.redump_id, d.system, d.title, d.redump_url, d.pvd_creation_date FROM discs d \
-         WHERE (SELECT COUNT(*) FROM tracks t WHERE t.redump_id = d.redump_id) \
+        "SELECT d.redump_id, d.system, d.title, d.redump_url, d.pvd_creation_date FROM redump_disc d \
+         WHERE (SELECT COUNT(*) FROM redump_track t WHERE t.redump_id = d.redump_id) \
                BETWEEN ?1 AND ?2",
         &[&(n - 1), &(n + 1)],
     )?;

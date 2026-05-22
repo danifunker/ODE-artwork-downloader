@@ -73,32 +73,32 @@ fn query_via_join(
 
 pub fn by_track_sha1(conn: &Connection, sha1: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN tracks t USING (redump_id) WHERE t.sha1 = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_track t USING (redump_id) WHERE t.sha1 = ?1"
     );
     query_via_join(conn, &sql, sha1, MatchSource::TrackSha1)
 }
 
 pub fn by_track_md5(conn: &Connection, md5: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN tracks t USING (redump_id) WHERE t.md5 = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_track t USING (redump_id) WHERE t.md5 = ?1"
     );
     query_via_join(conn, &sql, md5, MatchSource::TrackMd5)
 }
 
 pub fn by_track_crc32(conn: &Connection, crc32: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN tracks t USING (redump_id) WHERE t.crc32 = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_track t USING (redump_id) WHERE t.crc32 = ?1"
     );
     query_via_join(conn, &sql, crc32, MatchSource::TrackCrc32)
 }
 
 pub fn by_serial(conn: &Connection, serial: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN serials s USING (redump_id) WHERE s.serial = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_serial s USING (redump_id) WHERE s.serial = ?1"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows =
@@ -107,7 +107,7 @@ pub fn by_serial(conn: &Connection, serial: &str) -> rusqlite::Result<Vec<Redump
 }
 
 pub fn by_barcode(conn: &Connection, barcode: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
-    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM discs WHERE barcode = ?1");
+    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM redump_disc WHERE barcode = ?1");
     let mut stmt = conn.prepare(&sql)?;
     let rows =
         stmt.query_map([barcode], |row| row_to_match(row, MatchSource::Barcode))?;
@@ -123,7 +123,7 @@ pub fn by_pvd(
     creation_date: Option<&str>,
 ) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs \
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc \
          WHERE pvd_volume_id = ?1 AND (?2 IS NULL OR pvd_creation_date = ?2)"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -146,10 +146,10 @@ pub fn fuzzy_title(
 ) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
         "SELECT {SELECT_DISCS_COLS} \
-         FROM discs_fts \
-         JOIN discs d ON d.redump_id = discs_fts.rowid \
-         WHERE discs_fts MATCH ?1 \
-         ORDER BY bm25(discs_fts) \
+         FROM redump_disc_fts \
+         JOIN redump_disc d ON d.redump_id = redump_disc_fts.rowid \
+         WHERE redump_disc_fts MATCH ?1 \
+         ORDER BY bm25(redump_disc_fts) \
          LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -383,7 +383,7 @@ pub fn fuzzy_from_disc(
 
 /// Lookup a single disc by its `redump_id`. Returns `None` if not present.
 pub fn by_redump_id(conn: &Connection, redump_id: i64) -> rusqlite::Result<Option<RedumpMatch>> {
-    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM discs WHERE redump_id = ?1");
+    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM redump_disc WHERE redump_id = ?1");
     conn.query_row(&sql, [redump_id], |row| {
         row_to_match(row, MatchSource::PvdVolumeId)
     })

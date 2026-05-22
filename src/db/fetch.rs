@@ -1,4 +1,4 @@
-//! HTTP, hashing, and zstd decompression for the redump DB artifact.
+//! HTTP, hashing, and zstd decompression for the ODE-lookup DB artifact.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -35,9 +35,9 @@ pub struct Urls {
 impl Urls {
     pub fn latest() -> Self {
         Self {
-            zst: format!("{LATEST_RELEASE_BASE}/redump.sqlite.zst"),
-            zst_sha256: format!("{LATEST_RELEASE_BASE}/redump.sqlite.zst.sha256"),
-            plain_sha256: format!("{LATEST_RELEASE_BASE}/redump.sqlite.sha256"),
+            zst: format!("{LATEST_RELEASE_BASE}/ode-lookup.sqlite.zst"),
+            zst_sha256: format!("{LATEST_RELEASE_BASE}/ode-lookup.sqlite.zst.sha256"),
+            plain_sha256: format!("{LATEST_RELEASE_BASE}/ode-lookup.sqlite.sha256"),
         }
     }
 }
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn parse_coreutils_format() {
-        let body = "abc1230000000000000000000000000000000000000000000000000000000000  redump.sqlite.zst\n";
+        let body = "abc1230000000000000000000000000000000000000000000000000000000000  ode-lookup.sqlite.zst\n";
         let got = parse_sha256(body).unwrap();
         assert_eq!(got.len(), 64);
         assert!(got.starts_with("abc123"));
