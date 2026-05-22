@@ -406,8 +406,29 @@ impl App {
             Ok(Err(e)) => {
                 // "Unsupported format" / "cancelled" are not real failures.
                 if !e.contains("cancelled") && !e.contains("not yet supported") {
-                    log::warn!("Hashing failed: {e}");
-                    self.log(LogLevel::Warning, format!("Hashing failed: {e}"));
+                    // Hashing's redump-cascade benefit is mostly for ISO9660
+                    // data discs that redump catalogs deeply. For HFS / HFS+
+                    // discs the hash tier rarely helps even when it succeeds,
+                    // and the underlying CHD/CUE path frequently rejects them
+                    // outright. Surface that context so the warning isn't
+                    // mysterious.
+                    let suffix = match self
+                        .disc_info
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|i| i.filesystem)
+                    {
+                        Some(FilesystemType::Hfs) | Some(FilesystemType::HfsPlus) => {
+                            " (normal for HFS/HFS+ discs — redump doesn't catalog Mac \
+                             hashes deeply, so the hash tier wouldn't add much anyway)"
+                        }
+                        _ => "",
+                    };
+                    log::warn!("Hashing failed: {e}{suffix}");
+                    self.log(
+                        LogLevel::Warning,
+                        format!("Hashing failed: {e}{suffix}"),
+                    );
                 } else {
                     log::info!("Hashing skipped: {e}");
                 }
