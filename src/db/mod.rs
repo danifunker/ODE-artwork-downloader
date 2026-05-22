@@ -17,7 +17,7 @@ mod paths;
 mod seed;
 pub mod verify;
 
-pub use fuzzy::{fuzzy_search, FuzzyCandidate, FuzzyInputs, ScoreSource};
+pub use fuzzy::{fuzzy_search, FuzzyCandidate, FuzzyInputs, ScoreSource, WinworldRef};
 pub use verify::{classify as classify_one, gather_evidence, verify as verify_candidates, DiscEvidence, Verdict};
 pub use lookup::{
     by_redump_id, cascade, cascade_from_disc, fuzzy_from_disc, CascadeInputs, MatchSource,

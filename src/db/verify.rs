@@ -149,6 +149,7 @@ mod tests {
             inferred_version: None,
             pvd_creation_date: None,
             match_reason: "test".into(),
+            winworld: None,
         }
     }
 

@@ -183,6 +183,7 @@ fn sources_str(sources: &[ScoreSource]) -> String {
             ScoreSource::Pvd => "pvd",
             ScoreSource::Title => "title",
             ScoreSource::Tracks => "tracks",
+            ScoreSource::WinworldTitle => "winworld",
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -206,11 +207,18 @@ fn exact_record(file: &str, m: &RedumpMatch) -> Record {
 }
 
 fn fuzzy_record(file: &str, c: &FuzzyCandidate) -> Record {
+    // WinWorld candidates have no redump_id; emit None so CSV output doesn't
+    // claim a non-existent redump pressing.
+    let redump_id = if c.is_winworld() { None } else { Some(c.redump_id) };
     Record {
         file: file.to_string(),
         status: "ok".into(),
-        match_type: "fuzzy".into(),
-        redump_id: Some(c.redump_id),
+        match_type: if c.is_winworld() {
+            "fuzzy-winworld".into()
+        } else {
+            "fuzzy".into()
+        },
+        redump_id,
         title: c.title.clone(),
         system: c.system.clone(),
         score: Some(c.score),

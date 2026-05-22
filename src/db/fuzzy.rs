@@ -27,9 +27,35 @@ pub enum ScoreSource {
     Pvd,
     Title,
     Tracks,
+    /// Title (or download filename) matched a row from the winworld dataset.
+    WinworldTitle,
+}
+
+/// Identity for a winworld candidate. WinWorld discs aren't keyed by
+/// redump_id; instead they live under (product_slug, release_slug). Carried on
+/// a `FuzzyCandidate` when it represents a winworld release rather than a
+/// redump pressing.
+#[derive(Debug, Clone)]
+pub struct WinworldRef {
+    pub product_slug: String,
+    pub release_slug: String,
+    /// `info_links['Product type']` slug, e.g. `windows-3x`. Lets the UI tag
+    /// the candidate the same way redump's `system` field does.
+    pub category: Option<String>,
+    /// Best matching download filename, when the hit came from filename text.
+    /// Useful for the user to recognize "ah, this is the disc image".
+    pub matched_filename: Option<String>,
 }
 
 /// One ranked fuzzy candidate. Never a committed match — just a possibility.
+///
+/// Candidates can come from two sources:
+/// - **redump**: `redump_id > 0`, `winworld` is None.
+/// - **winworld**: `redump_id == 0`, `winworld` carries the slugs. The
+///   `system`/`title`/`redump_url` fields are still populated, but `system`
+///   holds the winworld category slug and `redump_url` is the winworld
+///   product URL. Downstream code that does `by_redump_id` will get None for
+///   these — that's the signal that this candidate has no redump pressing.
 #[derive(Debug, Clone)]
 pub struct FuzzyCandidate {
     pub redump_id: i64,
@@ -46,6 +72,16 @@ pub struct FuzzyCandidate {
     /// verification pass for date-based corroboration.
     pub pvd_creation_date: Option<String>,
     pub match_reason: String,
+    /// Present when this candidate came from the winworld dataset.
+    pub winworld: Option<WinworldRef>,
+}
+
+impl FuzzyCandidate {
+    /// True when this candidate originates from the winworld dataset rather
+    /// than redump. Equivalent to `self.winworld.is_some()`.
+    pub fn is_winworld(&self) -> bool {
+        self.winworld.is_some()
+    }
 }
 
 /// Everything the fuzzy matcher can use, pre-extracted from the disc so this
@@ -683,6 +719,212 @@ fn apply_size_sanity(
     Ok(Some((mult, ratio)))
 }
 
+// ── WinWorld source ─────────────────────────────────────────────────────────
+
+/// One winworld release row. Distinct from `DiscRow` because winworld has no
+/// redump_id and identifies releases by (product_slug, release_slug).
+struct WinworldRow {
+    product_slug: String,
+    release_slug: String,
+    title: String,
+    category: Option<String>,
+    url: String,
+}
+
+struct WinworldScratch {
+    row: WinworldRow,
+    score: f64,
+    reason: String,
+    matched_filename: Option<String>,
+}
+
+fn winworld_url(product_slug: &str, release_slug: &str) -> String {
+    format!("https://winworldpc.com/product/{product_slug}/{release_slug}")
+}
+
+/// FTS prefilter on `winworld_release_fts`. Sanitized exactly like
+/// `fts_candidates` so user/disc text can't break FTS5 syntax.
+fn winworld_fts_releases(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+) -> rusqlite::Result<Vec<WinworldRow>> {
+    let tokens: Vec<String> = normalize(query)
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .map(|t| format!("\"{t}\"*"))
+        .collect();
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fts_query = tokens.join(" OR ");
+
+    // Join via rowid back to the base table for product/category/url.
+    let sql = "SELECT r.product_slug, r.release_slug, \
+                      COALESCE(r.title, p.title, '') AS title, \
+                      p.category, p.url \
+               FROM winworld_release_fts \
+               JOIN winworld_release r ON r.rowid = winworld_release_fts.rowid \
+               JOIN winworld_product p ON p.product_slug = r.product_slug \
+               WHERE winworld_release_fts MATCH ?1 \
+               ORDER BY bm25(winworld_release_fts) \
+               LIMIT ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![fts_query, limit], |row| {
+        Ok(WinworldRow {
+            product_slug: row.get(0)?,
+            release_slug: row.get(1)?,
+            title: row.get(2)?,
+            category: row.get(3)?,
+            url: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        })
+    })?;
+    rows.collect()
+}
+
+/// Search `winworld_download.filename` for a literal token match. The
+/// filename is often the most reliable hook for disc images that come from
+/// the winworld archive (e.g. "Windows 95 OSR 2.5 [English] [Final].iso").
+/// Returns the matching download row joined with the parent release/product.
+fn winworld_by_filename(
+    conn: &Connection,
+    needle: &str,
+) -> rusqlite::Result<Vec<(WinworldRow, String)>> {
+    let needle = needle.trim();
+    if needle.len() < 3 {
+        return Ok(Vec::new());
+    }
+    let sql = "SELECT r.product_slug, r.release_slug, \
+                      COALESCE(r.title, p.title, '') AS title, \
+                      p.category, p.url, d.filename \
+               FROM winworld_download d \
+               JOIN winworld_release r USING (product_slug, release_slug) \
+               JOIN winworld_product p ON p.product_slug = r.product_slug \
+               WHERE d.filename LIKE ?1 COLLATE NOCASE \
+               LIMIT 200";
+    let mut stmt = conn.prepare(sql)?;
+    let like = format!("%{needle}%");
+    let rows = stmt.query_map([&like], |row| {
+        Ok((
+            WinworldRow {
+                product_slug: row.get(0)?,
+                release_slug: row.get(1)?,
+                title: row.get(2)?,
+                category: row.get(3)?,
+                url: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            },
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Probe whether the unified DB actually has the winworld tables. The pre-v3
+/// `redump.sqlite` artifact doesn't, so calling code must skip the source on
+/// older caches rather than failing the whole search.
+fn has_winworld_tables(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='winworld_release'",
+        [],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn upsert_ww(
+    acc: &mut HashMap<(String, String), WinworldScratch>,
+    row: WinworldRow,
+    score: f64,
+    reason: String,
+    matched_filename: Option<String>,
+) {
+    let key = (row.product_slug.clone(), row.release_slug.clone());
+    let entry = acc.entry(key).or_insert_with(|| WinworldScratch {
+        row: WinworldRow {
+            product_slug: row.product_slug.clone(),
+            release_slug: row.release_slug.clone(),
+            title: row.title.clone(),
+            category: row.category.clone(),
+            url: row.url.clone(),
+        },
+        score: 0.0,
+        reason: String::new(),
+        matched_filename: None,
+    });
+    if score > entry.score {
+        entry.score = score;
+        entry.reason = reason;
+    }
+    if entry.matched_filename.is_none() {
+        entry.matched_filename = matched_filename;
+    }
+}
+
+/// Run the winworld title source. Matches every expanded candidate string
+/// against `winworld_release_fts` titles and against `winworld_download`
+/// filenames. The same `best_title_score` rubric is reused so redump and
+/// winworld scores are directly comparable.
+fn source_winworld(
+    conn: &Connection,
+    inputs: &FuzzyInputs,
+    cfg: &FuzzyMatchConfig,
+    acc: &mut HashMap<(String, String), WinworldScratch>,
+) -> rusqlite::Result<()> {
+    if !has_winworld_tables(conn) {
+        return Ok(());
+    }
+
+    // Same expansion as `source_title`: include the version-stripped stem so
+    // labels like `WIN95_25` ride to `Windows 95`.
+    let mut expanded: Vec<String> = Vec::new();
+    for cand in &inputs.title_candidates {
+        let t = cand.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !expanded.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+            expanded.push(t.to_string());
+        }
+        let (stem, ver) = strip_version_suffix(t);
+        if ver.is_some() && !expanded.iter().any(|e| e.eq_ignore_ascii_case(&stem)) {
+            expanded.push(stem);
+        }
+    }
+
+    for cand in &expanded {
+        let cand = cand.as_str();
+
+        for row in winworld_fts_releases(conn, cand, (cfg.candidate_cap as i64) * 4)? {
+            let (score, matcher) = best_title_score(cand, &row.title);
+            if score >= cfg.source_threshold {
+                let reason = format!("winworld {matcher} {score:.2} vs {:?}", cand);
+                upsert_ww(acc, row, score, reason, None);
+            }
+        }
+
+        // Filename pass — only for distinctive tokens (≥3 chars, not generic).
+        // We rely on `LIKE` which is fast against ~3k filenames and OK for the
+        // small per-disc candidate vocabulary.
+        let norm = normalize(cand);
+        for token in norm.split_whitespace().filter(|t| t.len() >= 3) {
+            if is_generic_disc_token(token) {
+                continue;
+            }
+            for (row, filename) in winworld_by_filename(conn, token)? {
+                // Score the candidate against the release title so filename
+                // hits don't inflate unrelated releases.
+                let (score, _matcher) = best_title_score(cand, &row.title);
+                if score >= cfg.source_threshold {
+                    let reason =
+                        format!("winworld filename {:?} ~ {:?}", filename, row.title);
+                    upsert_ww(acc, row, score, reason, Some(filename));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Run all fuzzy sources and return ranked candidates above the merged floor,
@@ -698,7 +940,10 @@ pub fn fuzzy_search(
     source_pvd(conn, inputs, cfg, &mut acc)?;
     source_tracks(conn, inputs, cfg, &mut acc)?;
 
-    let mut out: Vec<FuzzyCandidate> = Vec::with_capacity(acc.len());
+    let mut ww_acc: HashMap<(String, String), WinworldScratch> = HashMap::new();
+    source_winworld(conn, inputs, cfg, &mut ww_acc)?;
+
+    let mut out: Vec<FuzzyCandidate> = Vec::with_capacity(acc.len() + ww_acc.len());
     for (_, scratch) in acc.into_iter().collect::<Vec<_>>() {
         // Agreement bonus: +bonus per source beyond the first, capped at 2x.
         let extra = scratch.sources.len().saturating_sub(1).min(2);
@@ -728,6 +973,44 @@ pub fn fuzzy_search(
             inferred_version: scratch.inferred_version,
             pvd_creation_date: scratch.row.pvd_creation_date,
             match_reason: scratch.reason,
+            winworld: None,
+        });
+    }
+
+    for (_, ww) in ww_acc.into_iter().collect::<Vec<_>>() {
+        // WinWorld has no track/payload signal, so the score is just the title
+        // score capped at 1.0. Use the merged_floor consistently.
+        let score = ww.score.min(1.0);
+        if score < cfg.merged_floor {
+            continue;
+        }
+        let row = ww.row;
+        let category = row.category.clone();
+        let url = if row.url.is_empty() {
+            winworld_url(&row.product_slug, &row.release_slug)
+        } else {
+            // The product URL points at the product page; the release lives
+            // beneath it. Use the per-release URL so a user clicking through
+            // lands directly on the matching pressing.
+            winworld_url(&row.product_slug, &row.release_slug)
+        };
+        out.push(FuzzyCandidate {
+            redump_id: 0,
+            system: category.clone().unwrap_or_else(|| "winworld".into()),
+            title: row.title.clone(),
+            redump_url: url,
+            score,
+            sources: vec![ScoreSource::WinworldTitle],
+            size_ratio: None,
+            inferred_version: None,
+            pvd_creation_date: None,
+            match_reason: ww.reason,
+            winworld: Some(WinworldRef {
+                product_slug: row.product_slug,
+                release_slug: row.release_slug,
+                category,
+                matched_filename: ww.matched_filename,
+            }),
         });
     }
 
@@ -735,7 +1018,16 @@ pub fn fuzzy_search(
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // Stable tiebreaker — redump candidates first when equal-scoring,
+            // then by redump_id / winworld slug.
+            .then_with(|| a.is_winworld().cmp(&b.is_winworld()))
             .then(a.redump_id.cmp(&b.redump_id))
+            .then_with(|| {
+                a.winworld
+                    .as_ref()
+                    .map(|w| (&w.product_slug, &w.release_slug))
+                    .cmp(&b.winworld.as_ref().map(|w| (&w.product_slug, &w.release_slug)))
+            })
     });
     out.truncate(cfg.candidate_cap);
     Ok(out)
