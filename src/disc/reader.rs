@@ -267,12 +267,21 @@ pub struct CueReferenceScan {
 /// Walk every FILE directive in a cue sheet and record which named files
 /// don't exist next to the cue. Used by the broken-cue pre-flight in
 /// `DiscReader::read` and by the UI prompt that offers to delete the cue.
+/// Existence lookup is case-insensitive: cues authored on case-insensitive
+/// filesystems (Windows, macOS HFS+ default) often reference `FOO.BIN`
+/// while the actual file on disk is `Foo.bin`. We don't want to false-flag
+/// those as broken.
 pub fn scan_cue_references(cue_path: &Path) -> CueReferenceScan {
     let mut out = CueReferenceScan::default();
     let Ok(content) = std::fs::read_to_string(cue_path) else {
         return out;
     };
     let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
+
+    // Lower-cased directory listing for the case-insensitive fallback.
+    // Built lazily so cues that resolve case-sensitively don't pay for it.
+    let mut lowercase_dir: Option<Vec<String>> = None;
+
     for line in content.lines() {
         let trimmed = line.trim();
         if !trimmed.to_ascii_uppercase().starts_with("FILE") {
@@ -294,8 +303,26 @@ pub fn scan_cue_references(cue_path: &Path) -> CueReferenceScan {
             continue;
         }
         out.total_refs += 1;
-        let resolved = cue_dir.join(&name);
-        if !resolved.exists() && !out.missing.iter().any(|n| n == &name) {
+        if cue_dir.join(&name).exists() {
+            continue;
+        }
+        // Case-insensitive fallback.
+        let dir_entries = lowercase_dir.get_or_insert_with(|| {
+            std::fs::read_dir(cue_dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| {
+                            e.file_name().to_str().map(|s| s.to_ascii_lowercase())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let lower_name = name.to_ascii_lowercase();
+        if dir_entries.iter().any(|e| e == &lower_name) {
+            continue;
+        }
+        if !out.missing.iter().any(|n| n == &name) {
             out.missing.push(name);
         }
     }
