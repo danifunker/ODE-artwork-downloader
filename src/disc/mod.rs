@@ -7,9 +7,12 @@
 //! ODE-specific logic (game title parsing, confidence scoring) lives here.
 
 pub mod browse;
+pub mod content;
 pub mod hasher;
 mod identifier;
+pub mod layout;
 mod reader;
+pub mod set_membership;
 
 // Re-exports from opticaldiscs
 pub use opticaldiscs::formats::{supported_extensions, DiscFormat, FilesystemType};
@@ -20,4 +23,9 @@ pub use opticaldiscs::toc::{DiscTOC, TrackInfo};
 
 // ODE-specific re-exports
 pub use identifier::{normalize_volume_label, parse_filename, ConfidenceLevel, ParsedFilename};
-pub use reader::{clear_log_callback, set_log_callback, DiscError, DiscInfo, DiscReader};
+pub use content::{read_content, DiscContent};
+pub use layout::{detect_sector_layout, SectorLayout};
+pub use reader::{
+    clear_log_callback, scan_cue_references, set_log_callback, CueReferenceScan,
+    DiscError, DiscInfo, DiscReader,
+};

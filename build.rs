@@ -85,47 +85,54 @@ fn encrypt_secrets() {
     println!("cargo:rerun-if-env-changed=DISCOGS_CONSUMER_SECRET");
 }
 
-/// Optionally download a fresh `redump.sqlite.zst` (and its sha256 sidecars)
-/// from the ODE-lookup-db release page so it can be embedded as a first-run
-/// seed via `include_bytes!`.
+/// Optionally download a fresh `ode-lookup.sqlite.zst` (and its sha256
+/// sidecars) from the ODE-lookup-db release page so it can be embedded as a
+/// first-run seed via `include_bytes!`.
 ///
-/// Behavior is driven by three env vars:
-/// - `EMBED_REDUMP_DB=1`           — opt in. Default (unset) writes empty
+/// Behavior is driven by three env vars (the legacy `EMBED_REDUMP_DB*` names
+/// are still honored as aliases so CI doesn't have to flip in lockstep):
+/// - `EMBED_LOOKUP_DB=1`           — opt in. Default (unset) writes empty
 ///                                    stub files and skips the network entirely.
 ///                                    This keeps local builds offline & fast.
-/// - `EMBED_REDUMP_DB_REQUIRED=1`  — make a failed fetch a hard build error.
+/// - `EMBED_LOOKUP_DB_REQUIRED=1`  — make a failed fetch a hard build error.
 ///                                    CI sets this only on scheduled runs.
-/// - `EMBED_REDUMP_DB_NONCE=...`   — opaque value (e.g. github.run_id) that
+/// - `EMBED_LOOKUP_DB_NONCE=...`   — opaque value (e.g. github.run_id) that
 ///                                    forces this build script to rerun even
 ///                                    when the cargo cache is warm.
-fn embed_redump_db() {
+fn embed_lookup_db() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let zst_path = Path::new(&out_dir).join("redump.sqlite.zst");
-    let zst_sha_path = Path::new(&out_dir).join("redump.sqlite.zst.sha256");
-    let plain_sha_path = Path::new(&out_dir).join("redump.sqlite.sha256");
+    let zst_path = Path::new(&out_dir).join("ode-lookup.sqlite.zst");
+    let zst_sha_path = Path::new(&out_dir).join("ode-lookup.sqlite.zst.sha256");
+    let plain_sha_path = Path::new(&out_dir).join("ode-lookup.sqlite.sha256");
 
-    println!("cargo:rerun-if-env-changed=EMBED_REDUMP_DB");
-    println!("cargo:rerun-if-env-changed=EMBED_REDUMP_DB_REQUIRED");
-    println!("cargo:rerun-if-env-changed=EMBED_REDUMP_DB_NONCE");
+    for var in [
+        "EMBED_LOOKUP_DB",
+        "EMBED_LOOKUP_DB_REQUIRED",
+        "EMBED_LOOKUP_DB_NONCE",
+        "EMBED_REDUMP_DB",
+        "EMBED_REDUMP_DB_REQUIRED",
+        "EMBED_REDUMP_DB_NONCE",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
 
-    let enabled = std::env::var("EMBED_REDUMP_DB").ok().as_deref() == Some("1");
+    let enabled = env_flag("EMBED_LOOKUP_DB") || env_flag("EMBED_REDUMP_DB");
     if !enabled {
         write_stub(&zst_path, &zst_sha_path, &plain_sha_path);
         return;
     }
 
-    let required =
-        std::env::var("EMBED_REDUMP_DB_REQUIRED").ok().as_deref() == Some("1");
+    let required = env_flag("EMBED_LOOKUP_DB_REQUIRED") || env_flag("EMBED_REDUMP_DB_REQUIRED");
     let base = "https://github.com/danifunker/ODE-lookup-db/releases/download/latest";
 
     let result = (|| -> Result<(), String> {
-        download_file(&format!("{base}/redump.sqlite.zst"), &zst_path)?;
+        download_file(&format!("{base}/ode-lookup.sqlite.zst"), &zst_path)?;
         download_file(
-            &format!("{base}/redump.sqlite.zst.sha256"),
+            &format!("{base}/ode-lookup.sqlite.zst.sha256"),
             &zst_sha_path,
         )?;
         download_file(
-            &format!("{base}/redump.sqlite.sha256"),
+            &format!("{base}/ode-lookup.sqlite.sha256"),
             &plain_sha_path,
         )?;
         Ok(())
@@ -135,22 +142,26 @@ fn embed_redump_db() {
         Ok(()) => {
             let size = fs::metadata(&zst_path).map(|m| m.len()).unwrap_or(0);
             println!(
-                "cargo:warning=Embedded redump DB seed ({} bytes compressed)",
+                "cargo:warning=Embedded ODE-lookup DB seed ({} bytes compressed)",
                 size
             );
         }
         Err(e) if required => {
             // Scheduled CI run: refusing to ship a binary with a stale embedded
             // DB. Bubble the error up so the workflow alerts.
-            panic!("EMBED_REDUMP_DB_REQUIRED=1 but seed fetch failed: {e}");
+            panic!("EMBED_LOOKUP_DB_REQUIRED=1 but seed fetch failed: {e}");
         }
         Err(e) => {
             println!(
-                "cargo:warning=Redump DB seed fetch failed (proceeding without seed): {e}"
+                "cargo:warning=ODE-lookup DB seed fetch failed (proceeding without seed): {e}"
             );
             write_stub(&zst_path, &zst_sha_path, &plain_sha_path);
         }
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).ok().as_deref() == Some("1")
 }
 
 fn write_stub(zst: &Path, zst_sha: &Path, plain_sha: &Path) {
@@ -191,8 +202,8 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 fn main() {
     // Encrypt secrets for embedding
     encrypt_secrets();
-    // Optionally embed a redump DB seed (CI-only by default)
-    embed_redump_db();
+    // Optionally embed an ODE-lookup DB seed (CI-only by default)
+    embed_lookup_db();
     // Set version at compile time
     // Reads from RELEASE_VERSION env var (set by CI) or falls back to Cargo.toml version
     let version = std::env::var("RELEASE_VERSION")

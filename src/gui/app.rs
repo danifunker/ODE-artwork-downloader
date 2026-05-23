@@ -7,7 +7,10 @@ use std::thread;
 
 use crate::api::{open_in_browser, ArtworkSearchQuery, SearchConfig, ContentType};
 use crate::disc::{supported_extensions, parse_filename, ConfidenceLevel, DiscInfo, DiscReader, DiscFormat, FilesystemType};
-use crate::export::{export_artwork, export_artwork_from_url, generate_output_path, ExportResult, ExportSettings};
+use crate::export::{
+    export_artwork, export_artwork_from_url_with_disc, export_artwork_from_url_with_label,
+    generate_output_path, ExportResult, ExportSettings,
+};
 use crate::search::ImageResult;
 use crate::update::{UpdateConfig, UpdateInfo};
 
@@ -89,6 +92,62 @@ pub struct App {
     hash_receiver: Option<Receiver<Result<crate::disc::hasher::TrackHashes, String>>>,
     /// Rolling rate/ETA estimator for the active hashing job
     hash_rate_tracker: super::progress::RateTracker,
+    /// Active bulk-processing queue, or `None` when not in bulk mode.
+    bulk_queue: Option<super::bulk::BulkQueue>,
+    /// In-flight loader dialog state for "Open Bulk Job…".
+    bulk_loader: Option<BulkLoaderDialog>,
+    /// Cursor index of the last bulk item we loaded into the central panel.
+    /// Used by tick_bulk to detect "queue advanced, load next" transitions.
+    bulk_loaded_cursor: Option<usize>,
+    /// While true, `process_file` will skip the normal redump cascade/fuzzy
+    /// auto-runs. Set by tick_bulk before triggering a bulk-driven load.
+    bulk_suppress_cascade: bool,
+    /// Hash cascade result for the current bulk item — written to the done
+    /// log when the user resolves the item. None when hashing hasn't finished
+    /// or no hash hit was returned.
+    pending_hash_redump_id: Option<i64>,
+    /// URL of the artwork the user is currently saving. Read by poll_export
+    /// on success so a bulk-mode save can record the chosen URL.
+    pending_export_url: Option<String>,
+    /// Bottom Y coordinate of the most recently rendered bulk banner.
+    /// Used to pick the default position of the Artwork Search window
+    /// so it opens directly below the controls in bulk mode.
+    bulk_banner_bottom_y: Option<f32>,
+    /// Active "broken cue — delete?" prompt. Blocks the loading flow until
+    /// the user clicks Delete / Keep, or (in bulk mode) the auto-skip
+    /// timeout elapses.
+    broken_cue_prompt: Option<BrokenCuePrompt>,
+}
+
+/// Pending decision for a cue file whose referenced BIN(s) don't exist.
+struct BrokenCuePrompt {
+    cue_path: PathBuf,
+    missing: Vec<String>,
+    total_refs: usize,
+    /// True when the cue came up through bulk-mode processing. Drives the
+    /// auto-skip countdown and the queue-advance side-effect on Keep.
+    in_bulk: bool,
+    /// Wall-clock when the prompt was opened. The bulk countdown reads this
+    /// and dismisses with Keep after `BULK_AUTO_SKIP_SECS`.
+    opened_at: std::time::Instant,
+}
+
+const BULK_AUTO_SKIP_SECS: u64 = 10;
+
+/// Modal state for the bulk-job loader: pending file the user picked, plus
+/// the load-time toggles (reprocess existing art, include fuzzy with a
+/// minimum confidence) and any parse error to surface.
+struct BulkLoaderDialog {
+    path: PathBuf,
+    item_count: usize,
+    /// Items already present in the sidecar `.done.jsonl` log.
+    resumed_count: usize,
+    reprocess_existing: bool,
+    filter: super::bulk::QueueFilter,
+    /// Last filter we re-parsed under, so we don't re-read the file on every
+    /// frame the dialog is open.
+    last_filter: super::bulk::QueueFilter,
+    error: Option<String>,
 }
 
 /// A log message with severity level
@@ -146,6 +205,14 @@ impl Default for App {
             hash_progress: None,
             hash_receiver: None,
             hash_rate_tracker: super::progress::RateTracker::default(),
+            bulk_queue: None,
+            bulk_loader: None,
+            bulk_loaded_cursor: None,
+            bulk_suppress_cascade: false,
+            pending_hash_redump_id: None,
+            pending_export_url: None,
+            bulk_banner_bottom_y: None,
+            broken_cue_prompt: None,
         }
     }
 }
@@ -190,6 +257,11 @@ impl App {
     /// (missing DB, query error) are logged at debug level and treated as
     /// "no match" — the rest of the flow continues unchanged.
     fn enrich_with_redump(&mut self, info: &mut DiscInfo) {
+        // Bulk mode commits to the queue's pre-decided match — don't let the
+        // exact/fuzzy cascade overwrite it.
+        if self.bulk_suppress_cascade {
+            return;
+        }
         let mgr = match crate::db::DatabaseManager::new() {
             Ok(m) => m,
             Err(e) => {
@@ -211,7 +283,8 @@ impl App {
         match crate::db::cascade_from_disc(&conn, info) {
             Ok(matches) => {
                 if matches.is_empty() {
-                    self.log(LogLevel::Info, "Redump: no match");
+                    self.log(LogLevel::Info, "Redump: no exact match, trying fuzzy");
+                    self.run_fuzzy(&conn, info);
                 } else {
                     let head = &matches[0];
                     let more = matches.len().saturating_sub(1);
@@ -232,6 +305,37 @@ impl App {
             }
             Err(e) => {
                 log::warn!("Redump cascade failed: {e}");
+            }
+        }
+    }
+
+    /// Run fuzzy matching after the exact cascade missed. Attaches a ranked
+    /// candidate list in-place and logs a one-line summary. During the initial
+    /// data-collection phase the full list is surfaced regardless of score.
+    fn run_fuzzy(&mut self, conn: &rusqlite::Connection, info: &mut DiscInfo) {
+        let cfg = &crate::config::get_config().fuzzy_match;
+        match crate::db::fuzzy_from_disc(conn, info, cfg, true) {
+            Ok(candidates) => {
+                if candidates.is_empty() {
+                    self.log(LogLevel::Info, "Fuzzy: no candidates above floor");
+                } else {
+                    let top = &candidates[0];
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "Fuzzy: {} candidate(s); top {} [#{}] {:.2} ({})",
+                            candidates.len(),
+                            top.title,
+                            top.redump_id,
+                            top.score,
+                            top.match_reason,
+                        ),
+                    );
+                }
+                info.fuzzy_matches = Some(candidates);
+            }
+            Err(e) => {
+                log::warn!("Fuzzy search failed: {e}");
             }
         }
     }
@@ -302,8 +406,29 @@ impl App {
             Ok(Err(e)) => {
                 // "Unsupported format" / "cancelled" are not real failures.
                 if !e.contains("cancelled") && !e.contains("not yet supported") {
-                    log::warn!("Hashing failed: {e}");
-                    self.log(LogLevel::Warning, format!("Hashing failed: {e}"));
+                    // Hashing's redump-cascade benefit is mostly for ISO9660
+                    // data discs that redump catalogs deeply. For HFS / HFS+
+                    // discs the hash tier rarely helps even when it succeeds,
+                    // and the underlying CHD/CUE path frequently rejects them
+                    // outright. Surface that context so the warning isn't
+                    // mysterious.
+                    let suffix = match self
+                        .disc_info
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|i| i.filesystem)
+                    {
+                        Some(FilesystemType::Hfs) | Some(FilesystemType::HfsPlus) => {
+                            " (normal for HFS/HFS+ discs — redump doesn't catalog Mac \
+                             hashes deeply, so the hash tier wouldn't add much anyway)"
+                        }
+                        _ => "",
+                    };
+                    log::warn!("Hashing failed: {e}{suffix}");
+                    self.log(
+                        LogLevel::Warning,
+                        format!("Hashing failed: {e}{suffix}"),
+                    );
                 } else {
                     log::info!("Hashing skipped: {e}");
                 }
@@ -356,15 +481,39 @@ impl App {
             }
         };
 
-        let head_summary = {
-            let head = &matches[0];
-            format!(
-                "Redump hash match: {} [#{}] via {:?}",
-                head.title, head.redump_id, head.matched_via
-            )
-        };
+        let head = matches[0].clone();
+        let head_summary = format!(
+            "Redump hash match: {} [#{}] via {:?}",
+            head.title, head.redump_id, head.matched_via
+        );
+
+        // In bulk mode the queue's match is authoritative. Record the
+        // disagreement (if any) on the active queue item so it lands in the
+        // done log when the user saves/skips, but don't disturb the UI.
+        if let Some(queue) = self.bulk_queue.as_mut() {
+            if let Some(item) = queue.current() {
+                let queue_id = item.best.redump_id;
+                if queue_id != Some(head.redump_id) {
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "Bulk: hash points to #{} (queue locked to #{:?}); recorded as disagreement",
+                            head.redump_id, queue_id
+                        ),
+                    );
+                } else {
+                    self.log(LogLevel::Info, "Bulk: hash confirms queue match");
+                }
+            }
+            self.pending_hash_redump_id = Some(head.redump_id);
+            return;
+        }
+
         if let Some(Ok(info)) = self.disc_info.as_mut() {
             info.redump_matches = Some(matches);
+            // Hash hit beats any fuzzy candidates from the earlier pass —
+            // drop the stale list so the UI doesn't show both.
+            info.fuzzy_matches = None;
         }
         self.log(LogLevel::Success, head_summary);
     }
@@ -429,6 +578,35 @@ impl App {
 
     /// Process a selected file
     fn process_file(&mut self, path: PathBuf) {
+        // Pre-flight: detect cue files whose BINs are missing and surface a
+        // "delete cue?" prompt before any of the rest of the load runs. The
+        // prompt is modal — the disc isn't loaded until the user resolves
+        // it (or, in bulk mode, the auto-skip timeout fires).
+        let scan = crate::disc::scan_cue_references(&path);
+        if !scan.missing.is_empty()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("cue"))
+                .unwrap_or(false)
+        {
+            self.broken_cue_prompt = Some(BrokenCuePrompt {
+                cue_path: path.clone(),
+                missing: scan.missing,
+                total_refs: scan.total_refs,
+                in_bulk: self.bulk_queue.is_some(),
+                opened_at: std::time::Instant::now(),
+            });
+            self.log(
+                LogLevel::Warning,
+                format!(
+                    "Broken cue detected: {} (missing data file(s))",
+                    path.display()
+                ),
+            );
+            return;
+        }
+
         self.log(LogLevel::Info, format!("Processing: {}", path.display()));
         self.selected_path = Some(path.clone());
 
@@ -512,6 +690,7 @@ impl App {
                         hfs_mdb: None,
                         hfsplus_header: None,
                         redump_matches: None,
+                        fuzzy_matches: None,
                     };
 
                     let mut fallback_info = fallback_info;
@@ -531,6 +710,763 @@ impl App {
         // displayed; when hashing finishes we'll re-run the cascade with the
         // hash tier active and refresh `redump_matches`.
         self.start_hashing();
+    }
+
+    /// Prompt the user for a `fuzzy_scan --queue` JSON file and stage it in
+    /// the loader dialog. The actual queue activation happens when they
+    /// click "Start" in the dialog.
+    fn open_bulk_job_picker(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Queue (JSON or CSV)", &["json", "csv"])
+            .add_filter("Queue JSON", &["json"])
+            .add_filter("fuzzy_scan CSV", &["csv"])
+            .add_filter("All Files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let filter = super::bulk::QueueFilter::default();
+        let (items, error) = match super::bulk::parse_queue_file(&path, &filter) {
+            Ok(items) => (items, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let resumed_count = count_resumed(&path, &items);
+
+        self.bulk_loader = Some(BulkLoaderDialog {
+            path,
+            item_count: items.len(),
+            resumed_count,
+            reprocess_existing: false,
+            filter: filter.clone(),
+            last_filter: filter,
+            error,
+        });
+    }
+
+    /// Re-parse the staged queue file under the dialog's current filter
+    /// settings so the displayed item count reflects what the user will get
+    /// when they click Start. Called when the include-fuzzy toggle or the
+    /// confidence slider changes value.
+    fn refresh_bulk_loader_counts(&mut self) {
+        let Some(dialog) = self.bulk_loader.as_mut() else {
+            return;
+        };
+        if filters_eq(&dialog.filter, &dialog.last_filter) {
+            return;
+        }
+        match super::bulk::parse_queue_file(&dialog.path, &dialog.filter) {
+            Ok(items) => {
+                dialog.item_count = items.len();
+                dialog.resumed_count = count_resumed(&dialog.path, &items);
+                dialog.error = None;
+            }
+            Err(e) => {
+                dialog.item_count = 0;
+                dialog.resumed_count = 0;
+                dialog.error = Some(e);
+            }
+        }
+        dialog.last_filter = dialog.filter.clone();
+    }
+
+    /// Activate the queue using the staged loader dialog. Closes the dialog.
+    fn start_bulk_job(&mut self) {
+        let Some(dialog) = self.bulk_loader.take() else {
+            return;
+        };
+        match super::bulk::BulkQueue::load(
+            dialog.path.clone(),
+            dialog.reprocess_existing,
+            &dialog.filter,
+        ) {
+            Ok(queue) => {
+                self.log(
+                    LogLevel::Success,
+                    format!(
+                        "Bulk job loaded: {} item(s), {} already done",
+                        queue.total(),
+                        queue.finished_count()
+                    ),
+                );
+                self.bulk_queue = Some(queue);
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, format!("Bulk job load failed: {e}"));
+            }
+        }
+    }
+
+    /// Exit bulk mode without affecting the sidecar log.
+    fn close_bulk_job(&mut self) {
+        if self.bulk_queue.is_some() {
+            self.log(LogLevel::Info, "Bulk job closed".to_string());
+        }
+        self.bulk_queue = None;
+        self.bulk_loaded_cursor = None;
+        self.bulk_suppress_cascade = false;
+        self.pending_hash_redump_id = None;
+    }
+
+    /// Clear all per-disc state so the central panel returns to the
+    /// "no file selected" view. Used when bulk mode finishes the last
+    /// item — the prior disc shouldn't stay loaded as if the user picked
+    /// it manually. Also cancels any in-flight hashing/search/preview.
+    fn unload_disc(&mut self) {
+        self.cancel_hashing();
+        self.selected_path = None;
+        self.disc_info = None;
+        self.search_query_text.clear();
+        self.manual_url.clear();
+        self.search_results.clear();
+        self.selected_image_index = None;
+        self.preview_texture = None;
+        self.preview_url = None;
+        self.preview_error = None;
+        self.show_search_window = false;
+        self.browse_view.clear();
+        self.show_browse_window = false;
+    }
+
+    /// Per-frame driver for bulk mode. If the cursor advanced to a new item,
+    /// either auto-skip it (existing art + reprocess off) or load the disc
+    /// and inject the queue's chosen match. After loading, the artwork
+    /// search is auto-triggered for exact matches.
+    fn tick_bulk(&mut self) {
+        let Some(queue) = self.bulk_queue.as_ref() else {
+            return;
+        };
+        if queue.is_complete() {
+            // First tick after the final item resolved: unload the disc so
+            // the central panel doesn't keep showing the last-processed
+            // file. The banner stays up (with the green "complete" notice)
+            // until the user clicks Exit bulk.
+            if self.bulk_loaded_cursor.is_some() {
+                self.unload_disc();
+                self.bulk_loaded_cursor = None;
+            }
+            return;
+        }
+        let cursor = queue.cursor;
+        if Some(cursor) == self.bulk_loaded_cursor {
+            return;
+        }
+
+        // Snapshot what we need; later mutating self requires releasing the
+        // queue borrow.
+        let Some(item) = queue.current() else {
+            return;
+        };
+        let path = std::path::PathBuf::from(&item.file);
+        let has_existing = item.has_existing_art;
+        let reprocess = queue.reprocess_existing;
+        let redump_id = item.best.redump_id;
+        let match_type = item.best.match_type.clone();
+        let display_title = item.best.title.clone();
+        let best_score = item.best.score;
+        let alt_count = item.alternates.len();
+        let already_resolved = queue
+            .statuses
+            .get(cursor)
+            .map(|s| *s != super::bulk::ItemStatus::Pending)
+            .unwrap_or(false);
+        log::debug!(
+            "bulk: tick advance cursor={} file={} best=#{:?} \"{}\" ({}, score={:?}) alts={} \
+             has_existing_art={} reprocess_existing={} already_resolved={}",
+            cursor, path.display(), redump_id, display_title, match_type, best_score,
+            alt_count, has_existing, reprocess, already_resolved,
+        );
+
+        // Existing-art auto-skip — but only for items that haven't been
+        // resolved yet. If the user explicitly went Back to a Saved /
+        // Skipped / existing-art item, load it so they can redo the
+        // choice; otherwise Back is useless on those items.
+        if has_existing && !reprocess && !already_resolved {
+            self.log(
+                LogLevel::Info,
+                format!("Bulk: skipping (existing art): {}", path.display()),
+            );
+            self.record_bulk_done("existing-art", None);
+            // Don't mark this cursor as loaded; let advance kick us to the
+            // next pending item on the next tick.
+            return;
+        }
+
+        if already_resolved {
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "Bulk: reopening previously-resolved item {} for re-processing",
+                    path.display()
+                ),
+            );
+        }
+
+        // Reset per-item transient state before kicking off the load.
+        self.pending_hash_redump_id = None;
+        self.bulk_loaded_cursor = Some(cursor);
+        self.bulk_suppress_cascade = true;
+        self.process_file(path.clone());
+        self.bulk_suppress_cascade = false;
+
+        // Inject the queue's chosen match in place of whatever the disc-read
+        // path would have produced. We pass the queue's best Record as a
+        // fallback so a missing entry in the local DB (e.g. CSV built
+        // against a different snapshot) still seeds redump_matches with
+        // the title — otherwise the search query would silently revert to
+        // the filename.
+        let queue_best = self
+            .bulk_queue
+            .as_ref()
+            .and_then(|q| q.current())
+            .map(|it| it.best.clone());
+        if let Some(rid) = redump_id {
+            self.inject_bulk_match(rid, &display_title, queue_best.as_ref());
+        }
+
+        // For exact matches the queue is trusted enough to auto-trigger the
+        // artwork search. Fuzzy matches go through a confirm step in the
+        // next phase (Phase 4); for now they also auto-search so the flow
+        // is exercisable.
+        self.update_search_query_from_disc();
+        if !self.search_query_text.is_empty() {
+            let q = self.search_query_text.clone();
+            self.start_search(&q);
+        }
+        let _ = match_type; // reserved for the fuzzy-confirm step in Phase 4.
+    }
+
+    /// Replace `disc_info.redump_matches` with a single RedumpMatch fetched
+    /// by `redump_id`, so the UI reflects the queue's pre-decided answer
+    /// without re-running the cascade. If the local DB doesn't have the
+    /// id (e.g. it's older than the snapshot the CSV was built against),
+    /// synthesize a minimal match from `queue_best` so the search query
+    /// still uses the correct title.
+    fn inject_bulk_match(
+        &mut self,
+        redump_id: i64,
+        fallback_title: &str,
+        queue_best: Option<&super::bulk::Record>,
+    ) {
+        let result = (|| -> Result<Option<crate::db::RedumpMatch>, String> {
+            let mgr =
+                crate::db::DatabaseManager::new().map_err(|e| e.to_string())?;
+            let conn = mgr.open().map_err(|e| e.to_string())?;
+            crate::db::by_redump_id(&conn, redump_id).map_err(|e| e.to_string())
+        })();
+
+        let m = match result {
+            Ok(Some(m)) => {
+                log::debug!(
+                    "bulk: inject local DB hit #{} \"{}\" matched_via={:?}",
+                    m.redump_id, m.title, m.matched_via
+                );
+                m
+            }
+            Ok(None) => {
+                self.log(
+                    LogLevel::Warning,
+                    format!(
+                        "Bulk: redump #{redump_id} ({fallback_title}) not found in local DB; \
+                         using queue's title for search"
+                    ),
+                );
+                let Some(rec) = queue_best else { return };
+                log::debug!(
+                    "bulk: inject synthesized from queue Record #{:?} \"{}\"",
+                    rec.redump_id, rec.title
+                );
+                synth_match_from_record(rec)
+            }
+            Err(e) => {
+                self.log(
+                    LogLevel::Warning,
+                    format!("Bulk: failed to fetch redump #{redump_id}: {e}"),
+                );
+                let Some(rec) = queue_best else { return };
+                log::debug!(
+                    "bulk: inject synthesized after DB error from queue Record #{:?} \"{}\"",
+                    rec.redump_id, rec.title
+                );
+                synth_match_from_record(rec)
+            }
+        };
+
+        let log_line = format!(
+            "Bulk: locked match {} [#{}] via {:?}",
+            m.title, m.redump_id, m.matched_via
+        );
+        if let Some(Ok(info)) = self.disc_info.as_mut() {
+            info.redump_matches = Some(vec![m]);
+            info.fuzzy_matches = None;
+        }
+        self.log(LogLevel::Success, log_line);
+    }
+
+    /// Bulk-mode keyboard shortcuts:
+    ///   Enter — save the currently focused image (or re-trigger the save
+    ///           button) — handled by the existing Save button path.
+    ///   S     — skip the current item (record as 'skipped', advance).
+    ///   B     — go back to the previous item (no log entry; cursor only).
+    ///   Esc   — exit bulk mode entirely.
+    /// Hotkeys are no-ops outside bulk mode and when the loader dialog is
+    /// open. We also skip keys consumed by a focused text input so the
+    /// search-query field stays editable.
+    fn handle_bulk_hotkeys(&mut self, ctx: &egui::Context) {
+        if self.bulk_queue.is_none() {
+            return;
+        }
+        if self.bulk_loader.is_some() {
+            return;
+        }
+        let text_focused = ctx.memory(|m| m.focused().is_some());
+        if text_focused {
+            return;
+        }
+
+        let (skip, back, exit, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::B),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+
+        if exit {
+            self.close_bulk_job();
+            return;
+        }
+        if skip {
+            self.log(LogLevel::Info, "Bulk: skipped");
+            self.record_bulk_done("skipped", None);
+            return;
+        }
+        if back {
+            if let Some(queue) = self.bulk_queue.as_mut() {
+                queue.back();
+            }
+            self.bulk_loaded_cursor = None;
+            self.pending_hash_redump_id = None;
+            return;
+        }
+        if enter {
+            // Save currently-previewed image, if any. The bulk advance
+            // happens inside poll_export on success.
+            if self.export_in_progress {
+                return;
+            }
+            let url = self.preview_url.clone();
+            let path = self
+                .selected_path
+                .as_ref()
+                .map(|p| generate_output_path(p));
+            if let (Some(url), Some(path)) = (url, path) {
+                self.start_export(&url, &path);
+            } else {
+                self.log(
+                    LogLevel::Info,
+                    "Bulk: Enter pressed but no image is selected for preview",
+                );
+            }
+        }
+    }
+
+    /// Append a done-log entry for the current bulk item and advance the
+    /// cursor. Caller chooses the status string (saved/skipped/existing-art).
+    fn record_bulk_done(&mut self, status: &str, image_url: Option<String>) {
+        // Build the entry while holding the queue borrow; release it before
+        // we touch self.log.
+        let (write_err, item_status_for_advance) = {
+            let Some(queue) = self.bulk_queue.as_mut() else {
+                return;
+            };
+            let Some(item) = queue.current() else {
+                return;
+            };
+            let queue_redump_id = item.best.redump_id;
+            let file = item.file.clone();
+            let hash_redump_id = self
+                .pending_hash_redump_id
+                .filter(|h| Some(*h) != queue_redump_id);
+            let entry = super::bulk::DoneEntry {
+                file,
+                status: status.to_string(),
+                queue_redump_id,
+                hash_redump_id,
+                image_url,
+                ts: super::bulk::now_iso8601(),
+            };
+            let item_status = match status {
+                "saved" => super::bulk::ItemStatus::Saved,
+                "skipped" => super::bulk::ItemStatus::Skipped,
+                "existing-art" => super::bulk::ItemStatus::ExistingArt,
+                _ => super::bulk::ItemStatus::Skipped,
+            };
+            let err = queue.record(entry, item_status).err();
+            queue.advance();
+            (err, item_status)
+        };
+
+        if let Some(e) = write_err {
+            self.log(LogLevel::Error, format!("Bulk: done-log write failed: {e}"));
+        }
+        let _ = item_status_for_advance;
+        self.bulk_loaded_cursor = None;
+        self.pending_hash_redump_id = None;
+    }
+
+    /// Render the broken-cue confirmation modal when one is staged. In bulk
+    /// mode shows a countdown that auto-dismisses with "Keep" after
+    /// `BULK_AUTO_SKIP_SECS` so a long-running queue isn't stuck behind a
+    /// prompt the user isn't around to answer.
+    fn render_broken_cue_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.broken_cue_prompt.as_ref() else {
+            return;
+        };
+        let cue = prompt.cue_path.clone();
+        let missing = prompt.missing.clone();
+        let total = prompt.total_refs;
+        let in_bulk = prompt.in_bulk;
+        let elapsed = prompt.opened_at.elapsed().as_secs();
+        let remaining = BULK_AUTO_SKIP_SECS.saturating_sub(elapsed);
+
+        let mut delete_clicked = false;
+        let mut keep_clicked = false;
+
+        egui::Window::new("Broken CUE file")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(cue.display().to_string()).strong());
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "{} of {} referenced data file(s) cannot be found:",
+                    missing.len(),
+                    total,
+                ));
+                ui.add_space(4.0);
+                for name in &missing {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!("  · {name}"),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label("Delete the cue file? (The cue can't be used without its data.)");
+
+                if in_bulk {
+                    ui.add_space(4.0);
+                    ui.weak(format!(
+                        "Auto-skipping (keep, don't delete) in {remaining}s …"
+                    ));
+                    // Pump the frame so the countdown ticks.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Delete cue").color(egui::Color32::LIGHT_RED),
+                        ))
+                        .clicked()
+                    {
+                        delete_clicked = true;
+                    }
+                    if ui.button("Keep (skip)").clicked() {
+                        keep_clicked = true;
+                    }
+                });
+            });
+
+        // Bulk-mode auto-skip after the timeout. Conservative default:
+        // never auto-delete — only auto-keep.
+        if in_bulk && remaining == 0 {
+            keep_clicked = true;
+        }
+
+        if delete_clicked {
+            self.resolve_broken_cue(true);
+        } else if keep_clicked {
+            self.resolve_broken_cue(false);
+        }
+    }
+
+    /// Apply the user's decision for the active broken-cue prompt. `delete`
+    /// removes the cue file from disk and logs the result; `false` keeps it.
+    /// In bulk mode also records the queue item as `skipped` (with a
+    /// distinct reason in the log) and advances the cursor.
+    fn resolve_broken_cue(&mut self, delete: bool) {
+        let Some(prompt) = self.broken_cue_prompt.take() else {
+            return;
+        };
+        let in_bulk = prompt.in_bulk;
+        let cue = prompt.cue_path;
+
+        if delete {
+            match std::fs::remove_file(&cue) {
+                Ok(()) => self.log(
+                    LogLevel::Success,
+                    format!("Deleted broken cue: {}", cue.display()),
+                ),
+                Err(e) => self.log(
+                    LogLevel::Error,
+                    format!("Could not delete {}: {e}", cue.display()),
+                ),
+            }
+        } else {
+            self.log(
+                LogLevel::Info,
+                format!("Kept broken cue (skipped): {}", cue.display()),
+            );
+        }
+
+        if in_bulk {
+            // Either path skips this queue item — record + advance so the
+            // bulk run keeps moving.
+            self.record_bulk_done("skipped", None);
+        }
+    }
+
+    /// Render the bulk loader modal when one is staged.
+    fn render_bulk_loader(&mut self, ctx: &egui::Context) {
+        let mut start_clicked = false;
+        let mut cancel_clicked = false;
+        let mut filter_changed = false;
+
+        if let Some(dialog) = self.bulk_loader.as_mut() {
+            egui::Window::new("Open Bulk Job")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("File: {}", dialog.path.display()));
+                    ui.add_space(6.0);
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    } else {
+                        ui.label(format!("Items: {}", dialog.item_count));
+                        if dialog.resumed_count > 0 {
+                            ui.label(format!(
+                                "Already done (will skip): {}",
+                                dialog.resumed_count
+                            ));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut dialog.reprocess_existing,
+                        "Reprocess discs that already have artwork",
+                    );
+
+                    ui.add_space(4.0);
+                    let prev_include = dialog.filter.include_fuzzy;
+                    if ui
+                        .checkbox(
+                            &mut dialog.filter.include_fuzzy,
+                            "Include partially-matched discs (fuzzy)",
+                        )
+                        .changed()
+                    {
+                        filter_changed = true;
+                    }
+                    if dialog.filter.include_fuzzy {
+                        ui.horizontal(|ui| {
+                            ui.label("Minimum confidence:");
+                            let resp = ui.add(
+                                egui::Slider::new(
+                                    &mut dialog.filter.fuzzy_min_score,
+                                    0.60..=0.95,
+                                )
+                                .fixed_decimals(2)
+                                .step_by(0.01),
+                            );
+                            if resp.drag_stopped() || resp.lost_focus() {
+                                filter_changed = true;
+                            }
+                        });
+                        ui.weak(
+                            "0.60 = fuzzy floor (noisy). 0.85 is selective without rejecting \
+                             genuine matches. 0.90+ is exact-like confidence.",
+                        );
+                    }
+                    if !prev_include && dialog.filter.include_fuzzy {
+                        filter_changed = true;
+                    }
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let can_start = dialog.error.is_none() && dialog.item_count > 0;
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("Start"))
+                            .clicked()
+                        {
+                            start_clicked = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                });
+        }
+
+        if filter_changed {
+            self.refresh_bulk_loader_counts();
+        }
+        if start_clicked {
+            self.start_bulk_job();
+        } else if cancel_clicked {
+            self.bulk_loader = None;
+        }
+    }
+
+    /// Inline top banner shown above the central panel content when bulk
+    /// mode is active. Shows progress, the current item, a short preview
+    /// of upcoming items, and the action buttons (Skip / Back / Exit).
+    fn render_bulk_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(queue) = self.bulk_queue.as_ref() else {
+            self.bulk_banner_bottom_y = None;
+            return;
+        };
+        let total = queue.total();
+        let done = queue.finished_count();
+        let current = queue.current().map(|it| it.file.clone());
+        let title = queue
+            .current()
+            .map(|it| it.best.title.clone())
+            .unwrap_or_default();
+        let cursor = queue.cursor;
+        let complete = queue.is_complete();
+
+        // Snapshot the next ~3 pending items for the "Up next" strip.
+        let upcoming: Vec<(usize, String, String)> = queue
+            .items
+            .iter()
+            .enumerate()
+            .skip(cursor + 1)
+            .filter(|(idx, _)| queue.statuses[*idx] == super::bulk::ItemStatus::Pending)
+            .take(3)
+            .map(|(idx, it)| {
+                let stem = std::path::Path::new(&it.file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&it.file)
+                    .to_string();
+                (idx, stem, it.best.title.clone())
+            })
+            .collect();
+
+        let mut exit_clicked = false;
+        let mut skip_clicked = false;
+        let mut back_clicked = false;
+        let frame_resp = egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                // Row 1: status + current item. The current item gets a
+                // marquee so a long filename doesn't fight the layout —
+                // it scrolls inside a fixed-width region instead of
+                // wrapping or being clipped.
+                ui.horizontal(|ui| {
+                    ui.heading(if complete {
+                        "Bulk job — complete"
+                    } else {
+                        "Bulk mode"
+                    });
+                    ui.separator();
+                    ui.label(format!("{done} / {total} done"));
+                    ui.separator();
+                    if let Some(file) = current {
+                        let stem = std::path::Path::new(&file)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&file);
+                        let line = if title.is_empty() {
+                            format!("[{}] {}", cursor + 1, stem)
+                        } else {
+                            format!("[{}] {}  →  {}", cursor + 1, stem, title)
+                        };
+                        let available = ui.available_width().max(120.0);
+                        marquee_label(ui, &line, available);
+                    }
+                });
+
+                ui.add_space(2.0);
+
+                // Row 2: controls + upcoming on the same line. Controls go
+                // first so they're always reachable; the upcoming list
+                // takes whatever space is left and marquees if too long.
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(cursor > 0, egui::Button::new("Back"))
+                        .on_hover_text("B — return to previous item")
+                        .clicked()
+                    {
+                        back_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(!complete, egui::Button::new("Skip"))
+                        .on_hover_text("S — record as skipped and advance")
+                        .clicked()
+                    {
+                        skip_clicked = true;
+                    }
+                    if ui
+                        .button("Exit bulk")
+                        .on_hover_text("Esc")
+                        .clicked()
+                    {
+                        exit_clicked = true;
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    if !upcoming.is_empty() {
+                        ui.weak("Up next:");
+                        let line = upcoming
+                            .iter()
+                            .map(|(_, stem, t)| {
+                                if t.is_empty() {
+                                    stem.clone()
+                                } else {
+                                    format!("{stem} → {t}")
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ·  ");
+                        let avail = ui.available_width().max(120.0);
+                        marquee_label(ui, &line, avail);
+                    } else if !complete {
+                        ui.weak("Last item in queue.");
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_GREEN,
+                            "All items processed — click Exit bulk to return to single-disc mode.",
+                        );
+                    }
+                });
+            });
+
+        self.bulk_banner_bottom_y = Some(frame_resp.response.rect.bottom());
+
+        ui.add_space(4.0);
+
+        if exit_clicked {
+            self.close_bulk_job();
+        }
+        if skip_clicked {
+            self.log(LogLevel::Info, "Bulk: skipped");
+            self.record_bulk_done("skipped", None);
+        }
+        if back_clicked {
+            if let Some(queue) = self.bulk_queue.as_mut() {
+                queue.back();
+            }
+            self.bulk_loaded_cursor = None;
+            self.pending_hash_redump_id = None;
+        }
     }
 
     /// Open file picker dialog
@@ -891,7 +1827,8 @@ impl App {
         }
     }
 
-    /// Start exporting artwork
+    /// Start exporting artwork. Reads the current disc's `disc_number` from
+    /// the parsed filename so discs 2+ pick up the "Disc N" overlay badge.
     fn start_export(&mut self, image_url: &str, output_path: &str) {
         let url = image_url.to_string();
         let path = output_path.to_string();
@@ -899,14 +1836,187 @@ impl App {
 
         self.export_in_progress = true;
         self.export_receiver = Some(rx);
+        self.pending_export_url = Some(url.clone());
+
+        let (disc_number, disc_total) = self.current_disc_marker();
 
         self.log(LogLevel::Info, format!("Downloading and converting to {}", path));
 
         thread::spawn(move || {
             let settings = ExportSettings::default();
-            let result = export_artwork_from_url(&url, &path, &settings);
+            let result = export_artwork_from_url_with_disc(
+                &url, &path, &settings, disc_number, disc_total,
+            );
             let _ = tx.send(result);
         });
+    }
+
+    /// After a successful save, re-export the same image URL to every
+    /// multi-disc sibling of the current disc — same source, but each one
+    /// stamped with its own disc-number badge. In bulk mode, also marks
+    /// those siblings as `saved` in the queue + done log so we don't
+    /// prompt for them again. In single-disc mode this is "auto-fill the
+    /// rest of the set" after one user choice.
+    ///
+    /// Synchronous: this runs on the UI thread after the main download has
+    /// already cached the image. Each sibling re-fetches the same URL — a
+    /// minor inefficiency we accept rather than refactoring the export
+    /// pipeline to take pre-fetched bytes.
+    fn apply_to_siblings(&mut self, image_url: &str) {
+        let Some(selected) = self.selected_path.clone() else {
+            return;
+        };
+
+        // Build the sibling work-list from whichever source applies:
+        //   1. In bulk mode, the queue's same-set neighbors that haven't
+        //      been processed yet.
+        //   2. In single-disc mode, a directory scan.
+        let siblings: Vec<(std::path::PathBuf, crate::disc::set_membership::DiscMarker)> =
+            if self.bulk_queue.is_some() {
+                self.queue_siblings_for(&selected)
+            } else {
+                crate::disc::set_membership::siblings_in_dir(&selected)
+                    .into_iter()
+                    .map(|s| (s.path, s.marker))
+                    .collect()
+            };
+
+        if siblings.is_empty() {
+            return;
+        }
+
+        let total_from_match = self
+            .disc_info
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|info| {
+                info.redump_matches
+                    .as_ref()
+                    .and_then(|ms| ms.first())
+                    .and_then(|m| crate::disc::set_membership::parse_disc_total(&m.title))
+            });
+
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Applying same artwork to {} multi-disc sibling(s) with per-disc badges",
+                siblings.len()
+            ),
+        );
+
+        let settings = ExportSettings::default();
+        for (sib_path, sib_marker) in &siblings {
+            // For numbered markers, swap in the total hint we got from the
+            // redump title (if any) so "Disc 2" becomes "Disc 2/3".
+            let badge_marker = match sib_marker {
+                crate::disc::set_membership::DiscMarker::Numbered { number, total } => {
+                    crate::disc::set_membership::DiscMarker::Numbered {
+                        number: *number,
+                        total: total.or(total_from_match),
+                    }
+                }
+                role @ crate::disc::set_membership::DiscMarker::Role(_) => role.clone(),
+            };
+            let label = badge_marker.badge_label();
+            let out_path = generate_output_path(sib_path);
+            let result = export_artwork_from_url_with_label(
+                image_url,
+                &out_path,
+                &settings,
+                label.as_deref(),
+            );
+            let pretty = label.clone().unwrap_or_else(|| "(unbadged)".into());
+            match result {
+                Ok(_) => self.log(
+                    LogLevel::Success,
+                    format!("  sibling {pretty}: saved to {out_path}"),
+                ),
+                Err(e) => self.log(
+                    LogLevel::Warning,
+                    format!("  sibling {pretty}: failed ({e})"),
+                ),
+            }
+        }
+
+        // For bulk mode, mark these sibling queue items as done so the
+        // user doesn't have to re-pick artwork for each.
+        if let Some(queue) = self.bulk_queue.as_mut() {
+            let now = super::bulk::now_iso8601();
+            for (sib_path, _) in &siblings {
+                let sib_file = sib_path.to_string_lossy().to_string();
+                let Some(idx) = queue.items.iter().position(|it| it.file == sib_file) else {
+                    continue;
+                };
+                let entry = super::bulk::DoneEntry {
+                    file: sib_file,
+                    status: "saved".to_string(),
+                    queue_redump_id: queue.items[idx].best.redump_id,
+                    hash_redump_id: None,
+                    image_url: Some(image_url.to_string()),
+                    ts: now.clone(),
+                };
+                if let Err(e) =
+                    queue.record_at(idx, entry, super::bulk::ItemStatus::Saved)
+                {
+                    log::warn!("sibling done-log write failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Find unfinished queue items whose disc file shares a set key with
+    /// `selected`. Returns (path, marker) pairs ready for export — the
+    /// marker decides what label (if any) lands on the badge.
+    fn queue_siblings_for(
+        &self,
+        selected: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, crate::disc::set_membership::DiscMarker)> {
+        let Some(queue) = self.bulk_queue.as_ref() else {
+            return Vec::new();
+        };
+        let Some(my_stem) = selected.file_stem().and_then(|s| s.to_str()) else {
+            return Vec::new();
+        };
+        let my_key = crate::disc::set_membership::set_key(my_stem);
+        let mut out = Vec::new();
+        for (idx, item) in queue.items.iter().enumerate() {
+            if queue.statuses[idx] != super::bulk::ItemStatus::Pending {
+                continue;
+            }
+            let path = std::path::PathBuf::from(&item.file);
+            if path == selected {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if crate::disc::set_membership::set_key(stem) != my_key {
+                continue;
+            }
+            let Some(marker) = crate::disc::set_membership::disc_marker_from_stem(stem)
+                .or_else(|| crate::disc::set_membership::disc_marker_from_stem(&item.best.title))
+            else {
+                continue;
+            };
+            out.push((path, marker));
+        }
+        out
+    }
+
+    /// Snapshot the current disc's `(Disc N)` marker for export-time badging.
+    /// Returns `(number, total)`. `total` is unknown unless the redump title
+    /// includes "Disc N of M" — common enough on multi-disc sets that we try.
+    fn current_disc_marker(&self) -> (Option<u32>, Option<u32>) {
+        let Some(Ok(info)) = self.disc_info.as_ref() else {
+            return (None, None);
+        };
+        let n = info.parsed_filename.disc_number;
+        let total = info
+            .redump_matches
+            .as_ref()
+            .and_then(|ms| ms.first())
+            .and_then(|m| crate::disc::set_membership::parse_disc_total(&m.title));
+        (n, total)
     }
 
     /// Convert a local image file (for drag-and-drop artwork)
@@ -939,6 +2049,8 @@ impl App {
                 Ok(Ok(result)) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    self.show_search_window = false;
+                    let saved_url = self.pending_export_url.take();
                     let msg = if result.was_cropped {
                         format!(
                             "Saved to {} (cropped from {}x{} to {}x{})",
@@ -957,10 +2069,24 @@ impl App {
                         )
                     };
                     self.log(LogLevel::Success, msg);
+
+                    // Multi-disc siblings get the same image with their own
+                    // disc-number badge. Done before bulk-advance so the
+                    // queue cursor doesn't move past siblings we still need
+                    // to process.
+                    if let Some(url) = saved_url.clone() {
+                        self.apply_to_siblings(&url);
+                    }
+
+                    // If we're in bulk mode, record the save and advance.
+                    if self.bulk_queue.is_some() {
+                        self.record_bulk_done("saved", saved_url);
+                    }
                 }
                 Ok(Err(e)) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    self.pending_export_url = None;
                     self.log(LogLevel::Error, format!("Export failed: {}", e));
                 }
                 Err(TryRecvError::Empty) => {
@@ -969,6 +2095,7 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     self.export_in_progress = false;
                     self.export_receiver = None;
+                    self.pending_export_url = None;
                     self.log(LogLevel::Error, "Export thread terminated unexpectedly");
                 }
             }
@@ -1114,6 +2241,120 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Failed to read image bytes: {}", e))
 }
 
+/// Single-line scrolling text. If `text` fits in `max_width`, renders as a
+/// plain label; otherwise the text slides continuously to the left, with a
+/// duplicate trailing copy so the loop is seamless. Hovering the strip shows
+/// the full text in a tooltip for users who'd rather read than wait.
+fn marquee_label(ui: &mut egui::Ui, text: &str, max_width: f32) {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, color);
+    let natural_w = galley.size().x;
+    let h = galley.size().y;
+    let visible_w = max_width.min(natural_w.max(1.0));
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(visible_w.max(40.0), h),
+        egui::Sense::hover(),
+    );
+
+    if natural_w <= visible_w {
+        ui.painter()
+            .galley(rect.left_top(), galley, color);
+        return;
+    }
+
+    // Clip drawing to the allocated rect so the looping copy doesn't bleed
+    // into neighboring widgets.
+    let painter = ui.painter_at(rect);
+
+    // 30 px gap between the trailing edge of one copy and the leading edge
+    // of the next; tuned to feel airy on Roboto-like fonts without leaving
+    // a long blank gap.
+    let gap = 30.0_f32;
+    let cycle = natural_w + gap;
+    // 40 px/sec is slow enough to read a 40-char title in ~10s, fast enough
+    // that you don't feel stuck behind it.
+    let speed = 40.0_f32;
+    let t = ui.ctx().input(|i| i.time) as f32;
+    let offset = (t * speed).rem_euclid(cycle);
+
+    painter.galley(
+        rect.left_top() - egui::vec2(offset, 0.0),
+        galley.clone(),
+        color,
+    );
+    painter.galley(
+        rect.left_top() + egui::vec2(cycle - offset, 0.0),
+        galley,
+        color,
+    );
+
+    resp.on_hover_text(text);
+
+    // Keep the frame ticking while the marquee is on screen.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// Build a minimal RedumpMatch from a queue Record when the local DB
+/// doesn't have the matching redump entry. The reduced-field match is
+/// enough to drive the search query (which only reads title) and the
+/// UI's "matched via …" chip; the disc-detail grid will simply show
+/// fewer fields.
+fn synth_match_from_record(rec: &super::bulk::Record) -> crate::db::RedumpMatch {
+    crate::db::RedumpMatch {
+        redump_id: rec.redump_id.unwrap_or(0),
+        system: rec.system.clone(),
+        title: rec.title.clone(),
+        foreign_title: None,
+        edition: None,
+        version: None,
+        category: None,
+        media: None,
+        barcode: None,
+        catalog: None,
+        pvd_volume_id: None,
+        pvd_creation_date: None,
+        redump_url: rec.redump_url.clone(),
+        matched_via: crate::db::MatchSource::PvdVolumeId,
+    }
+}
+
+fn filters_eq(a: &super::bulk::QueueFilter, b: &super::bulk::QueueFilter) -> bool {
+    a.include_fuzzy == b.include_fuzzy
+        && (a.fuzzy_min_score - b.fuzzy_min_score).abs() < 1e-9
+}
+
+/// Count how many of `items` are already present in the sidecar `.done.jsonl`
+/// next to `job_path`. Used by the bulk loader dialog to show resume info.
+fn count_resumed(job_path: &std::path::Path, items: &[super::bulk::QueueItem]) -> usize {
+    use std::io::{BufRead, BufReader};
+    let mut sidecar = job_path.to_path_buf();
+    let name = job_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| format!("{s}.done.jsonl"))
+        .unwrap_or_else(|| "queue.done.jsonl".to_string());
+    sidecar.set_file_name(name);
+
+    let Ok(file) = std::fs::File::open(&sidecar) else {
+        return 0;
+    };
+    let mut done_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<super::bulk::DoneEntry>(trimmed) {
+            done_files.insert(entry.file);
+        }
+    }
+    items.iter().filter(|it| done_files.contains(&it.file)).count()
+}
+
 /// Load image from bytes into egui ColorImage
 fn load_image_from_bytes(bytes: &[u8]) -> Result<egui::ColorImage, String> {
     let image = image::load_from_memory(bytes)
@@ -1153,6 +2394,27 @@ impl eframe::App for App {
 
         // Poll the track-hashing worker
         self.poll_hash();
+
+        // Bulk-job loader modal (rendered as a centered Window). Independent
+        // of the central-panel ui, so render through the context.
+        self.render_bulk_loader(&ctx);
+
+        // Broken-cue prompt — blocks tick_bulk from advancing until the
+        // user (or the bulk-mode timeout) resolves it.
+        self.render_broken_cue_prompt(&ctx);
+
+        // Bulk-mode keyboard shortcuts.
+        self.handle_bulk_hotkeys(&ctx);
+
+        // Drive the bulk queue: load next item if cursor advanced. The
+        // broken-cue prompt is a blocker — don't try to load anything else
+        // until it resolves.
+        if self.broken_cue_prompt.is_none() {
+            self.tick_bulk();
+        }
+
+        // Top-of-central banner when bulk mode is active.
+        self.render_bulk_banner(ui);
 
         // Request repaint while loading
         if self.search_in_progress || self.preview_loading || self.export_in_progress || self.user_agent_capture_in_progress || self.hash_progress.is_some() {
@@ -1349,9 +2611,23 @@ impl eframe::App for App {
                         .build_query()
                 })
                 .unwrap_or_default();
+            // Only treat the disc as a MusicBrainz target when it looks like
+            // a pure audio CD: a TOC is present, no data filesystem was
+            // detected (no PVD, no HFS/HFS+), AND no redump match was found
+            // (redump's PC/Mac catalog is data-only, so a hit there is
+            // strong evidence this isn't an audio CD).
             let use_musicbrainz = info_for_search
                 .as_ref()
-                .map(|i| i.toc.is_some())
+                .map(|i| {
+                    i.toc.is_some()
+                        && i.pvd.is_none()
+                        && i.hfs_mdb.is_none()
+                        && i.hfsplus_header.is_none()
+                        && i.redump_matches
+                            .as_ref()
+                            .map(|ms| ms.is_empty())
+                            .unwrap_or(true)
+                })
                 .unwrap_or(false);
             let disc_id = info_for_search
                 .as_ref()
@@ -1377,13 +2653,23 @@ impl eframe::App for App {
             let default_w = (app_rect.x * 0.75).max(600.0);
             let default_h = (app_rect.y * 0.85).max(500.0);
 
-            egui::Window::new("Artwork Search")
+            // In bulk mode, default-position the window directly below the
+            // banner so the controls remain visible. Outside bulk mode, fall
+            // through to egui's default placement.
+            let default_pos = self.bulk_banner_bottom_y.map(|y| {
+                let content = ctx.content_rect();
+                egui::pos2(content.left() + 12.0, y + 8.0)
+            });
+            let mut window = egui::Window::new("Artwork Search")
                 .open(&mut self.show_search_window)
                 .default_size([default_w, default_h])
                 .min_width(600.0)
                 .min_height(400.0)
-                .resizable(true)
-                .show(&ctx, |ui| {
+                .resizable(true);
+            if let Some(pos) = default_pos {
+                window = window.default_pos(pos);
+            }
+            window.show(&ctx, |ui| {
                     // ---- Content type ----
                     ui.horizontal(|ui| {
                         ui.label("Content Type:");
@@ -1685,9 +2971,14 @@ impl eframe::App for App {
                     ui.heading("File Selection");
                     ui.add_space(8.0);
 
-                    if ui.button("Browse...").clicked() {
-                        self.open_file_picker();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Browse...").clicked() {
+                            self.open_file_picker();
+                        }
+                        if ui.button("Bulk Job...").clicked() {
+                            self.open_bulk_job_picker();
+                        }
+                    });
 
                     ui.add_space(8.0);
 
@@ -1802,7 +3093,15 @@ impl eframe::App for App {
                             self.search_query_text = default_query.clone();
                         }
                         let can_browse = info.filesystem != FilesystemType::Unknown;
-                        let use_musicbrainz = info.toc.is_some();
+                        let use_musicbrainz = info.toc.is_some()
+                            && info.pvd.is_none()
+                            && info.hfs_mdb.is_none()
+                            && info.hfsplus_header.is_none()
+                            && info
+                                .redump_matches
+                                .as_ref()
+                                .map(|ms| ms.is_empty())
+                                .unwrap_or(true);
                         let disc_id = info.toc.as_ref().map(|toc| toc.musicbrainz_id());
                         let toc_string_for_browser = info.toc.as_ref().map(|toc| toc.to_toc_string());
                         let preview_loading = self.preview_loading;
@@ -1942,6 +3241,7 @@ impl eframe::App for App {
                                                 ("Category", first.category.as_deref()),
                                                 ("Edition", first.edition.as_deref()),
                                                 ("Version", first.version.as_deref()),
+                                                ("Catalog", first.catalog.as_deref()),
                                             ]
                                             .into_iter()
                                             .filter_map(|(k, v)| {
@@ -2014,6 +3314,38 @@ impl eframe::App for App {
                                         "Searching… (waiting on hash)",
                                     );
                                     ui.end_row();
+                                }
+
+                                // Fuzzy candidates (only when exact match missed)
+                                if let Some(fuzzy) = &info.fuzzy_matches {
+                                    if !fuzzy.is_empty() {
+                                        ui.label("Possible matches:");
+                                        ui.vertical(|ui| {
+                                            for c in fuzzy {
+                                                ui.horizontal(|ui| {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(220, 180, 80),
+                                                        format!("{:.0}%", c.score * 100.0),
+                                                    );
+                                                    let mut title = format!(
+                                                        "{} (#{})",
+                                                        c.title, c.redump_id
+                                                    );
+                                                    if let Some(v) = &c.inferred_version {
+                                                        title.push_str(&format!(" v{v}"));
+                                                    }
+                                                    ui.label(title);
+                                                    ui.hyperlink_to("↗", &c.redump_url);
+                                                });
+                                                ui.label(
+                                                    egui::RichText::new(&c.match_reason)
+                                                        .small()
+                                                        .color(egui::Color32::GRAY),
+                                                );
+                                            }
+                                        });
+                                        ui.end_row();
+                                    }
                                 }
 
                                 // Cover art status

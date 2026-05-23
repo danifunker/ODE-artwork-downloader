@@ -41,35 +41,35 @@ fn updates_and_opens_real_release() {
 
     let (schema_version, row_count): (i64, i64) = conn
         .query_row(
-            "SELECT schema_version, row_count FROM meta",
+            "SELECT schema_version, row_count FROM meta WHERE source = 'redump'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("meta query");
-    assert_eq!(schema_version, 1);
+    assert_eq!(schema_version, 2);
     assert!(row_count > 0);
 
     let discs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM discs", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM redump_disc", [], |row| row.get(0))
         .unwrap();
     assert_eq!(discs, row_count);
 
     let fts: i64 = conn
-        .query_row("SELECT COUNT(*) FROM discs_fts", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM redump_disc_fts", [], |row| row.get(0))
         .unwrap();
     assert_eq!(fts, row_count);
 
     // Any track row at all should be reachable by its sha1.
     let (some_sha1,): (String,) = conn
         .query_row(
-            "SELECT sha1 FROM tracks WHERE sha1 IS NOT NULL LIMIT 1",
+            "SELECT sha1 FROM redump_track WHERE sha1 IS NOT NULL LIMIT 1",
             [],
             |row| Ok((row.get(0)?,)),
         )
         .unwrap();
     let hit: Option<i64> = conn
         .query_row(
-            "SELECT redump_id FROM tracks WHERE sha1 = lower(?1) LIMIT 1",
+            "SELECT redump_id FROM redump_track WHERE sha1 = lower(?1) LIMIT 1",
             [&some_sha1],
             |row| row.get(0),
         )

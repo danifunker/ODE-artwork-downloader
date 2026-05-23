@@ -1,20 +1,32 @@
-//! Redump lookup database (downloaded SQLite artifact).
+//! ODE-lookup database (downloaded SQLite artifact).
 //!
-//! See `docs/dbintegration.md` for the overall plan. This module handles the
-//! download/verify/swap flow and read-only opening; query helpers live in
-//! `lookup.rs` (added when the lookup cascade is wired up).
+//! Bundles `redump` and `winworld` source tables in one SQLite file
+//! (`ode-lookup.sqlite`). The redump side carries the exact-match cascade
+//! (track hashes, serials, PVD) and the redump-side fuzzy sources. The
+//! winworld side feeds a complementary fuzzy source for applications /
+//! operating systems that redump doesn't cover.
+//!
+//! See `MIGRATION-unified-db.md` in ODE-lookup-db for the breaking-change
+//! details and `docs/dbintegration.md` for the overall plan.
 
 mod fetch;
+pub mod fuzzy;
 pub mod lookup;
 pub mod manager;
 mod paths;
 mod seed;
+pub mod verify;
 
-pub use lookup::{cascade, cascade_from_disc, CascadeInputs, MatchSource, RedumpMatch};
+pub use fuzzy::{fuzzy_search, FuzzyCandidate, FuzzyInputs, ScoreSource, WinworldRef};
+pub use verify::{classify as classify_one, gather_evidence, verify as verify_candidates, DiscEvidence, Verdict};
+pub use lookup::{
+    by_redump_id, cascade, cascade_from_disc, fuzzy_from_disc, CascadeInputs, MatchSource,
+    RedumpMatch,
+};
 pub use manager::{DatabaseManager, UpdateOutcome};
 
 /// Schema version this build of the app understands.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
 
 /// Base URL for the `latest` release tag on the DB repo.
 pub const LATEST_RELEASE_BASE: &str =

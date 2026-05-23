@@ -1,6 +1,6 @@
-//! First-run seed: unpack a redump DB embedded at build time.
+//! First-run seed: unpack an ODE-lookup DB embedded at build time.
 //!
-//! Local builds never embed anything (`EMBED_REDUMP_DB` is unset), so the
+//! Local builds never embed anything (`EMBED_LOOKUP_DB` is unset), so the
 //! embedded byte slice is empty and `try_install_if_missing` is a no-op.
 //! CI release builds embed the artifact downloaded by `build.rs`.
 
@@ -12,18 +12,18 @@ use sha2::{Digest, Sha256};
 
 use super::paths::DbPaths;
 
-/// Compressed seed DB bytes. Empty when `EMBED_REDUMP_DB` was not set at
+/// Compressed seed DB bytes. Empty when `EMBED_LOOKUP_DB` was not set at
 /// build time.
 const SEED_ZST: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/redump.sqlite.zst"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/ode-lookup.sqlite.zst"));
 
 /// sha256 of `SEED_ZST` (coreutils format). Empty when no seed embedded.
 const SEED_ZST_SHA256: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/redump.sqlite.zst.sha256"));
+    include_str!(concat!(env!("OUT_DIR"), "/ode-lookup.sqlite.zst.sha256"));
 
 /// sha256 of the decompressed SQLite. Empty when no seed embedded.
 const SEED_PLAIN_SHA256: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/redump.sqlite.sha256"));
+    include_str!(concat!(env!("OUT_DIR"), "/ode-lookup.sqlite.sha256"));
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeedError {

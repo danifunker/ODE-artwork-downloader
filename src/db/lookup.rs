@@ -18,6 +18,7 @@ pub struct RedumpMatch {
     pub category: Option<String>,
     pub media: Option<String>,
     pub barcode: Option<String>,
+    pub catalog: Option<String>,
     pub pvd_volume_id: Option<String>,
     pub pvd_creation_date: Option<String>,
     pub redump_url: String,
@@ -37,7 +38,7 @@ pub enum MatchSource {
 }
 
 const SELECT_DISCS_COLS: &str = "redump_id, system, title, foreign_title, edition, \
-    version, category, media, barcode, pvd_volume_id, pvd_creation_date, redump_url";
+    version, category, media, barcode, catalog, pvd_volume_id, pvd_creation_date, redump_url";
 
 fn row_to_match(row: &Row<'_>, matched_via: MatchSource) -> rusqlite::Result<RedumpMatch> {
     Ok(RedumpMatch {
@@ -50,9 +51,10 @@ fn row_to_match(row: &Row<'_>, matched_via: MatchSource) -> rusqlite::Result<Red
         category: row.get(6)?,
         media: row.get(7)?,
         barcode: row.get(8)?,
-        pvd_volume_id: row.get(9)?,
-        pvd_creation_date: row.get(10)?,
-        redump_url: row.get(11)?,
+        catalog: row.get(9)?,
+        pvd_volume_id: row.get(10)?,
+        pvd_creation_date: row.get(11)?,
+        redump_url: row.get(12)?,
         matched_via,
     })
 }
@@ -71,32 +73,32 @@ fn query_via_join(
 
 pub fn by_track_sha1(conn: &Connection, sha1: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN tracks t USING (redump_id) WHERE t.sha1 = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_track t USING (redump_id) WHERE t.sha1 = ?1"
     );
     query_via_join(conn, &sql, sha1, MatchSource::TrackSha1)
 }
 
 pub fn by_track_md5(conn: &Connection, md5: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN tracks t USING (redump_id) WHERE t.md5 = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_track t USING (redump_id) WHERE t.md5 = ?1"
     );
     query_via_join(conn, &sql, md5, MatchSource::TrackMd5)
 }
 
 pub fn by_track_crc32(conn: &Connection, crc32: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN tracks t USING (redump_id) WHERE t.crc32 = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_track t USING (redump_id) WHERE t.crc32 = ?1"
     );
     query_via_join(conn, &sql, crc32, MatchSource::TrackCrc32)
 }
 
 pub fn by_serial(conn: &Connection, serial: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs d \
-         JOIN serials s USING (redump_id) WHERE s.serial = ?1"
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_serial s USING (redump_id) WHERE s.serial = ?1"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows =
@@ -105,7 +107,7 @@ pub fn by_serial(conn: &Connection, serial: &str) -> rusqlite::Result<Vec<Redump
 }
 
 pub fn by_barcode(conn: &Connection, barcode: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
-    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM discs WHERE barcode = ?1");
+    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM redump_disc WHERE barcode = ?1");
     let mut stmt = conn.prepare(&sql)?;
     let rows =
         stmt.query_map([barcode], |row| row_to_match(row, MatchSource::Barcode))?;
@@ -121,7 +123,7 @@ pub fn by_pvd(
     creation_date: Option<&str>,
 ) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM discs \
+        "SELECT {SELECT_DISCS_COLS} FROM redump_disc \
          WHERE pvd_volume_id = ?1 AND (?2 IS NULL OR pvd_creation_date = ?2)"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -144,10 +146,10 @@ pub fn fuzzy_title(
 ) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
         "SELECT {SELECT_DISCS_COLS} \
-         FROM discs_fts \
-         JOIN discs d ON d.redump_id = discs_fts.rowid \
-         WHERE discs_fts MATCH ?1 \
-         ORDER BY bm25(discs_fts) \
+         FROM redump_disc_fts \
+         JOIN redump_disc d ON d.redump_id = redump_disc_fts.rowid \
+         WHERE redump_disc_fts MATCH ?1 \
+         ORDER BY bm25(redump_disc_fts) \
          LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -179,12 +181,10 @@ pub fn cascade(
             return Ok(Some(hits));
         }
     }
-    if let Some(crc32) = inputs.track_crc32 {
-        let hits = by_track_crc32(conn, crc32)?;
-        if !hits.is_empty() {
-            return Ok(Some(hits));
-        }
-    }
+    // NOTE: CRC32 is intentionally NOT an exact tier. It is only 32 bits and
+    // collides — a scan found unrelated Windows/Visual Studio ISOs all matching
+    // one redump entry by CRC32 alone. Any genuine match already hits via SHA1
+    // or MD5 above, so CRC32 adds nothing but false positives here.
     if let Some(serial) = inputs.serial {
         let hits = by_serial(conn, serial)?;
         if !hits.is_empty() {
@@ -246,10 +246,144 @@ pub fn cascade_from_disc(
     Ok(cascade(conn, &inputs)?.unwrap_or_default())
 }
 
+/// Build fuzzy-match inputs from a disc and run the fuzzy search. Called by
+/// the UI only after the exact cascade misses. Returns ranked candidates.
+pub fn fuzzy_from_disc(
+    conn: &Connection,
+    info: &crate::disc::DiscInfo,
+    cfg: &crate::config::FuzzyMatchConfig,
+    deep_dig: bool,
+) -> rusqlite::Result<Vec<crate::db::FuzzyCandidate>> {
+    // Title candidates in priority order, de-duplicated, non-empty. For each
+    // raw source string we also include label_variants (letter↔digit split,
+    // CamelCase split, version-suffix strip) so labels like `QUAKE106` reach
+    // `Quake` and `MortalKombat3` reaches `Mortal Kombat 3`.
+    let mut titles: Vec<String> = Vec::new();
+    let mut push_title = |s: &str| {
+        let t = s.trim();
+        if !t.is_empty() && !titles.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+            titles.push(t.to_string());
+        }
+    };
+    let mut push_with_variants = |s: &str| {
+        for v in crate::db::fuzzy::label_variants(s) {
+            push_title(&v);
+        }
+    };
+    if let Some(label) = info.volume_label.as_deref() {
+        push_with_variants(label);
+    }
+    push_with_variants(&info.parsed_filename.title);
+    push_with_variants(&info.parsed_filename.original);
+    push_with_variants(&info.title);
+
+    let pvd_volume_id = info
+        .pvd
+        .as_ref()
+        .map(|p| p.volume_id.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Per-track durations in CD frames from the absolute TOC offsets.
+    let disc_track_frames = info
+        .toc
+        .as_ref()
+        .map(|toc| {
+            let offsets = &toc.track_offsets;
+            let mut frames = Vec::with_capacity(offsets.len());
+            for i in 0..offsets.len() {
+                let end = offsets.get(i + 1).copied().unwrap_or(toc.lead_out);
+                frames.push(end.saturating_sub(offsets[i]));
+            }
+            frames
+        })
+        .unwrap_or_default();
+
+    // Total disc payload for the size-sanity source. On a mixed-mode disc the
+    // PVD `volume_space_size` counts only the ISO data track, but redump's
+    // total includes the audio tracks — comparing those directly makes a real
+    // game look 5–10× too small and Source D wrongly drops it. When a TOC is
+    // present use the lead-out (total frames × 2352 = whole-disc bytes), which
+    // is comparable to redump's per-track byte sum. Fall back to the PVD size
+    // for pure-data ISOs with no TOC.
+    let disc_payload_bytes = info
+        .toc
+        .as_ref()
+        .map(|toc| toc.lead_out as u64 * 2352)
+        .or_else(|| {
+            info.pvd
+                .as_ref()
+                .map(|p| p.volume_space_size as u64 * p.logical_block_size.max(2048) as u64)
+        });
+
+    let mut inputs = crate::db::FuzzyInputs {
+        title_candidates: titles,
+        pvd_volume_id,
+        pvd_creation_date: None,
+        disc_track_frames,
+        disc_payload_bytes,
+    };
+
+    // First (shallow) pass: volume label + filename derivations only — no
+    // filesystem walk.
+    let mut candidates = crate::db::fuzzy_search(conn, &inputs, cfg)?;
+
+    let strong = |cands: &[crate::db::FuzzyCandidate]| {
+        cands.iter().filter(|c| c.score >= cfg.strong_score).count()
+    };
+
+    // Decide whether we need to read the disc. Two triggers:
+    //   - zero candidates       → dig for more (cryptic labels like TR1)
+    //   - many strong candidates → dig to disambiguate / rule out
+    let need_dig = candidates.is_empty() || strong(&candidates) >= cfg.min_strong_for_verify;
+    if !need_dig {
+        return Ok(candidates);
+    }
+    // Caller (e.g. CLI `--no-deep-filesystem-search`) opted out of the disc
+    // walk. Return the shallow-pass candidates as-is, without enrichment or
+    // content-based verification.
+    if !deep_dig {
+        return Ok(candidates);
+    }
+
+    // Walk the disc once; reuse the result for both candidate enrichment and
+    // verification.
+    let content = crate::disc::read_content(info);
+    log::debug!(
+        "deep-dig: files_seen={} bytes_read={} phrases={} tokens={} date={:?}",
+        content.files_seen,
+        content.bytes_read,
+        content.phrase_candidates.len(),
+        content.tokens.len(),
+        content.creation_date,
+    );
+
+    // If the shallow pass found nothing, enrich candidates with on-disc phrase
+    // hints (directory names, exe stems, autorun/readme labels) and re-run.
+    if candidates.is_empty() && !content.phrase_candidates.is_empty() {
+        let mut seen: Vec<String> = inputs.title_candidates.clone();
+        for phrase in &content.phrase_candidates {
+            for v in crate::db::fuzzy::label_variants(phrase) {
+                if !seen.iter().any(|e| e.eq_ignore_ascii_case(&v)) {
+                    seen.push(v);
+                }
+            }
+        }
+        inputs.title_candidates = seen;
+        candidates = crate::db::fuzzy_search(conn, &inputs, cfg)?;
+    }
+
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+
+    // Verify against the disc evidence we already gathered.
+    let evidence: crate::db::DiscEvidence = content.into();
+    Ok(crate::db::verify_candidates(candidates, &evidence))
+}
+
 /// Lookup a single disc by its `redump_id`. Returns `None` if not present.
-#[allow(dead_code)]
 pub fn by_redump_id(conn: &Connection, redump_id: i64) -> rusqlite::Result<Option<RedumpMatch>> {
-    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM discs WHERE redump_id = ?1");
+    let sql = format!("SELECT {SELECT_DISCS_COLS} FROM redump_disc WHERE redump_id = ?1");
     conn.query_row(&sql, [redump_id], |row| {
         row_to_match(row, MatchSource::PvdVolumeId)
     })

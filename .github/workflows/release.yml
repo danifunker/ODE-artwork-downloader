@@ -13,8 +13,8 @@ on:
       - "/update-os-sublist.sh"
       # - ".github/**"
   workflow_dispatch:
-  # Weekly database-refresh build. Picks up any new redump.sqlite even when
-  # there are no app-code changes. Mondays 06:00 UTC.
+  # Weekly database-refresh build. Picks up any new ode-lookup.sqlite even
+  # when there are no app-code changes. Mondays 06:00 UTC.
   schedule:
     - cron: "0 6 * * 1"
 
@@ -26,16 +26,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Embed the latest redump.sqlite seed at build time. Empty locally; opted in
-  # for CI so released binaries ship with a pre-populated DB.
-  EMBED_REDUMP_DB: "1"
+  # Embed the latest ode-lookup.sqlite seed at build time. Empty locally;
+  # opted in for CI so released binaries ship with a pre-populated DB.
+  EMBED_LOOKUP_DB: "1"
   # Hard-fail the build only on the weekly scheduled run, where the entire
   # point is to refresh the embedded DB. On push / manual runs we tolerate a
   # transient upstream outage and ship an unseeded build instead.
-  EMBED_REDUMP_DB_REQUIRED: ${{ github.event_name == 'schedule' && '1' || '' }}
+  EMBED_LOOKUP_DB_REQUIRED: ${{ github.event_name == 'schedule' && '1' || '' }}
   # Forces build.rs to rerun (and refetch the seed) on every CI invocation
   # regardless of cargo's incremental cache.
-  EMBED_REDUMP_DB_NONCE: ${{ github.run_id }}
+  EMBED_LOOKUP_DB_NONCE: ${{ github.run_id }}
 
 jobs:
   # Gate for scheduled runs: if a release was published in the last 7 days,

@@ -1,4 +1,4 @@
-//! Platform-appropriate paths for the cached redump DB.
+//! Platform-appropriate paths for the cached ODE-lookup DB.
 
 use std::path::PathBuf;
 
@@ -19,24 +19,35 @@ impl DbPaths {
     }
 
     pub fn sqlite(&self) -> PathBuf {
-        self.data_dir.join("redump.sqlite")
+        self.data_dir.join("ode-lookup.sqlite")
     }
 
     /// Cached sha256 of the most recently installed `.zst` artifact. Stored as
     /// the raw 64-char hex string. Used to short-circuit downloads when the
     /// upstream artifact hasn't changed.
     pub fn last_zst_sha256(&self) -> PathBuf {
-        self.data_dir.join("redump.sqlite.zst.sha256")
+        self.data_dir.join("ode-lookup.sqlite.zst.sha256")
     }
 
     /// Temp location for the in-flight download. Sits next to the live DB so
     /// the final atomic rename stays on the same filesystem.
     pub fn download_tmp(&self) -> PathBuf {
-        self.data_dir.join("redump.sqlite.zst.partial")
+        self.data_dir.join("ode-lookup.sqlite.zst.partial")
     }
 
     /// Temp location for the decompressed DB before the swap.
     pub fn decompress_tmp(&self) -> PathBuf {
-        self.data_dir.join("redump.sqlite.partial")
+        self.data_dir.join("ode-lookup.sqlite.partial")
+    }
+
+    /// Pre-v3 artifact paths. Used once at startup to clean up the old cache
+    /// after the move to the unified `ode-lookup.sqlite`.
+    pub fn legacy_artifacts(&self) -> Vec<PathBuf> {
+        vec![
+            self.data_dir.join("redump.sqlite"),
+            self.data_dir.join("redump.sqlite.zst.sha256"),
+            self.data_dir.join("redump.sqlite.zst.partial"),
+            self.data_dir.join("redump.sqlite.partial"),
+        ]
     }
 }

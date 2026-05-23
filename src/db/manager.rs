@@ -67,11 +67,23 @@ impl DatabaseManager {
     /// Check upstream, download + verify + swap if changed. Safe to call on
     /// startup; falls back to the cached file if the network is unavailable.
     pub fn update_if_needed(&self) -> Result<UpdateOutcome, DbError> {
+        // One-shot upgrade cleanup: discard the pre-unified `redump.sqlite`
+        // cache so a stale schema/file doesn't sit next to the new one.
+        for legacy in self.paths.legacy_artifacts() {
+            if legacy.exists() {
+                if let Err(e) = fs::remove_file(&legacy) {
+                    log::warn!("Could not remove legacy {}: {e}", legacy.display());
+                } else {
+                    log::info!("Removed legacy DB artifact {}", legacy.display());
+                }
+            }
+        }
+
         // Unpack the embedded seed (if any) before touching the network. This
         // gives offline first-run users a working DB.
         match seed::try_install_if_missing(&self.paths) {
             Ok(SeedOutcome::Installed { bytes }) => {
-                log::info!("Installed embedded redump DB seed ({bytes} bytes)");
+                log::info!("Installed embedded ODE-lookup DB seed ({bytes} bytes)");
             }
             Ok(SeedOutcome::AlreadyInstalled) | Ok(SeedOutcome::NotEmbedded) => {}
             Err(e) => log::warn!("Embedded seed install failed: {e}"),
@@ -169,8 +181,14 @@ impl DatabaseManager {
 }
 
 fn assert_schema_supported(conn: &Connection) -> Result<(), DbError> {
-    let found: i64 =
-        conn.query_row("SELECT schema_version FROM meta", [], |row| row.get(0))?;
+    // Unified DB has one meta row per source; we only require the redump
+    // schema to be readable. winworld schema is checked separately if/when
+    // the winworld tables are queried.
+    let found: i64 = conn.query_row(
+        "SELECT schema_version FROM meta WHERE source = 'redump'",
+        [],
+        |row| row.get(0),
+    )?;
     if found > SUPPORTED_SCHEMA_VERSION {
         return Err(DbError::SchemaTooNew {
             found,
@@ -189,23 +207,24 @@ fn smoke_test(path: &PathBuf) -> Result<(), DbError> {
 
     let (declared_row_count, _built_at): (i64, String) = conn
         .query_row(
-            "SELECT row_count, built_at FROM meta",
+            "SELECT row_count, built_at FROM meta WHERE source = 'redump'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
-    let discs_count: i64 = conn.query_row("SELECT COUNT(*) FROM discs", [], |row| row.get(0))?;
+    let discs_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM redump_disc", [], |row| row.get(0))?;
     if discs_count != declared_row_count {
         return Err(DbError::SmokeFailed(format!(
-            "discs count {discs_count} != meta.row_count {declared_row_count}"
+            "redump_disc count {discs_count} != meta.row_count {declared_row_count}"
         )));
     }
 
-    let fts_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM discs_fts", [], |row| row.get(0))?;
+    let fts_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM redump_disc_fts", [], |row| row.get(0))?;
     if fts_count != declared_row_count {
         return Err(DbError::SmokeFailed(format!(
-            "discs_fts count {fts_count} != meta.row_count {declared_row_count}"
+            "redump_disc_fts count {fts_count} != meta.row_count {declared_row_count}"
         )));
     }
 
