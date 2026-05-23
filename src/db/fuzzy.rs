@@ -986,14 +986,9 @@ pub fn fuzzy_search(
         }
         let row = ww.row;
         let category = row.category.clone();
-        let url = if row.url.is_empty() {
-            winworld_url(&row.product_slug, &row.release_slug)
-        } else {
-            // The product URL points at the product page; the release lives
-            // beneath it. Use the per-release URL so a user clicking through
-            // lands directly on the matching pressing.
-            winworld_url(&row.product_slug, &row.release_slug)
-        };
+        // The product `url` points at the product page; link to the per-release
+        // page instead so a click lands on the matching pressing.
+        let url = winworld_url(&row.product_slug, &row.release_slug);
         out.push(FuzzyCandidate {
             redump_id: 0,
             system: category.clone().unwrap_or_else(|| "winworld".into()),
@@ -1014,7 +1009,7 @@ pub fn fuzzy_search(
         });
     }
 
-    out.sort_by(|a, b| {
+    let by_score = |a: &FuzzyCandidate, b: &FuzzyCandidate| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1028,8 +1023,28 @@ pub fn fuzzy_search(
                     .map(|w| (&w.product_slug, &w.release_slug))
                     .cmp(&b.winworld.as_ref().map(|w| (&w.product_slug, &w.release_slug)))
             })
-    });
-    out.truncate(cfg.candidate_cap);
+    };
+    out.sort_by(&by_score);
+
+    // Reserve slots for winworld so a flood of same-title redump pressings
+    // (e.g. dozens of "Windows 95" OEM discs) can't crowd winworld out of the
+    // capped result entirely — that crowding would defeat the whole point of
+    // adding the source for applications / operating systems. Only the *cap*
+    // is partitioned; scoring and the merged floor are unchanged, so this
+    // never promotes a winworld candidate that didn't earn its score.
+    let cap = cfg.candidate_cap;
+    if out.len() > cap {
+        let ww_reserve = (cap / 4).max(3);
+        let (mut redump_c, mut ww_c): (Vec<_>, Vec<_>) =
+            out.into_iter().partition(|c| !c.is_winworld());
+        let ww_take = ww_c.len().min(ww_reserve);
+        let redump_take = redump_c.len().min(cap - ww_take);
+        redump_c.truncate(redump_take);
+        ww_c.truncate(ww_take);
+        out = redump_c;
+        out.extend(ww_c);
+        out.sort_by(&by_score);
+    }
     Ok(out)
 }
 
