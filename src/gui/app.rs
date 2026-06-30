@@ -527,24 +527,24 @@ impl App {
             Ok(Ok(outcome)) => {
                 match &outcome {
                     crate::db::UpdateOutcome::UpToDate { .. } => {
-                        self.log(LogLevel::Info, "Redump DB is up to date");
+                        self.log(LogLevel::Info, "Lookup DB is up to date");
                     }
                     crate::db::UpdateOutcome::Updated { local_path, .. } => {
                         self.log(
                             LogLevel::Success,
-                            format!("Redump DB updated: {}", local_path.display()),
+                            format!("Lookup DB updated: {}", local_path.display()),
                         );
                     }
                     crate::db::UpdateOutcome::OfflineUsingCached { error, .. } => {
                         self.log(
                             LogLevel::Warning,
-                            format!("Redump DB update skipped (offline): {error}"),
+                            format!("Lookup DB update skipped (offline): {error}"),
                         );
                     }
                     crate::db::UpdateOutcome::OfflineNoCache { error } => {
                         self.log(
                             LogLevel::Warning,
-                            format!("Redump DB unavailable (offline, no cache): {error}"),
+                            format!("Lookup DB unavailable (offline, no cache): {error}"),
                         );
                     }
                 }
@@ -552,7 +552,7 @@ impl App {
                 self.db_update_receiver = None;
             }
             Ok(Err(e)) => {
-                self.log(LogLevel::Error, format!("Redump DB update failed: {e}"));
+                self.log(LogLevel::Error, format!("Lookup DB update failed: {e}"));
                 self.db_update_done = true;
                 self.db_update_receiver = None;
             }

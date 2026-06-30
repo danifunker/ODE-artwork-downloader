@@ -101,7 +101,7 @@ impl DatabaseManager {
         };
 
         if self.is_up_to_date(&remote_zst_hash) {
-            log::info!("Redump DB cache is up to date ({})", &remote_zst_hash[..12]);
+            log::info!("Lookup DB cache is up to date ({})", &remote_zst_hash[..12]);
             return Ok(UpdateOutcome::UpToDate {
                 local_path: self.paths.sqlite(),
             });
@@ -116,11 +116,11 @@ impl DatabaseManager {
         let _ = fs::remove_file(&tmp_zst);
         let _ = fs::remove_file(&tmp_plain);
 
-        log::info!("Downloading redump DB: {}", urls.zst);
+        log::info!("Downloading lookup DB: {}", urls.zst);
         let got_zst_hash = download_with_hash(&client, &urls.zst, &tmp_zst)?;
         check_compressed(&remote_zst_hash, &got_zst_hash)?;
 
-        log::info!("Decompressing redump DB");
+        log::info!("Decompressing lookup DB");
         let got_plain_hash = decompress_with_hash(&tmp_zst, &tmp_plain)?;
         check_decompressed(&remote_plain_hash, &got_plain_hash)?;
 
