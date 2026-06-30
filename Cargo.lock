@@ -317,7 +317,7 @@ dependencies = [
  "serde_core",
  "serde_json",
  "snafu",
- "ureq 3.3.0",
+ "ureq",
  "url-escape",
 ]
 
@@ -594,7 +594,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "ureq 3.3.0",
+ "ureq",
 ]
 
 [[package]]
@@ -2884,16 +2884,16 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libchdman-rs"
-version = "0.287.0-l7"
+version = "0.288.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe34138e7c9f2a433bc234c4b5ceba624032bc90b605f68b7680fcc5337057a2"
+checksum = "f9e349d24a5de45ed8a8c9f01db055d0f393771881169c39ae39707618cffd22"
 dependencies = [
  "cc",
  "hex",
  "libc",
- "sha2",
+ "sha2 0.11.0",
  "tempfile",
- "ureq 2.12.1",
+ "ureq",
 ]
 
 [[package]]
@@ -3711,7 +3711,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.6",
- "sha2",
+ "sha2 0.10.9",
  "strsim",
  "tempfile",
  "thiserror 2.0.18",
@@ -3747,9 +3747,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opticaldiscs"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb30e617e9d74619ba827bb8daa06ceea913c0d284c146b36dfb811924e75457"
+checksum = "ee8945c35cfd0e2364cea3597617e0e9c74e09d7a0c62df4bdc381903ae88ec4"
 dependencies = [
  "base64",
  "cue_sheet",
@@ -4919,6 +4919,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5656,21 +5667,6 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "2.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
-dependencies = [
- "base64",
- "log",
- "once_cell",
- "rustls",
- "rustls-pki-types",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
@@ -5687,7 +5683,7 @@ dependencies = [
  "socks",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -6123,15 +6119,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.7",
 ]
 
 [[package]]

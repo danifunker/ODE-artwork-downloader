@@ -187,11 +187,14 @@ fn walk(
         }
         c.files_seen += 1;
         push_tokens(&mut c.tokens, &child.name);
-        if let Some(tc) = child.type_code.as_deref() {
-            push_tokens(&mut c.tokens, tc);
+        // 0.5.0 stores the raw 4-byte Finder type/creator codes; the
+        // *_string() helpers reproduce the exact rendering the old
+        // Option<String> fields held, preserving tokenization behavior.
+        if let Some(tc) = child.type_code_string() {
+            push_tokens(&mut c.tokens, &tc);
         }
-        if let Some(cc) = child.creator_code.as_deref() {
-            push_tokens(&mut c.tokens, cc);
+        if let Some(cc) = child.creator_code_string() {
+            push_tokens(&mut c.tokens, &cc);
         }
 
         // NOTE: directory names and executable stems are intentionally NOT
