@@ -65,8 +65,6 @@ libchdman-rs = { version = "0.288.8", features = ["prebuilt"] }
 # Temp scratch dir for CHD → BIN extraction during hashing.
 tempfile = "3"
 
-[dev-dependencies]
-
 [build-dependencies]
 winres = "0.1"
 aes-gcm = "0.10"

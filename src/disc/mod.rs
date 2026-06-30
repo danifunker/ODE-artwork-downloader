@@ -7,6 +7,7 @@
 //! ODE-specific logic (game title parsing, confidence scoring) lives here.
 
 pub mod browse;
+pub mod chd_audio;
 pub mod content;
 pub mod hasher;
 mod identifier;
@@ -23,6 +24,7 @@ pub use opticaldiscs::toc::{DiscTOC, TrackInfo};
 
 // ODE-specific re-exports
 pub use identifier::{normalize_volume_label, parse_filename, ConfidenceLevel, ParsedFilename};
+pub use chd_audio::{ChdCdTrack, CDDA_CHANNELS, CDDA_SAMPLE_RATE};
 pub use content::{read_content, DiscContent};
 pub use layout::{detect_sector_layout, SectorLayout};
 pub use reader::{
