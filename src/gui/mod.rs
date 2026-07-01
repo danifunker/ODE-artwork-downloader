@@ -3,6 +3,7 @@
 //! Provides the graphical user interface for the ODE Artwork Downloader.
 
 mod app;
+mod audio;
 pub mod browse_view;
 pub mod bulk;
 pub mod hex_view;

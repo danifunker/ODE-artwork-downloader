@@ -117,6 +117,17 @@ pub struct App {
     /// the user clicks Delete / Keep, or (in bulk mode) the auto-skip
     /// timeout elapses.
     broken_cue_prompt: Option<BrokenCuePrompt>,
+    /// CD audio tracks for the loaded disc, when it's a CHD with audio. `None`
+    /// for non-CHD discs or CHDs without parseable tracks. Cached at load time
+    /// so the panel doesn't re-open the CHD every frame.
+    audio_tracks: Option<Vec<crate::disc::cd_audio::CdTrack>>,
+    /// Active CD-DA playback job, if the user is playing a track.
+    audio_playback: Option<super::audio::AudioPlayback>,
+    /// Whether the pop-out audio-player modal is open. Auto-opens when a CHD
+    /// with audio loads; the user can close it and reopen from the panel button.
+    audio_modal_open: bool,
+    /// Last playback failure, surfaced in the modal until the next play starts.
+    audio_error: Option<String>,
 }
 
 /// Pending decision for a cue file whose referenced BIN(s) don't exist.
@@ -205,6 +216,10 @@ impl Default for App {
             hash_progress: None,
             hash_receiver: None,
             hash_rate_tracker: super::progress::RateTracker::default(),
+            audio_tracks: None,
+            audio_playback: None,
+            audio_modal_open: false,
+            audio_error: None,
             bulk_queue: None,
             bulk_loader: None,
             bulk_loaded_cursor: None,
@@ -376,6 +391,221 @@ impl App {
     }
 
     /// Poll the hashing worker and refresh redump_matches when it finishes.
+    /// Render the CD-DA track list with play/stop controls for a CHD that has
+    /// audio tracks. No-op when there are no cached audio tracks. Takes the disc
+    /// path explicitly so the caller can keep `self.disc_info` borrowed while we
+    /// borrow `self` mutably here.
+    /// Panel entry point for the CD-DA player: a button that opens the pop-out
+    /// modal, plus a compact now-playing readout. The player itself lives in the
+    /// modal ([`Self::render_audio_modal`]); this is a no-op for discs without
+    /// audio.
+    fn render_audio_player(&mut self, ui: &mut egui::Ui) {
+        let has_audio = self
+            .audio_tracks
+            .as_ref()
+            .map(|tracks| tracks.iter().any(|t| t.is_audio))
+            .unwrap_or(false);
+        if !has_audio {
+            return;
+        }
+
+        // Reap a finished/failed job so the play buttons re-enable.
+        self.reap_audio_playback();
+
+        let n_audio = self
+            .audio_tracks
+            .as_ref()
+            .map(|tracks| tracks.iter().filter(|t| t.is_audio).count())
+            .unwrap_or(0);
+        let now_playing = self
+            .audio_playback
+            .as_ref()
+            .map(|pb| (pb.track(), pb.state(), pb.elapsed_secs()));
+
+        ui.separator();
+        let mut open_modal = false;
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("🎵 Audio Tracks ({n_audio})"))
+                .on_hover_text("Open the CD-DA player")
+                .clicked()
+            {
+                open_modal = true;
+            }
+            if let Some((track, state, elapsed)) = now_playing.as_ref() {
+                match state {
+                    super::audio::PlaybackState::Preparing => {
+                        ui.label(format!("▶ Track {track} — preparing…"));
+                    }
+                    super::audio::PlaybackState::Playing => {
+                        ui.label(format!("▶ Track {track} — {:.0}s", elapsed.unwrap_or(0.0)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if open_modal {
+            self.audio_modal_open = true;
+        }
+
+        let ctx = ui.ctx().clone();
+        self.render_audio_modal(&ctx);
+
+        // Keep repainting while a job is active so both the panel readout and
+        // the modal's seconds counter stay live even when idle otherwise.
+        if self.audio_playback.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Drop a finished/failed playback job, remembering a failure so the modal
+    /// can surface it until the next play starts.
+    fn reap_audio_playback(&mut self) {
+        match self.audio_playback.as_ref().map(|pb| pb.state()) {
+            Some(super::audio::PlaybackState::Failed(e)) => {
+                self.audio_error = Some(e);
+                self.audio_playback = None;
+            }
+            Some(super::audio::PlaybackState::Finished) => {
+                self.audio_playback = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The pop-out CD-DA player modal: a multi-column track grid with per-track
+    /// play/stop and a live elapsed-seconds readout for the active track.
+    fn render_audio_modal(&mut self, ctx: &egui::Context) {
+        if !self.audio_modal_open {
+            return;
+        }
+
+        // Snapshot the active job (number, state, elapsed) so the closures below
+        // never hold a borrow of `self.audio_playback` across the UI build.
+        let active = self
+            .audio_playback
+            .as_ref()
+            .map(|pb| (pb.track(), pb.state(), pb.elapsed_secs()));
+        let busy = active.is_some();
+
+        let mut to_play: Option<u32> = None;
+        let mut do_stop = false;
+        let mut close = false;
+
+        let modal = egui::Modal::new(egui::Id::new("audio_player_modal")).show(ctx, |ui| {
+            ui.set_min_width(460.0);
+
+            ui.horizontal(|ui| {
+                ui.heading("🎵 Audio Tracks");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if close_x_button(ui).on_hover_text("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+            // Now-playing banner: position in seconds + progress bar.
+            if let Some((track, state, elapsed)) = active.as_ref() {
+                let total = self
+                    .audio_tracks
+                    .as_ref()
+                    .and_then(|ts| ts.iter().find(|t| t.number == *track))
+                    .map(|t| f64::from(t.frames) / 75.0)
+                    .unwrap_or(0.0);
+                match state {
+                    super::audio::PlaybackState::Preparing => {
+                        ui.label(format!("Track {track}: preparing…"));
+                    }
+                    super::audio::PlaybackState::Playing => {
+                        let pos = elapsed.unwrap_or(0.0).min(total);
+                        ui.label(
+                            egui::RichText::new(format!("▶ Track {track}   {pos:.0}s / {total:.0}s"))
+                                .strong(),
+                        );
+                        let frac = if total > 0.0 { (pos / total) as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(err) = self.audio_error.as_ref() {
+                ui.colored_label(egui::Color32::RED, format!("Playback failed: {err}"));
+            }
+
+            ui.separator();
+
+            // Multi-column grid of tracks.
+            const COLS: usize = 3;
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                egui::Grid::new("audio_tracks_grid")
+                    .num_columns(COLS)
+                    .spacing([18.0, 8.0])
+                    .show(ui, |ui| {
+                        let audio: Vec<&crate::disc::cd_audio::CdTrack> = self
+                            .audio_tracks
+                            .as_ref()
+                            .map(|ts| ts.iter().filter(|t| t.is_audio).collect())
+                            .unwrap_or_default();
+                        for (i, t) in audio.iter().enumerate() {
+                            let is_this = active
+                                .as_ref()
+                                .map(|(n, _, _)| *n == t.number)
+                                .unwrap_or(false);
+                            ui.horizontal(|ui| {
+                                if is_this {
+                                    if ui.button("■").on_hover_text("Stop").clicked() {
+                                        do_stop = true;
+                                    }
+                                } else if ui.add_enabled(!busy, egui::Button::new("▶")).clicked() {
+                                    to_play = Some(t.number);
+                                }
+
+                                match active.as_ref() {
+                                    Some((n, super::audio::PlaybackState::Playing, elapsed))
+                                        if *n == t.number =>
+                                    {
+                                        let total = f64::from(t.frames) / 75.0;
+                                        let pos = elapsed.unwrap_or(0.0).min(total);
+                                        ui.label(format!("Track {} — {pos:.0}s", t.number));
+                                    }
+                                    _ => {
+                                        ui.label(format!(
+                                            "Track {} ({})",
+                                            t.number,
+                                            t.duration_mmss()
+                                        ));
+                                    }
+                                }
+                            });
+                            if (i + 1) % COLS == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+        });
+
+        if modal.should_close() {
+            close = true;
+        }
+
+        if do_stop {
+            self.audio_playback = None;
+        }
+        if let Some(track) = to_play {
+            if let Some(disc_path) = self.selected_path.clone() {
+                self.audio_error = None;
+                self.audio_playback = Some(super::audio::AudioPlayback::start(disc_path, track));
+            }
+        }
+        if close {
+            self.audio_modal_open = false;
+            // Closing the player stops playback (dropping the job tears it down).
+            self.audio_playback = None;
+        }
+    }
+
     fn poll_hash(&mut self) {
         if let Some(progress) = self.hash_progress.as_ref() {
             // Pump the rate tracker each frame while hashing is in flight.
@@ -617,6 +847,10 @@ impl App {
         self.selected_image_index = None;
         self.preview_texture = None;
         self.preview_url = None;
+        self.audio_tracks = None;
+        self.audio_playback = None; // Drop stops any in-flight playback.
+        self.audio_modal_open = false;
+        self.audio_error = None;
 
         // Clear browse view state
         self.browse_view.clear();
@@ -650,6 +884,20 @@ impl App {
                 );
                 let mut info = info;
                 self.enrich_with_redump(&mut info);
+                // Cache the CD audio track list for CHD and BIN/CUE images so the
+                // disc panel can offer per-track playback without re-parsing the
+                // image each frame.
+                self.audio_tracks = if matches!(info.format, DiscFormat::Chd | DiscFormat::BinCue) {
+                    crate::disc::cd_audio::read_tracks(&info.path).ok()
+                } else {
+                    None
+                };
+                // Pop the audio player out automatically when the disc has audio.
+                self.audio_error = None;
+                self.audio_modal_open = self
+                    .audio_tracks
+                    .as_ref()
+                    .is_some_and(|tracks| tracks.iter().any(|t| t.is_audio));
                 self.disc_info = Some(Ok(info));
             }
             Err(e) => {
@@ -826,6 +1074,10 @@ impl App {
         self.show_search_window = false;
         self.browse_view.clear();
         self.show_browse_window = false;
+        self.audio_tracks = None;
+        self.audio_playback = None;
+        self.audio_modal_open = false;
+        self.audio_error = None;
     }
 
     /// Per-frame driver for bulk mode. If the cursor advanced to a new item,
@@ -3603,6 +3855,12 @@ impl eframe::App for App {
                         });
                     }
                 }
+
+                // In-app CD-DA player for CHDs that have audio tracks. Self-
+                // guards to a no-op otherwise; placed after the disc_info match
+                // so it can take `&mut self` without conflicting with the borrow
+                // of `self.disc_info` inside the arms above.
+                self.render_audio_player(ui);
             });
 
         });
@@ -3640,6 +3898,22 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// A frameless "✕" close button drawn with strokes, matching egui's own window
+/// close button. Drawn rather than typed because egui's default font has no glyph
+/// for U+2715 (it renders as a tofu box).
+fn close_x_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::Vec2::splat(ui.spacing().icon_width);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let rect = rect.shrink(2.0).expand(visuals.expansion);
+    let stroke = visuals.fg_stroke;
+    ui.painter()
+        .line_segment([rect.left_top(), rect.right_bottom()], stroke);
+    ui.painter()
+        .line_segment([rect.right_top(), rect.left_bottom()], stroke);
+    response
 }
 
 /// Preview files being dragged over the window
