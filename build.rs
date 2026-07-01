@@ -91,14 +91,12 @@ fn encrypt_secrets() {
 ///
 /// Behavior is driven by three env vars (the legacy `EMBED_REDUMP_DB*` names
 /// are still honored as aliases so CI doesn't have to flip in lockstep):
-/// - `EMBED_LOOKUP_DB=1`           — opt in. Default (unset) writes empty
-///                                    stub files and skips the network entirely.
-///                                    This keeps local builds offline & fast.
-/// - `EMBED_LOOKUP_DB_REQUIRED=1`  — make a failed fetch a hard build error.
-///                                    CI sets this only on scheduled runs.
-/// - `EMBED_LOOKUP_DB_NONCE=...`   — opaque value (e.g. github.run_id) that
-///                                    forces this build script to rerun even
-///                                    when the cargo cache is warm.
+/// - `EMBED_LOOKUP_DB=1` — opt in. Default (unset) writes empty stub files and
+///   skips the network entirely. This keeps local builds offline & fast.
+/// - `EMBED_LOOKUP_DB_REQUIRED=1` — make a failed fetch a hard build error. CI
+///   sets this only on scheduled runs.
+/// - `EMBED_LOOKUP_DB_NONCE=...` — opaque value (e.g. github.run_id) that forces
+///   this build script to rerun even when the cargo cache is warm.
 fn embed_lookup_db() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let zst_path = Path::new(&out_dir).join("ode-lookup.sqlite.zst");

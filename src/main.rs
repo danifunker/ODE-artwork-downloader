@@ -24,11 +24,11 @@ fn main() -> eframe::Result<()> {
     let icon_bytes = include_bytes!("../assets/icons/icon-256.png");
     let icon_image = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
         .expect("Failed to load icon");
-    
+
     // Ensure we have RGBA with alpha channel
     let icon_rgba = icon_image.to_rgba8();
     let (icon_width, icon_height) = icon_rgba.dimensions();
-    
+
     let icon_data = egui::IconData {
         rgba: icon_rgba.into_raw(),
         width: icon_width,
