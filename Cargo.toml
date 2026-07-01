@@ -2,6 +2,8 @@
 name = "ode-artwork-downloader"
 version = "1.0.0"
 edition = "2021"
+# `cargo run` targets the GUI app; the fuzzy_scan CLI stays at `--bin fuzzy_scan`.
+default-run = "ode-artwork-downloader"
 description = "Cross-platform GUI application to download cover art for USBODE disc images"
 license = "GPL-3.0"
 repository = "https://github.com/dani/ODE-artwork-downloader"
