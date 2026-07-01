@@ -71,14 +71,6 @@ impl AudioPlayback {
             .unwrap_or(PlaybackState::Finished)
     }
 
-    /// Whether the job is still preparing or playing.
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self.state(),
-            PlaybackState::Preparing | PlaybackState::Playing
-        )
-    }
-
     /// Signal the worker to stop. Extraction in progress stops at the next
     /// chunk boundary; queued audio is cut immediately.
     pub fn stop(&self) {

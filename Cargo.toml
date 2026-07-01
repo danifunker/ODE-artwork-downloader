@@ -61,9 +61,23 @@ crc32fast = "1.4"
 # so the whole graph must resolve to a SINGLE copy — keep this in lockstep
 # with opticaldiscs's own libchdman-rs pin (opticaldiscs 0.5.x -> 0.288.x).
 # Bump both together when a new MAME release lands.
-libchdman-rs = { version = "0.288.8", features = ["prebuilt"] }
+libchdman-rs = { version = "0.288.9", features = ["prebuilt"] }
 # Temp scratch dir for CHD → BIN extraction during hashing.
 tempfile = "3"
+
+# Format-agnostic CD-DA track machinery (Toc/Track types, track-bounds math
+# incl. the CD-Extra gap, and the WAV header helper). ODE owns the CHD → sector
+# decoding — via libchdman-rs above — behind this crate's `AudioSectorReader`
+# seam, so it pulls in NO new native deps of its own.
+cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-based-backend" }
+
+# In-app CD-DA playback (also used by the play_chd example). Pinned <0.20 for
+# the OutputStream::try_default / Sink::try_new API used in gui/audio.rs.
+rodio = "0.19"
+
+[dev-dependencies]
+# WAV writer for the play_chd `--save-wav` verification dump.
+hound = "3.5"
 
 [build-dependencies]
 winres = "0.1"

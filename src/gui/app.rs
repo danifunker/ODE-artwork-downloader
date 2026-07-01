@@ -3710,6 +3710,12 @@ impl eframe::App for App {
                         });
                     }
                 }
+
+                // In-app CD-DA player for CHDs that have audio tracks. Self-
+                // guards to a no-op otherwise; placed after the disc_info match
+                // so it can take `&mut self` without conflicting with the borrow
+                // of `self.disc_info` inside the arms above.
+                self.render_audio_player(ui);
             });
 
         });
