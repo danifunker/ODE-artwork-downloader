@@ -11,6 +11,8 @@ finish-args:
   - --share=ipc
   # Network access for downloading artwork
   - --share=network
+  # Audio output for the CD-DA player (PipeWire is served via the pulse socket)
+  - --socket=pulseaudio
   # File system access for reading disc images and saving artwork
   - --filesystem=home
   # GPU acceleration

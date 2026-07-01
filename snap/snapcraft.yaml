@@ -24,6 +24,7 @@ apps:
       - x11
       - unity7
       - opengl
+      - audio-playback
 
 parts:
   ode-artwork-downloader:
@@ -32,5 +33,8 @@ parts:
     stage-packages:
       - libgtk-3-0
       - libssl3
+      # ALSA client lib + pulse/pipewire bridge plugin for CD-DA audio output
+      - libasound2
+      - libasound2-plugins
     organize:
       bin/ode-artwork-downloader: bin/ode-artwork-downloader
