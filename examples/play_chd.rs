@@ -1,7 +1,7 @@
 //! Play (or dump) a CD-DA audio track from a MAME-style `.chd` CD image.
 //!
 //! This is a verification/debug tool: it exercises the same CHD audio
-//! extraction path the app uses ([`disc::chd_audio`]) so we can *hear* that the
+//! extraction path the app uses ([`disc::cd_audio`]) so we can *hear* that the
 //! PCM is correct — right pitch/speed, no static — and diff it against a
 //! `chdman extractcd` rip.
 //!
@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use ode_artwork_downloader::disc::chd_audio::{
-    self, ChdCdTrack, CDDA_CHANNELS, CDDA_SAMPLE_RATE,
+use ode_artwork_downloader::disc::cd_audio::{
+    self, CdTrack, CDDA_CHANNELS, CDDA_SAMPLE_RATE,
 };
 
 fn main() {
@@ -56,7 +56,7 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<(), String> {
-    let tracks = chd_audio::read_tracks(&args.chd)?;
+    let tracks = cd_audio::read_tracks(&args.chd)?;
     print_track_table(&tracks);
 
     let track = select_track(&tracks, args.track)?;
@@ -69,7 +69,7 @@ fn run(args: &Args) -> Result<(), String> {
 }
 
 /// Print the parsed track table so the user can see what's on the disc.
-fn print_track_table(tracks: &[ChdCdTrack]) {
+fn print_track_table(tracks: &[CdTrack]) {
     println!("\nTracks:");
     println!("  {:>3}  {:<10}  {:>8}  {:>8}", "#", "TYPE", "FRAMES", "LENGTH");
     for t in tracks {
@@ -85,7 +85,7 @@ fn print_track_table(tracks: &[ChdCdTrack]) {
 }
 
 /// Resolve which track to use: the requested number, or the first AUDIO track.
-fn select_track(tracks: &[ChdCdTrack], requested: Option<u8>) -> Result<&ChdCdTrack, String> {
+fn select_track(tracks: &[CdTrack], requested: Option<u8>) -> Result<&CdTrack, String> {
     match requested {
         Some(num) => {
             let track = tracks
@@ -108,7 +108,7 @@ fn select_track(tracks: &[ChdCdTrack], requested: Option<u8>) -> Result<&ChdCdTr
 }
 
 /// Stream the track to the default audio device and play to completion.
-fn play(chd: &Path, track: &ChdCdTrack) -> Result<(), String> {
+fn play(chd: &Path, track: &CdTrack) -> Result<(), String> {
     use rodio::buffer::SamplesBuffer;
 
     println!(
@@ -127,7 +127,7 @@ fn play(chd: &Path, track: &ChdCdTrack) -> Result<(), String> {
     // hundreds of MB) track ahead of playback.
     const MAX_QUEUED_CHUNKS: usize = 4;
 
-    chd_audio::extract_audio_pcm(chd, track.number, |samples| {
+    cd_audio::extract_audio_pcm(chd, track.number, |samples| {
         while sink.len() >= MAX_QUEUED_CHUNKS {
             thread::sleep(Duration::from_millis(20));
         }
@@ -144,7 +144,7 @@ fn play(chd: &Path, track: &ChdCdTrack) -> Result<(), String> {
 }
 
 /// Write the track's PCM as a 44.1kHz/16-bit/stereo WAV.
-fn save_wav(chd: &Path, track: &ChdCdTrack, out: &Path) -> Result<(), String> {
+fn save_wav(chd: &Path, track: &CdTrack, out: &Path) -> Result<(), String> {
     let spec = hound::WavSpec {
         channels: CDDA_CHANNELS,
         sample_rate: CDDA_SAMPLE_RATE,
@@ -162,7 +162,7 @@ fn save_wav(chd: &Path, track: &ChdCdTrack, out: &Path) -> Result<(), String> {
     );
 
     let mut write_err: Option<String> = None;
-    let total = chd_audio::extract_audio_pcm(chd, track.number, |samples| {
+    let total = cd_audio::extract_audio_pcm(chd, track.number, |samples| {
         if write_err.is_some() {
             return;
         }
