@@ -960,8 +960,8 @@ dependencies = [
 
 [[package]]
 name = "cd-da-reader"
-version = "0.4.1"
-source = "git+https://github.com/danifunker/rust-cd-da-reader?branch=file-based-backend#ee26fde9ad99578309987173e7de28e4c767a1a7"
+version = "1.0.0"
+source = "git+https://github.com/danifunker/rust-cd-da-reader?branch=file-backend-on-1.0#885335edd699d5fa5a25b7117084895fbb95a0b7"
 dependencies = [
  "cc",
  "libc",

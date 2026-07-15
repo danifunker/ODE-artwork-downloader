@@ -26,7 +26,13 @@ pub use lookup::{
 pub use manager::{DatabaseManager, UpdateOutcome};
 
 /// Schema version this build of the app understands.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+
+/// Oldest schema version this build can read. v3 moved the per-file hashes we
+/// match on off `redump_track` and onto `redump_file`, a table that simply does
+/// not exist in v2 — so an older database has to be re-downloaded rather than
+/// queried and tolerated.
+pub const MINIMUM_SCHEMA_VERSION: i64 = 3;
 
 /// Base URL for the `latest` release tag on the DB repo.
 pub const LATEST_RELEASE_BASE: &str =
