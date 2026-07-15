@@ -421,42 +421,57 @@ fn fts_candidates(conn: &Connection, query: &str, limit: i64) -> rusqlite::Resul
 
 /// Per-disc track summary used by Sources C and D.
 struct TrackSummary {
-    /// Per-track durations in CD frames, in track order.
+    /// Per-track durations in CD frames, in track order. Empty for DVDs, which
+    /// have no track table.
     frames: Vec<u32>,
-    /// Total payload bytes across all tracks.
+    /// Whole-disc payload in bytes, comparable to `FuzzyInputs::disc_payload_bytes`.
     total_bytes: u64,
 }
 
-/// Fallback when `tracks.sectors` is NULL (pre-v2 rows). Redump `size_bytes`
-/// is cooked (2048 for Mode-1 data, 2352 for audio), so we divide by the
-/// per-sector payload to approximate the frame count.
-fn bytes_to_frames(kind: &str, size_bytes: u64) -> u32 {
-    let per = if kind.eq_ignore_ascii_case("audio") { 2352 } else { 2048 };
-    (size_bytes / per) as u32
-}
+/// Redump dumps a CD's tracks as raw sectors, so a track's file is exactly
+/// `sectors * 2352` — for data tracks as well as audio ones (a data track's
+/// `.bin` is raw, *not* 2048-B cooked).
+const CD_RAW_SECTOR_BYTES: u64 = 2352;
 
+/// Geometry and payload size for one candidate disc.
+///
+/// `redump_track` is geometry-only and CD-only, so the two media take different
+/// payload paths: a CD's payload is its track sectors, a DVD's is the size of
+/// its lone image file.
 fn track_summary(conn: &Connection, redump_id: i64) -> rusqlite::Result<TrackSummary> {
-    let mut stmt = conn.prepare(
-        "SELECT kind, sectors, size_bytes FROM redump_track WHERE redump_id = ?1 ORDER BY number",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT sectors FROM redump_track WHERE redump_id = ?1 ORDER BY number")?;
     let rows = stmt.query_map([redump_id], |row| {
-        let kind: Option<String> = row.get(0)?;
-        let sectors: Option<i64> = row.get(1)?;
-        let size: Option<i64> = row.get(2)?;
-        Ok((
-            kind.unwrap_or_default(),
-            sectors.map(|s| s.max(0) as u32),
-            size.unwrap_or(0).max(0) as u64,
-        ))
+        // NULL when redump's Sectors cell was empty or malformed. 0 keeps the
+        // positional track alignment intact — it just can't match a real track —
+        // whereas dropping the entry would shift every track after it.
+        let sectors: Option<i64> = row.get(0)?;
+        Ok(sectors.unwrap_or(0).max(0) as u32)
     })?;
-    let mut frames = Vec::new();
-    let mut total_bytes = 0u64;
-    for r in rows {
-        let (kind, sectors, size) = r?;
-        total_bytes += size;
-        frames.push(sectors.unwrap_or_else(|| bytes_to_frames(&kind, size)));
+    let frames: Vec<u32> = rows.collect::<rusqlite::Result<_>>()?;
+
+    if !frames.is_empty() {
+        let total_bytes = frames
+            .iter()
+            .map(|f| u64::from(*f) * CD_RAW_SECTOR_BYTES)
+            .sum();
+        return Ok(TrackSummary { frames, total_bytes });
     }
-    Ok(TrackSummary { frames, total_bytes })
+
+    // No track rows means a DVD, whose payload is a single image file. Take the
+    // largest non-`.cue` file rather than summing: redump lists a whole-disc
+    // mirror of the same bytes next to the per-track files (every CD carries an
+    // `.img` beside its `.bin`s), so a SUM here would risk double-counting.
+    let total_bytes: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(size_bytes), 0) FROM redump_file \
+         WHERE redump_id = ?1 AND filename NOT LIKE '%.cue'",
+        [redump_id],
+        |row| row.get(0),
+    )?;
+    Ok(TrackSummary {
+        frames,
+        total_bytes: total_bytes.max(0) as u64,
+    })
 }
 
 // ── Scratch candidate accumulated across sources before merge ────────────────

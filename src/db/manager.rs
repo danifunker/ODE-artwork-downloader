@@ -12,7 +12,7 @@ use super::fetch::{
 };
 use super::paths::DbPaths;
 use super::seed::{self, SeedOutcome};
-use super::SUPPORTED_SCHEMA_VERSION;
+use super::{MINIMUM_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION};
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -26,6 +26,8 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
     #[error("schema_version {found} is newer than supported {supported}; please update the app")]
     SchemaTooNew { found: i64, supported: i64 },
+    #[error("schema_version {found} is older than the minimum {minimum}; please update the database")]
+    SchemaTooOld { found: i64, minimum: i64 },
     #[error("smoke test failed: {0}")]
     SmokeFailed(String),
     #[error("no database installed yet")]
@@ -193,6 +195,14 @@ fn assert_schema_supported(conn: &Connection) -> Result<(), DbError> {
         return Err(DbError::SchemaTooNew {
             found,
             supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+    // Reject an old schema here rather than letting the lookups fail one by one
+    // on a missing `redump_file` table.
+    if found < MINIMUM_SCHEMA_VERSION {
+        return Err(DbError::SchemaTooOld {
+            found,
+            minimum: MINIMUM_SCHEMA_VERSION,
         });
     }
     Ok(())

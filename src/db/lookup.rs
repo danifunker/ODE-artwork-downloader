@@ -71,26 +71,39 @@ fn query_via_join(
     rows.collect()
 }
 
+// Schema v3 moved per-file hashes off `redump_track` (now geometry-only) onto
+// `redump_file` — one row per dumped file: the `.cue`, one `.bin` per track, and
+// a whole-disc `.img` mirror. We still match a *track* hash the app computed
+// itself; it just lands on the track's `.bin` row.
+//
+// DISTINCT because one disc can own several rows with the same hash: on a
+// single-track disc the `.img` mirror repeats its `.bin`'s crc32, and identical
+// (e.g. silent) audio tracks share a hash. We select only disc columns, so
+// DISTINCT collapses those back to one row per disc.
+//
+// Any hash column may be NULL (redump.info omits md5/sha1 on the `.img` mirror).
+// A NULL never equals the probe, so those rows simply don't match — the caller
+// falls through to the next hash tier.
 pub fn by_track_sha1(conn: &Connection, sha1: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
-         JOIN redump_track t USING (redump_id) WHERE t.sha1 = ?1"
+        "SELECT DISTINCT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_file f USING (redump_id) WHERE f.sha1 = ?1"
     );
     query_via_join(conn, &sql, sha1, MatchSource::TrackSha1)
 }
 
 pub fn by_track_md5(conn: &Connection, md5: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
-         JOIN redump_track t USING (redump_id) WHERE t.md5 = ?1"
+        "SELECT DISTINCT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_file f USING (redump_id) WHERE f.md5 = ?1"
     );
     query_via_join(conn, &sql, md5, MatchSource::TrackMd5)
 }
 
 pub fn by_track_crc32(conn: &Connection, crc32: &str) -> rusqlite::Result<Vec<RedumpMatch>> {
     let sql = format!(
-        "SELECT {SELECT_DISCS_COLS} FROM redump_disc d \
-         JOIN redump_track t USING (redump_id) WHERE t.crc32 = ?1"
+        "SELECT DISTINCT {SELECT_DISCS_COLS} FROM redump_disc d \
+         JOIN redump_file f USING (redump_id) WHERE f.crc32 = ?1"
     );
     query_via_join(conn, &sql, crc32, MatchSource::TrackCrc32)
 }
