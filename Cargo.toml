@@ -70,8 +70,9 @@ tempfile = "3"
 # Format-agnostic CD-DA track machinery (Toc/Track types, track-bounds math
 # incl. the CD-Extra gap, and the WAV header helper). ODE owns the CHD → sector
 # decoding — via libchdman-rs above — behind this crate's `AudioSectorReader`
-# seam, so it pulls in NO new native deps of its own.
-cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-based-backend" }
+# seam, so it pulls in NO new native deps of its own. Tracks the 1.0 API; the
+# crate is edition 2024, so this needs rustc >= 1.85.
+cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-backend-on-1.0" }
 
 # In-app CD-DA playback (also used by the play_chd example). Pinned <0.20 for
 # the OutputStream::try_default / Sink::try_new API used in gui/audio.rs.
