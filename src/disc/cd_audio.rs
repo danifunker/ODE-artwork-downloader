@@ -15,14 +15,16 @@
 //!   the audio track's sectors straight out of the `.bin` — including multi-BIN
 //!   layouts, where each track names its own file.
 //!
-//! For CHD we resolve track bounds from a cumulative TOC rather than
-//! cd-da-reader's `read_track`, whose CD-Extra trailing-gap subtraction (correct
-//! for a physical disc) would drop real audio from a gapless extracted BIN.
+//! For CHD we read through cd-da-reader's [`read_track_with_bounds`] with
+//! [`TrackBounds::Gapless`], since the extracted BIN addresses tracks
+//! back-to-back. The default [`TrackBounds::SessionGap`] would subtract the
+//! CD-Extra inter-session gap (correct for a physical disc) and drop real audio
+//! from a gap-stripped extract.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use cd_da_reader::{lba_to_msf, AudioSectorReader, Toc, Track};
+use cd_da_reader::{lba_to_msf, read_track_with_bounds, AudioSectorReader, Toc, Track, TrackBounds};
 use libchdman_rs::cd::{extract_to_cue, list_tracks, TrackType};
 use libchdman_rs::Chd;
 use opticaldiscs::bincue::{self, BinTrack};
@@ -132,7 +134,8 @@ where
     // per-track read below is fast.
     let disc = ChdDisc::open(path)?;
 
-    // Guard against reading a data track's bytes as "audio".
+    // Guard against reading a data track's bytes as "audio": read_track_with_bounds
+    // resolves geometry only and does not validate track type on a file backing.
     let idx = disc
         .toc
         .tracks
@@ -143,29 +146,15 @@ where
     if !track.is_audio {
         return Err(format!("track {track_number} is not an AUDIO track"));
     }
+    let track_no = track.number;
 
-    // Bounds come straight from our cumulative TOC: the extracted BIN is gapless
-    // (each track is exactly `frames` sectors, back-to-back), so a track spans
-    // from its own `start_lba` to the next track's (or the leadout).
-    //
-    // We deliberately do NOT use cd-da-reader's `read_track` here. Its
-    // `get_track_bounds` applies a CD-Extra rule that subtracts a fixed
-    // 11,400-sector inter-session gap from the last audio track before a data
-    // track. That gap is real on a physical disc but is absent from a
-    // CHD-derived image, so honouring it would chop ~2.5 min of real audio off
-    // that track. Every other track reads identically to `read_track`.
-    let start_lba = track.start_lba;
-    let end_lba = disc
-        .toc
-        .tracks
-        .get(idx + 1)
-        .map(|t| t.start_lba)
-        .unwrap_or(disc.toc.leadout_lba);
-    if end_lba <= start_lba {
-        return Err(format!("track {track_number}: bad TOC bounds"));
-    }
-    let pcm = disc
-        .read_audio_sectors(start_lba, end_lba - start_lba)
+    // The extracted BIN is gapless — each track is exactly `frames` sectors,
+    // back-to-back — so resolve bounds with TrackBounds::Gapless. The default
+    // SessionGap policy (what CdReader::read_track uses) would subtract the
+    // 11,400-sector CD-Extra inter-session gap from the last audio track before
+    // a data track; that gap is real on a physical disc but absent from a
+    // CHD-derived image, so it would chop ~2.5 min of real audio off that track.
+    let pcm = read_track_with_bounds(&disc, &disc.toc, track_no, TrackBounds::Gapless)
         .map_err(|e| format!("read track {track_number}: {e}"))?;
 
     // Batch ~1 second of audio per callback: 1176 i16 per CD frame × 75 frames/s.
