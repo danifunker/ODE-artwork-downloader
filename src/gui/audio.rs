@@ -1,12 +1,11 @@
 //! Background CD-DA playback for the disc-info panel.
 //!
-//! Playing an audio track (see [`crate::disc::cd_audio`]) can be slow to start —
-//! a CHD extracts the whole disc to a temporary BIN first — so all the work runs
-//! on a dedicated thread. The UI polls [`AudioPlayback::state`] each frame and
-//! offers a Stop button.
+//! Decoding and playing an audio track (see [`crate::disc::cd_audio`]) blocks
+//! for the whole track, so all the work runs on a dedicated thread. The UI
+//! polls [`AudioPlayback::state`] each frame and offers a Stop button.
 //!
-//! rodio's `OutputStream` is `!Send`, so it is created and owned entirely on
-//! the playback thread; the UI only ever touches the shared state flag.
+//! rodio's device sink is created and owned entirely on the playback thread;
+//! the UI only ever touches the shared state flag.
 
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -26,7 +25,7 @@ const MAX_QUEUED_CHUNKS: usize = 4;
 /// Lifecycle of a single track's playback.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlaybackState {
-    /// Extracting the disc to a temp BIN — no audio yet.
+    /// Opening the image and the audio device — no audio yet.
     Preparing,
     /// Audio is streaming to the output device.
     Playing,
@@ -57,7 +56,7 @@ impl AudioPlayback {
         let state_bg = Arc::clone(&state);
         let play_start_bg = Arc::clone(&play_start);
 
-        // Detached: the worker owns its rodio stream and the temp extraction,
+        // Detached: the worker owns its rodio stream and the disc reader,
         // and tears itself down when it sees the stop flag or finishes.
         thread::spawn(move || run(image_path, track, &stop_bg, &state_bg, &play_start_bg));
 
