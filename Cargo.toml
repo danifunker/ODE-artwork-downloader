@@ -10,14 +10,14 @@ repository = "https://github.com/dani/ODE-artwork-downloader"
 
 [dependencies]
 # GUI
-eframe = "0.34"
-egui = "0.34"
-egui_extras = { version = "0.34", features = ["image"] }
+eframe = "0.37"
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["image"] }
 rfd = "0.17"
 
 # Image processing
 image = "0.25"
-imageproc = "0.25"
+imageproc = "0.27"
 ab_glyph = "0.2"
 
 # HTTP and serialization
@@ -32,31 +32,31 @@ thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
 urlencoding = "2.1"
-base64 = "0.22"
+base64 = "0.23"
 tiny_http = "0.12"
 
 # Browser automation
 headless_chrome = "1.0"
 
 # Encryption
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 # Disc image formats (delegated to opticaldiscs). 0.6.x uses libchdman-rs
 # under the hood for CHD reading, with `prebuilt` enabled so CI doesn't have
 # to compile MAME's C++.
-opticaldiscs = { version = "0.6", features = ["toc"] }
-musicbrainz_rs = "0.13"
+opticaldiscs = { version = "0.15", features = ["toc"] }
+musicbrainz_rs = "0.14"
 
 # Redump SQLite lookup DB (download + open)
-rusqlite = { version = "0.32", features = ["bundled"] }
-zstd = "0.13"
-sha2 = "0.10"
-directories = "5"
+rusqlite = { version = "0.41", features = ["bundled"] }
+zstd = "0.14"
+sha2 = "0.11"
+directories = "6"
 hex = "0.4"
 
 # Track-level hashing for redump lookup
-sha1 = "0.10"
-md-5 = "0.10"
+sha1 = "0.11"
+md-5 = "0.11"
 crc32fast = "1.4"
 # Direct CHD reader; uses the same prebuilt static lib opticaldiscs already
 # links, so this adds no compile-time cost. libchdman-rs is a `links` crate,
@@ -76,7 +76,7 @@ cd-da-reader = "1.0"
 
 # In-app CD-DA playback (also used by the play_chd example). Pinned <0.20 for
 # the OutputStream::try_default / Sink::try_new API used in gui/audio.rs.
-rodio = "0.19"
+rodio = "0.23"
 
 [dev-dependencies]
 # WAV writer for the play_chd `--save-wav` verification dump.
@@ -84,8 +84,8 @@ hound = "3.5"
 
 [build-dependencies]
 winres = "0.1"
-aes-gcm = "0.10"
-base64 = "0.22"
+aes-gcm = "0.11"
+base64 = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

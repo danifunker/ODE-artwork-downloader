@@ -183,7 +183,7 @@ impl BrowseView {
             .resizable(true)
             .default_size(320.0)
             .size_range(200.0..=700.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.set_min_height(panel_height);
                 ui.heading("Files");
                 ui.separator();
@@ -200,7 +200,7 @@ impl BrowseView {
             });
 
         // Right panel: content viewer (fills remaining space).
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.set_min_height(panel_height);
                 ui.heading("Content");

@@ -110,6 +110,7 @@ fn select_track(tracks: &[CdTrack], requested: Option<u8>) -> Result<&CdTrack, S
 /// Stream the track to the default audio device and play to completion.
 fn play(chd: &Path, track: &CdTrack) -> Result<(), String> {
     use rodio::buffer::SamplesBuffer;
+    use std::num::NonZero;
 
     println!(
         "Playing track {} ({}, {})…",
@@ -118,9 +119,12 @@ fn play(chd: &Path, track: &CdTrack) -> Result<(), String> {
         track.duration_mmss()
     );
 
-    let (_stream, handle) =
-        rodio::OutputStream::try_default().map_err(|e| format!("open audio output: {e}"))?;
-    let sink = rodio::Sink::try_new(&handle).map_err(|e| format!("create audio sink: {e}"))?;
+    let mut device = rodio::DeviceSinkBuilder::open_default_sink()
+        .map_err(|e| format!("open audio output: {e}"))?;
+    device.log_on_drop(false);
+    let sink = rodio::Player::connect_new(device.mixer());
+    let channels = NonZero::new(CDDA_CHANNELS).unwrap();
+    let rate = NonZero::new(CDDA_SAMPLE_RATE).unwrap();
 
     // `extract_audio_pcm` hands us ~1s batches; queue each on the sink with
     // backpressure so we never buffer more than a few seconds of the (possibly
@@ -131,11 +135,12 @@ fn play(chd: &Path, track: &CdTrack) -> Result<(), String> {
         while sink.len() >= MAX_QUEUED_CHUNKS {
             thread::sleep(Duration::from_millis(20));
         }
-        sink.append(SamplesBuffer::new(
-            CDDA_CHANNELS,
-            CDDA_SAMPLE_RATE,
-            samples.to_vec(),
-        ));
+        // rodio mixes in float samples; scale the 16-bit PCM into [-1, 1).
+        let pcm: Vec<rodio::Sample> = samples
+            .iter()
+            .map(|&s| rodio::Sample::from(s) / 32768.0)
+            .collect();
+        sink.append(SamplesBuffer::new(channels, rate, pcm));
     })?;
 
     sink.sleep_until_end();

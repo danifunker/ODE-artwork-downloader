@@ -8,6 +8,7 @@
 //! rodio's `OutputStream` is `!Send`, so it is created and owned entirely on
 //! the playback thread; the UI only ever touches the shared state flag.
 
+use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,6 +107,21 @@ impl Drop for AudioPlayback {
     }
 }
 
+/// Wrap a batch of interleaved 16-bit CD-DA PCM as a rodio buffer (rodio 0.21+
+/// mixes in float samples).
+fn cdda_buffer(samples: &[i16]) -> SamplesBuffer {
+    const CHANNELS: NonZero<u16> = NonZero::new(CDDA_CHANNELS).unwrap();
+    const RATE: NonZero<u32> = NonZero::new(CDDA_SAMPLE_RATE).unwrap();
+    SamplesBuffer::new(
+        CHANNELS,
+        RATE,
+        samples
+            .iter()
+            .map(|&s| rodio::Sample::from(s) / 32768.0)
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn set(state: &Arc<Mutex<PlaybackState>>, value: PlaybackState) {
     if let Ok(mut s) = state.lock() {
         *s = value;
@@ -119,14 +135,12 @@ fn run(
     state: &Arc<Mutex<PlaybackState>>,
     play_start: &Arc<Mutex<Option<Instant>>>,
 ) {
-    let (_stream, handle) = match rodio::OutputStream::try_default() {
+    let mut device = match rodio::DeviceSinkBuilder::open_default_sink() {
         Ok(out) => out,
         Err(e) => return set(state, PlaybackState::Failed(format!("no audio output: {e}"))),
     };
-    let sink = match rodio::Sink::try_new(&handle) {
-        Ok(s) => s,
-        Err(e) => return set(state, PlaybackState::Failed(format!("audio sink: {e}"))),
-    };
+    device.log_on_drop(false);
+    let sink = rodio::Player::connect_new(device.mixer());
 
     let mut started = false;
     let result = cd_audio::extract_audio_pcm(&image_path, track, |samples| {
@@ -145,11 +159,7 @@ fn run(
             }
             thread::sleep(Duration::from_millis(20));
         }
-        sink.append(SamplesBuffer::new(
-            CDDA_CHANNELS,
-            CDDA_SAMPLE_RATE,
-            samples.to_vec(),
-        ));
+        sink.append(cdda_buffer(samples));
     });
 
     if let Err(e) = result {

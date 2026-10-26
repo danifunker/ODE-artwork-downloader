@@ -25,7 +25,7 @@ pub struct App {
     /// Status/log messages
     log_messages: Vec<LogMessage>,
     /// Dropped files (for drag-and-drop)
-    dropped_files: Vec<egui::DroppedFile>,
+    dropped_files: Vec<egui::DroppedFileHandle>,
     /// Search results from image search
     search_results: Vec<ImageResult>,
     /// Receiver for async search results
@@ -492,7 +492,7 @@ impl App {
         let mut do_stop = false;
         let mut close = false;
 
-        let modal = egui::Modal::new(egui::Id::new("audio_player_modal")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("audio_player_modal")).show(ctx, |ui| {
             ui.set_min_width(460.0);
 
             ui.horizontal(|ui| {
@@ -2682,33 +2682,32 @@ impl eframe::App for App {
 
         // Process dropped files
         if let Some(file) = self.dropped_files.pop() {
-            if let Some(path) = file.path {
-                // Check if it's an image file (for manual artwork drop)
-                let ext = path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_lowercase())
-                    .unwrap_or_default();
+            let path = file.path().to_path_buf();
+            // Check if it's an image file (for manual artwork drop)
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
 
-                let is_image = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp");
+            let is_image = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp");
 
-                if is_image {
-                    // It's an image - convert and save if we have a disc selected
-                    if let Some(ref disc_path) = self.selected_path {
-                        let output_path = generate_output_path(disc_path);
-                        self.log(LogLevel::Info, format!("Converting dropped image: {}", path.display()));
-                        self.convert_local_image(&path, &output_path);
-                    } else {
-                        self.log(LogLevel::Warning, "Drop a disc image first, then drop artwork to convert");
-                    }
+            if is_image {
+                // It's an image - convert and save if we have a disc selected
+                if let Some(ref disc_path) = self.selected_path {
+                    let output_path = generate_output_path(disc_path);
+                    self.log(LogLevel::Info, format!("Converting dropped image: {}", path.display()));
+                    self.convert_local_image(&path, &output_path);
                 } else {
-                    // It's a disc image
-                    self.process_file(path);
+                    self.log(LogLevel::Warning, "Drop a disc image first, then drop artwork to convert");
                 }
+            } else {
+                // It's a disc image
+                self.process_file(path);
             }
         }
 
         // Top panel with title
-        egui::Panel::top("top_panel").show_inside(ui, |ui| {
+        egui::Panel::top("top_panel").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("ODE Artwork Downloader");
@@ -3213,7 +3212,7 @@ impl eframe::App for App {
         }
 
         // Main central panel
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Top section with File Selection and Search Settings in columns
             ui.columns(2, |columns| {
 
@@ -3922,7 +3921,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 
     if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
         let painter =
-            ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
+            ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("file_drop_target")));
 
         let screen_rect = ctx.content_rect();
         painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));

@@ -81,11 +81,11 @@ fn decrypt_secrets() -> Option<EmbeddedSecrets> {
     }
 
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).ok()?;
 
     // Decrypt
     let cipher = Aes256Gcm::new_from_slice(&key_bytes).ok()?;
-    let plaintext = match cipher.decrypt(nonce, ciphertext) {
+    let plaintext = match cipher.decrypt(&nonce, ciphertext) {
         Ok(data) => data,
         Err(e) => {
             log::error!("Failed to decrypt secrets: {}", e);

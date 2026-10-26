@@ -52,12 +52,12 @@ fn encrypt_secrets() {
                 nonce[..8].copy_from_slice(&hash.to_le_bytes());
                 nonce
             };
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let nonce = Nonce::from(nonce_bytes);
 
             // Encrypt
             let cipher = Aes256Gcm::new_from_slice(&key_bytes).unwrap();
             let ciphertext = cipher
-                .encrypt(nonce, plaintext.as_bytes())
+                .encrypt(&nonce, plaintext.as_bytes())
                 .expect("Encryption failed");
 
             // Write: nonce (12 bytes) + ciphertext
