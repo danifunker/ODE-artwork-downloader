@@ -22,6 +22,7 @@
 //! `chdman extractcd` for the same track, confirming byte order and sector
 //! extraction are correct.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -141,6 +142,7 @@ fn play(chd: &Path, track: &CdTrack) -> Result<(), String> {
             .map(|&s| rodio::Sample::from(s) / 32768.0)
             .collect();
         sink.append(SamplesBuffer::new(channels, rate, pcm));
+        ControlFlow::Continue(())
     })?;
 
     sink.sleep_until_end();
@@ -168,15 +170,13 @@ fn save_wav(chd: &Path, track: &CdTrack, out: &Path) -> Result<(), String> {
 
     let mut write_err: Option<String> = None;
     let total = cd_audio::extract_audio_pcm(chd, track.number, |samples| {
-        if write_err.is_some() {
-            return;
-        }
         for &s in samples {
             if let Err(e) = writer.write_sample(s) {
                 write_err = Some(format!("write sample: {e}"));
-                return;
+                return ControlFlow::Break(());
             }
         }
+        ControlFlow::Continue(())
     })?;
 
     if let Some(e) = write_err {

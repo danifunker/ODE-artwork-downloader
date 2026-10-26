@@ -8,6 +8,7 @@
 //! the UI only ever touches the shared state flag.
 
 use std::num::NonZero;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,8 +94,8 @@ impl AudioPlayback {
             .and_then(|p| p.map(|t| t.elapsed().as_secs_f64()))
     }
 
-    /// Signal the worker to stop. Extraction in progress stops at the next
-    /// chunk boundary; queued audio is cut immediately.
+    /// Signal the worker to stop. Within ~20 ms it cuts the queued audio and
+    /// stops reading the track.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -150,25 +151,24 @@ fn run(
             set(state, PlaybackState::Playing);
             started = true;
         }
-        // Bounded queue: wait while the sink is a few chunks ahead, bailing if
-        // the user hit Stop.
-        while sink.len() >= MAX_QUEUED_CHUNKS {
+        // Bounded queue: wait while the sink is a few chunks ahead. On Stop,
+        // cut the queued audio now and stop reading the rest of the track.
+        loop {
             if stop.load(Ordering::Relaxed) {
-                return;
+                sink.stop();
+                return ControlFlow::Break(());
+            }
+            if sink.len() < MAX_QUEUED_CHUNKS {
+                break;
             }
             thread::sleep(Duration::from_millis(20));
         }
         sink.append(cdda_buffer(samples));
+        ControlFlow::Continue(())
     });
 
     if let Err(e) = result {
-        // A stop during extraction surfaces as a short-read/None, not a real
-        // failure — report Finished in that case.
-        if stop.load(Ordering::Relaxed) {
-            set(state, PlaybackState::Finished);
-        } else {
-            set(state, PlaybackState::Failed(e));
-        }
+        set(state, PlaybackState::Failed(e));
         return;
     }
 

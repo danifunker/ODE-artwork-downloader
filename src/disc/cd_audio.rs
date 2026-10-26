@@ -22,6 +22,7 @@
 //! `INDEX 01`.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -77,11 +78,14 @@ pub fn read_tracks(path: &Path) -> Result<Vec<CdTrack>, String> {
 /// interleaved little-endian `i16` stereo samples, and return the total number
 /// of `i16` samples emitted. Errors if the requested track isn't an audio track.
 ///
-/// Dispatches on format: CHD extracts the disc once up front (the slow
-/// "Preparing" cost) then slices; BIN/CUE streams straight from the `.bin`.
+/// `on_samples` returns [`ControlFlow::Break`] to stop reading early (e.g. the
+/// user hit Stop); that is not an error, and the count covers what was emitted.
+///
+/// Dispatches on format: CHD decodes sectors on demand; BIN/CUE streams
+/// straight from the `.bin`.
 pub fn extract_audio_pcm<F>(path: &Path, track_number: u32, on_samples: F) -> Result<u64, String>
 where
-    F: FnMut(&[i16]),
+    F: FnMut(&[i16]) -> ControlFlow<()>,
 {
     match DiscFormat::from_path(path) {
         Some(DiscFormat::Chd) => extract_audio_pcm_chd(path, track_number, on_samples),
@@ -131,7 +135,7 @@ fn extract_audio_pcm_chd<F>(
     mut on_samples: F,
 ) -> Result<u64, String>
 where
-    F: FnMut(&[i16]),
+    F: FnMut(&[i16]) -> ControlFlow<()>,
 {
     let chd = open_chd(path)?;
     let tracks = list_tracks(&chd).map_err(|e| format!("list CHD tracks: {e:?}"))?;
@@ -168,7 +172,9 @@ where
     {
         let samples = pcm_le_i16(&bytes);
         total += samples.len() as u64;
-        on_samples(&samples);
+        if on_samples(&samples).is_break() {
+            break;
+        }
     }
     Ok(total)
 }
@@ -251,7 +257,7 @@ fn extract_audio_pcm_bincue<F>(
     mut on_samples: F,
 ) -> Result<u64, String>
 where
-    F: FnMut(&[i16]),
+    F: FnMut(&[i16]) -> ControlFlow<()>,
 {
     let cue = resolve_cue(path)?;
     let tracks = bincue::parse_cue_tracks(&cue).map_err(|e| format!("parse cue: {e}"))?;
@@ -281,7 +287,9 @@ where
             .map_err(|e| format!("read track {track_number}: {e}"))?;
         let samples = pcm_le_i16(&buf[..bytes]);
         total += samples.len() as u64;
-        on_samples(&samples);
+        if on_samples(&samples).is_break() {
+            break;
+        }
         remaining -= n;
     }
     Ok(total)
