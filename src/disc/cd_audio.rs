@@ -16,9 +16,11 @@
 //!   the audio track's sectors straight out of the `.bin` — including multi-BIN
 //!   layouts, where each track names its own file.
 //!
-//! A CHD track's sectors start at the first sector the CHD stores for it,
-//! which includes an `INDEX 00` pregap when the image keeps one, exactly as
-//! the track's slice of an extracted `.bin` would.
+//! Both backings start a track at `INDEX 01`. A CHD often stores each track's
+//! `INDEX 00` pregap (~2 s of silence on an audio CD) at the start of that
+//! track's sectors, so the CHD path skips it; BIN/CUE already reads from
+//! `INDEX 01`.
+
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -105,10 +107,12 @@ fn read_tracks_chd(path: &Path) -> Result<Vec<CdTrack>, String> {
     let tracks: Vec<CdTrack> = list_tracks(&chd)
         .map_err(|e| format!("list CHD tracks: {e:?}"))?
         .into_iter()
-        .map(|t| CdTrack {
+        .enumerate()
+        .map(|(i, t)| CdTrack {
             number: t.track_num,
             track_type: format!("{:?}", t.track_type),
-            frames: t.frames,
+            // FRAMES counts a stored pregap; report INDEX 01 onward, like BIN/CUE.
+            frames: t.frames.saturating_sub(stored_pregap(&chd, i)),
             pregap: t.pregap,
             is_audio: t.track_type == TrackType::Audio,
         })
@@ -145,12 +149,17 @@ where
     // Per-track view: sector 0 is the track's first sector, so the bounds are
     // just 0..sector_count(). Unlike CdAudioReader::open, this doesn't reject
     // the whole disc when some other track is stored cooked (MODE1/2048).
+    // The view starts at the track's first stored sector, which is INDEX 00
+    // when the CHD keeps the pregap (usually ~2 s of silence). Skip it and
+    // start at INDEX 01, as a CD player does when you pick a track.
+    let pregap = stored_pregap(&chd, index);
     let reader = CdAudioReader::open_track(chd, index as u32)
         .map_err(|e| format!("open CHD track {track_number}: {e:?}"))?;
     let sectors = reader.sector_count();
+    let start = pregap.min(sectors);
     let src = ChdTrackAudio(Mutex::new(reader));
-    let mut stream =
-        open_track_stream_at(&src, 0, sectors).with_sectors_per_chunk(SECTORS_PER_SECOND);
+    let mut stream = open_track_stream_at(&src, start, sectors - start)
+        .with_sectors_per_chunk(SECTORS_PER_SECOND);
 
     let mut total = 0u64;
     while let Some(bytes) = stream
@@ -162,6 +171,28 @@ where
         on_samples(&samples);
     }
     Ok(total)
+}
+
+/// Frames of `INDEX 00` pregap the CHD stores at the start of track `index`
+/// (0-based, as in `list_tracks`). MAME only stores the pregap's data when the
+/// track record's `PGTYPE` starts with `V` (e.g. `VAUDIO`); otherwise the
+/// pregap is implied silence with no sectors, and this returns 0. Legacy
+/// `CHTR` records carry no pregap at all.
+fn stored_pregap(chd: &Chd, index: usize) -> u32 {
+    let record = [*b"CHT2", *b"CHGD"]
+        .iter()
+        .find_map(|tag| chd.read_metadata(u32::from_be_bytes(*tag), index as u32).ok());
+    let Some(record) = record else { return 0 };
+    let text = String::from_utf8_lossy(&record);
+    let field = |key: &str| {
+        text.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key))
+            .map(|v| v.trim_end_matches('\0'))
+    };
+    match (field("PREGAP:"), field("PGTYPE:")) {
+        (Some(n), Some(pgtype)) if pgtype.starts_with('V') => n.parse().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// One CHD track exposed to `cd-da-reader`. The trait reads through `&self`
